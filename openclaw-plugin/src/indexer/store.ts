@@ -42,6 +42,15 @@ export interface ChunkSearchResult {
   frontmatter: Record<string, unknown>;
 }
 
+export interface GraphEdgeRow {
+  relationship: string;
+  context: string;
+  path: string;
+  title: string;
+  type: string;
+  neighborPageId: number;
+}
+
 export interface StoreStats {
   pageCount: number;
   chunkCount: number;
@@ -373,6 +382,53 @@ export class GBrainStore {
       }
     });
     tx();
+  }
+
+  /** Get all edges where this page is the source (pages this page mentions). */
+  getEdgesFrom(pageId: number): GraphEdgeRow[] {
+    return this.db
+      .prepare(
+        `SELECT e.relationship, e.context, p.path, p.title, p.type, p.id as neighborPageId
+         FROM edges e
+         JOIN pages p ON e.target_page_id = p.id
+         WHERE e.source_page_id = ?`
+      )
+      .all(pageId) as GraphEdgeRow[];
+  }
+
+  /** Get all edges where this page is the target (pages that mention this page). */
+  getEdgesTo(pageId: number): GraphEdgeRow[] {
+    return this.db
+      .prepare(
+        `SELECT e.relationship, e.context, p.path, p.title, p.type, p.id as neighborPageId
+         FROM edges e
+         JOIN pages p ON e.source_page_id = p.id
+         WHERE e.target_page_id = ?`
+      )
+      .all(pageId) as GraphEdgeRow[];
+  }
+
+  /** Get pages that share edge targets with this page (co-occurrence). */
+  getCoOccurs(pageId: number): GraphEdgeRow[] {
+    return this.db
+      .prepare(
+        `SELECT DISTINCT 'co_occurs' as relationship, '' as context,
+                p.path, p.title, p.type, p.id as neighborPageId
+         FROM edges e1
+         JOIN edges e2 ON e1.target_page_id = e2.target_page_id
+         JOIN pages p ON e2.source_page_id = p.id
+         WHERE e1.source_page_id = ? AND e2.source_page_id != ?`
+      )
+      .all(pageId, pageId) as GraphEdgeRow[];
+  }
+
+  /** Get all timeline chunks for a page. */
+  getTimelineChunks(pageId: number): Array<{ content: string }> {
+    return this.db
+      .prepare(
+        `SELECT content FROM chunks WHERE page_id = ? AND chunk_type = 'timeline'`
+      )
+      .all(pageId) as Array<{ content: string }>;
   }
 
   getSyncState(key: string): string | null {
