@@ -1,4 +1,7 @@
+import postgres from 'postgres';
 import { createHash } from 'crypto';
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
 import type { BrainEngine } from './engine.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
@@ -12,29 +15,72 @@ import type {
   IngestLogEntry, IngestLogInput,
   EngineConfig,
 } from './types.ts';
+import { GBrainError } from './types.ts';
 import * as db from './db.ts';
 
 export class PostgresEngine implements BrainEngine {
+  private _sql: ReturnType<typeof postgres> | null = null;
+
+  // Instance connection (for workers) or fall back to module global (backward compat)
+  get sql(): ReturnType<typeof postgres> {
+    if (this._sql) return this._sql;
+    return db.getConnection();
+  }
+
   // Lifecycle
-  async connect(config: EngineConfig): Promise<void> {
-    await db.connect(config);
+  async connect(config: EngineConfig & { poolSize?: number }): Promise<void> {
+    if (config.poolSize) {
+      // Instance-level connection for worker isolation
+      const url = config.database_url;
+      if (!url) throw new GBrainError('No database URL', 'database_url is missing', 'Provide --url');
+      this._sql = postgres(url, {
+        max: config.poolSize,
+        idle_timeout: 20,
+        connect_timeout: 10,
+        types: { bigint: postgres.BigInt },
+      });
+      await this._sql`SELECT 1`;
+    } else {
+      // Module-level singleton (backward compat for CLI main engine)
+      await db.connect(config);
+    }
   }
 
   async disconnect(): Promise<void> {
-    await db.disconnect();
+    if (this._sql) {
+      await this._sql.end();
+      this._sql = null;
+    } else {
+      await db.disconnect();
+    }
   }
 
   async initSchema(): Promise<void> {
-    await db.initSchema();
+    const conn = this.sql;
+    const schemaPath = join(dirname(new URL(import.meta.url).pathname), '..', 'schema.sql');
+    const schemaSql = readFileSync(schemaPath, 'utf-8');
+    await conn.unsafe(schemaSql);
   }
 
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    if (this._sql) {
+      // Instance connection: use .begin() directly, no global swap
+      return this._sql.begin(async (tx) => {
+        const prev = this._sql;
+        this._sql = tx as unknown as ReturnType<typeof postgres>;
+        try {
+          return await fn(this);
+        } finally {
+          this._sql = prev;
+        }
+      });
+    }
     return db.withTransaction(() => fn(this));
   }
 
   // Pages CRUD
   async getPage(slug: string): Promise<Page | null> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const rows = await sql`
       SELECT id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at
       FROM pages WHERE slug = ${slug}
@@ -45,7 +91,7 @@ export class PostgresEngine implements BrainEngine {
 
   async putPage(slug: string, page: PageInput): Promise<Page> {
     validateSlug(slug);
-    const sql = db.getConnection();
+    const sql = this.sql;
     const hash = page.content_hash || contentHash(page.compiled_truth, page.timeline || '');
     const frontmatter = page.frontmatter || {};
 
@@ -66,12 +112,12 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async deletePage(slug: string): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`DELETE FROM pages WHERE slug = ${slug}`;
   }
 
   async listPages(filters?: PageFilters): Promise<Page[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const limit = filters?.limit || 100;
     const offset = filters?.offset || 0;
 
@@ -106,7 +152,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async resolveSlugs(partial: string): Promise<string[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
 
     // Try exact match first
     const exact = await sql`SELECT slug FROM pages WHERE slug = ${partial}`;
@@ -125,7 +171,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Search
   async searchKeyword(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const limit = opts?.limit || 20;
 
     const rows = await sql`
@@ -147,7 +193,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const limit = opts?.limit || 20;
     const vecStr = '[' + Array.from(embedding).join(',') + ']';
 
@@ -171,7 +217,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Chunks
   async upsertChunks(slug: string, chunks: ChunkInput[]): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
 
     // Get page_id
     const pages = await sql`SELECT id FROM pages WHERE slug = ${slug}`;
@@ -203,7 +249,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getChunks(slug: string): Promise<Chunk[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const rows = await sql`
       SELECT cc.* FROM content_chunks cc
       JOIN pages p ON p.id = cc.page_id
@@ -214,7 +260,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async deleteChunks(slug: string): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       DELETE FROM content_chunks
       WHERE page_id = (SELECT id FROM pages WHERE slug = ${slug})
@@ -223,7 +269,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Links
   async addLink(from: string, to: string, context?: string, linkType?: string): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       INSERT INTO links (from_page_id, to_page_id, link_type, context)
       SELECT f.id, t.id, ${linkType || ''}, ${context || ''}
@@ -236,7 +282,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async removeLink(from: string, to: string): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       DELETE FROM links
       WHERE from_page_id = (SELECT id FROM pages WHERE slug = ${from})
@@ -245,7 +291,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getLinks(slug: string): Promise<Link[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const rows = await sql`
       SELECT f.slug as from_slug, t.slug as to_slug, l.link_type, l.context
       FROM links l
@@ -257,7 +303,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getBacklinks(slug: string): Promise<Link[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const rows = await sql`
       SELECT f.slug as from_slug, t.slug as to_slug, l.link_type, l.context
       FROM links l
@@ -269,7 +315,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async traverseGraph(slug: string, depth: number = 5): Promise<GraphNode[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const rows = await sql`
       WITH RECURSIVE graph AS (
         SELECT p.id, p.slug, p.title, p.type, 0 as depth
@@ -306,7 +352,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Tags
   async addTag(slug: string, tag: string): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       INSERT INTO tags (page_id, tag)
       SELECT id, ${tag} FROM pages WHERE slug = ${slug}
@@ -315,7 +361,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async removeTag(slug: string, tag: string): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       DELETE FROM tags
       WHERE page_id = (SELECT id FROM pages WHERE slug = ${slug})
@@ -324,7 +370,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getTags(slug: string): Promise<string[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const rows = await sql`
       SELECT tag FROM tags
       WHERE page_id = (SELECT id FROM pages WHERE slug = ${slug})
@@ -335,7 +381,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Timeline
   async addTimelineEntry(slug: string, entry: TimelineInput): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       INSERT INTO timeline_entries (page_id, date, source, summary, detail)
       SELECT id, ${entry.date}::date, ${entry.source || ''}, ${entry.summary}, ${entry.detail || ''}
@@ -344,7 +390,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getTimeline(slug: string, opts?: TimelineOpts): Promise<TimelineEntry[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const limit = opts?.limit || 100;
 
     let rows;
@@ -376,7 +422,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Raw data
   async putRawData(slug: string, source: string, data: object): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       INSERT INTO raw_data (page_id, source, data)
       SELECT id, ${source}, ${JSON.stringify(data)}::jsonb
@@ -388,7 +434,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getRawData(slug: string, source?: string): Promise<RawData[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     let rows;
     if (source) {
       rows = await sql`
@@ -408,7 +454,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Versions
   async createVersion(slug: string): Promise<PageVersion> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const rows = await sql`
       INSERT INTO page_versions (page_id, compiled_truth, frontmatter)
       SELECT id, compiled_truth, frontmatter
@@ -419,7 +465,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getVersions(slug: string): Promise<PageVersion[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const rows = await sql`
       SELECT pv.* FROM page_versions pv
       JOIN pages p ON p.id = pv.page_id
@@ -430,7 +476,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async revertToVersion(slug: string, versionId: number): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       UPDATE pages SET
         compiled_truth = pv.compiled_truth,
@@ -443,7 +489,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Stats + health
   async getStats(): Promise<BrainStats> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const [stats] = await sql`
       SELECT
         (SELECT count(*) FROM pages) as page_count,
@@ -474,7 +520,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getHealth(): Promise<BrainHealth> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const [h] = await sql`
       SELECT
         (SELECT count(*) FROM pages) as page_count,
@@ -504,7 +550,7 @@ export class PostgresEngine implements BrainEngine {
 
   // Ingest log
   async logIngest(entry: IngestLogInput): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       INSERT INTO ingest_log (source_type, source_ref, pages_updated, summary)
       VALUES (${entry.source_type}, ${entry.source_ref}, ${JSON.stringify(entry.pages_updated)}::jsonb, ${entry.summary})
@@ -512,7 +558,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getIngestLog(opts?: { limit?: number }): Promise<IngestLogEntry[]> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const limit = opts?.limit || 50;
     const rows = await sql`
       SELECT * FROM ingest_log ORDER BY created_at DESC LIMIT ${limit}
@@ -523,7 +569,7 @@ export class PostgresEngine implements BrainEngine {
   // Sync
   async updateSlug(oldSlug: string, newSlug: string): Promise<void> {
     validateSlug(newSlug);
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`UPDATE pages SET slug = ${newSlug}, updated_at = now() WHERE slug = ${oldSlug}`;
   }
 
@@ -536,13 +582,13 @@ export class PostgresEngine implements BrainEngine {
 
   // Config
   async getConfig(key: string): Promise<string | null> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     const rows = await sql`SELECT value FROM config WHERE key = ${key}`;
     return rows.length > 0 ? (rows[0].value as string) : null;
   }
 
   async setConfig(key: string, value: string): Promise<void> {
-    const sql = db.getConnection();
+    const sql = this.sql;
     await sql`
       INSERT INTO config (key, value) VALUES (${key}, ${value})
       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
