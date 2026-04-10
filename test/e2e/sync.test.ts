@@ -331,4 +331,66 @@ describeE2E('E2E: Git-to-DB Sync Pipeline', () => {
       noEmbed: true,
     });
   });
+
+  test('files with spaces in names get slugified slugs', async () => {
+    const { performSync } = await import('../../src/commands/sync.ts');
+    const engine = getEngine();
+
+    // Add a file with spaces (Apple Notes style)
+    mkdirSync(join(repoPath, 'Apple Notes'), { recursive: true });
+    writeFileSync(join(repoPath, 'Apple Notes/2017-05-03 ohmygreen.md'), [
+      '---',
+      'title: Ohmygreen Notes',
+      '---',
+      '',
+      'Notes about ohmygreen lunch service.',
+    ].join('\n'));
+    gitCommit(repoPath, 'add apple notes file with spaces');
+
+    const result = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+    });
+
+    expect(result.status).toBe('synced');
+    expect(result.added).toBe(1);
+
+    // Slug should be slugified (lowercase, spaces → hyphens)
+    const page = await engine.getPage('apple-notes/2017-05-03-ohmygreen');
+    expect(page).not.toBeNull();
+    expect(page!.title).toBe('Ohmygreen Notes');
+
+    // Original space-based slug should NOT exist
+    const rawSlug = await engine.getPage('Apple Notes/2017-05-03 ohmygreen');
+    expect(rawSlug).toBeNull();
+  });
+
+  test('incremental sync adds file with special characters', async () => {
+    const { performSync } = await import('../../src/commands/sync.ts');
+    const engine = getEngine();
+
+    // Add a file with parens and special chars
+    writeFileSync(join(repoPath, 'Apple Notes/meeting notes (draft).md'), [
+      '---',
+      'title: Draft Meeting Notes',
+      '---',
+      '',
+      'Some draft notes from the meeting.',
+    ].join('\n'));
+    gitCommit(repoPath, 'add file with parens');
+
+    const result = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+    });
+
+    expect(result.status).toBe('synced');
+
+    // Slug should have parens stripped, spaces → hyphens
+    const page = await engine.getPage('apple-notes/meeting-notes-draft');
+    expect(page).not.toBeNull();
+    expect(page!.title).toBe('Draft Meeting Notes');
+  });
 });

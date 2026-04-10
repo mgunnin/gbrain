@@ -697,14 +697,14 @@ describeE2E('E2E: Slug with Special Characters', () => {
   afterAll(teardownDB);
 
   test('imports files with spaces in filename', async () => {
-    const page = await callOp('get_page', { slug: 'apple-notes/2017-05-03 ohmygreen' }) as any;
+    const page = await callOp('get_page', { slug: 'apple-notes/2017-05-03-ohmygreen' }) as any;
     expect(page).not.toBeNull();
     expect(page.title).toBe('OhMyGreen');
     expect(page.type).toBe('company');
   });
 
   test('imports files with parens in filename', async () => {
-    const page = await callOp('get_page', { slug: 'apple-notes/notes (march 2024)' }) as any;
+    const page = await callOp('get_page', { slug: 'apple-notes/notes-march-2024' }) as any;
     expect(page).not.toBeNull();
     expect(page.title).toBe('March 2024 Notes');
   });
@@ -713,7 +713,7 @@ describeE2E('E2E: Slug with Special Characters', () => {
     const results = await callOp('search', { query: 'OhMyGreen' }) as any[];
     expect(results.length).toBeGreaterThanOrEqual(1);
     const slugs = results.map((r: any) => r.slug);
-    expect(slugs).toContain('apple-notes/2017-05-03 ohmygreen');
+    expect(slugs).toContain('apple-notes/2017-05-03-ohmygreen');
   });
 
   test('re-import of special-char files is idempotent', async () => {

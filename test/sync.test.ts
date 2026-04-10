@@ -90,7 +90,7 @@ describe('isSyncable', () => {
 });
 
 describe('pathToSlug', () => {
-  test('strips .md extension', () => {
+  test('strips .md extension and lowercases', () => {
     expect(pathToSlug('people/pedro-franceschi.md')).toBe('people/pedro-franceschi');
   });
 
@@ -128,6 +128,14 @@ describe('pathToSlug', () => {
 
   test('handles file with only extension', () => {
     expect(pathToSlug('.md')).toBe('');
+  });
+
+  test('slugifies spaces to hyphens', () => {
+    expect(pathToSlug('Apple Notes/2017-05-03 ohmygreen.md')).toBe('apple-notes/2017-05-03-ohmygreen');
+  });
+
+  test('strips special characters', () => {
+    expect(pathToSlug('notes/meeting (march 2024).md')).toBe('notes/meeting-march-2024');
   });
 });
 
