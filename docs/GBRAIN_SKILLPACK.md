@@ -103,6 +103,7 @@ Run `gbrain --help` for the full command reference.
 
 - [Infrastructure Layer](architecture/infra-layer.md) — Import pipeline, chunking, embedding, search
 - [Thin Harness, Fat Skills](ethos/THIN_HARNESS_FAT_SKILLS.md) — Architecture philosophy
+- [Markdown Skills as Recipes](ethos/MARKDOWN_SKILLS_AS_RECIPES.md) — Why markdown is code and your agent is a package manager
 - [Homebrew for Personal AI](designs/HOMEBREW_FOR_PERSONAL_AI.md) — The 10-star vision
 - [Recommended Schema](GBRAIN_RECOMMENDED_SCHEMA.md) — Directory structure for your brain repo
 - [Verification Runbook](GBRAIN_VERIFY.md) — End-to-end installation verification

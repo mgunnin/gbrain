@@ -34,6 +34,7 @@ server are both generated from this single source. Skills are fat markdown files
 - `docs/integrations/` — "Getting Data In" guides and integration docs
 - `docs/architecture/infra-layer.md` — Shared infrastructure documentation
 - `docs/ethos/THIN_HARNESS_FAT_SKILLS.md` — Architecture philosophy essay
+- `docs/ethos/MARKDOWN_SKILLS_AS_RECIPES.md` — "Homebrew for Personal AI" essay
 - `docs/designs/HOMEBREW_FOR_PERSONAL_AI.md` — 10-star vision for integration system
 - `scripts/deploy-remote.sh` — One-script remote MCP deployment
 - `docs/mcp/` — Per-client setup guides (Claude Desktop, Code, Cowork, Perplexity, ChatGPT)
