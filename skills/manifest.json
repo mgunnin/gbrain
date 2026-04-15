@@ -123,6 +123,11 @@
       "name": "webhook-transforms",
       "path": "webhook-transforms/SKILL.md",
       "description": "Convert external events into brain-ingestible signals with entity extraction."
+    },
+    {
+      "name": "data-research",
+      "path": "data-research/SKILL.md",
+      "description": "Structured data research: search, extract, archive, deduplicate, track. Parameterized YAML recipes for investor updates, donations, company metrics."
     }
   ],
   "dependencies": {
