@@ -20,7 +20,7 @@ All notable changes to GBrain will be documented in this file.
 
 - **`gbrain init` detects GStack and reports mod status.** After brain setup, init now shows how many skills are loaded, whether GStack is installed, and where to get it. GStack detection uses `gstack-global-discover` with fallback to known host paths.
 
-- **Conformance standard for all skills.** Every skill now has YAML frontmatter (name, version, description, triggers, tools, mutating) plus Contract, Anti-Patterns, and Output Format sections. Two new test files validate conformance across all 24 skills.
+- **Conformance standard for all skills.** Every skill now has YAML frontmatter (name, version, description, triggers, tools, mutating) plus Contract, Anti-Patterns, and Output Format sections. Two new test files validate conformance across all 25 skills.
 
 - **Existing 8 skills migrated to conformance format.** Frontmatter added, Workflow renamed to Phases, Contract and Anti-Patterns sections added. Ingest becomes a thin router delegating to specialized ingestion skills.
 
@@ -44,6 +44,22 @@ All notable changes to GBrain will be documented in this file.
 | **testing** | Validates every skill has SKILL.md with frontmatter, manifest coverage, resolver coverage. The CI for your skill system. | 3 skills and you need validation. 24 skills and you need it yesterday. Catches dead references, missing sections, MECE violations. |
 | **soul-audit** | 6-phase interview that generates SOUL.md, USER.md, ACCESS_POLICY.md, HEARTBEAT.md. Your agent's identity, built from your answers. | What makes Wintermute feel like Wintermute. Without personality and access control, every agent feels the same. |
 | **webhook-transforms** | External events (SMS, meetings, social mentions) converted into brain pages with entity extraction. Dead-letter queue for failures. | Your brain ingests signals from everywhere. Not just conversations, but every webhook, every notification, every external event. |
+
+### Infrastructure (new in v0.10.0)
+
+- **Your brain now self-validates its own skill routing.** `checkResolvable()` verifies every skill is reachable from RESOLVER.md, detects MECE overlaps, flags missing triggers, and catches DRY violations. Runs from `bun test`, `gbrain doctor`, and the skill-creator skill. Every issue comes with a machine-readable fix object the agent can act on.
+
+- **`gbrain doctor` got serious.** 8 health checks now (up from 5), plus a composite health score (0-100). Filesystem checks (resolver, conformance) run even without a database. `--fast` skips DB checks. `--json` output includes structured `issues` array with action strings so agents can parse and auto-fix.
+
+- **Batch operations won't melt your machine anymore.** Adaptive load-aware throttling checks CPU and memory before each batch item. Exponential backoff with a 20-attempt safety cap. Active hours multiplier slows batch work during the day. Two concurrent batch process limit.
+
+- **Your agent's classifiers get smarter automatically.** Fail-improve loop: try deterministic code first, fall back to LLM, log every fallback. Over time, the logs reveal which regex patterns are missing. Auto-generates test cases from successful LLM results. Tracks deterministic hit rate in `gbrain doctor` output.
+
+- **Voice notes just work.** Groq Whisper transcription (with OpenAI fallback) via `transcribe_audio` operation. Files over 25MB get ffmpeg-segmented automatically. Transcripts flow through the standard import pipeline, entities get extracted, back-links get created.
+
+- **Enrichment is now a global service, not a per-skill skill.** Every ingest pathway can call `extractAndEnrich()` to detect entities and create/update their brain pages. Tier auto-escalation: entities start at Tier 3, auto-promote to Tier 1 based on mention frequency across sources.
+
+- **Data research: one skill for any email-to-tracker pipeline.** New `data-research` skill with parameterized YAML recipes. Extract investor updates (MRR, ARR, runway, headcount), donation receipts, company metrics from email. Battle-tested regex patterns, extraction integrity rule (save first, report second), dedup with configurable tolerance, canonical tracker pages with running totals.
 
 ### For contributors
 

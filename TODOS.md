@@ -68,7 +68,7 @@
 ### Community recipe submission (`gbrain integrations submit`)
 **What:** Package a user's custom integration recipe as a PR to the GBrain repo. Validates frontmatter, checks constrained DSL health_checks, creates PR with template.
 
-**Why:** Turns GBrain from "Garry's integrations" into a community ecosystem. The recipe format IS the contribution format.
+**Why:** Turns GBrain from a single-author integration set into a community ecosystem. The recipe format IS the contribution format.
 
 **Pros:** Community-driven integration library. Users build Slack-to-brain, RSS-to-brain, Discord-to-brain.
 
@@ -100,7 +100,7 @@
 
 **Cons:** Users need ngrok ($8/mo) or a cloud host (Fly.io $5/mo, Railway $5/mo). Not zero-infra.
 
-**Context:** The production deployment at wintermute uses a custom Hono server wrapping `gbrain serve`. This TODO would formalize that pattern into the CLI. ChatGPT OAuth 2.1 support depends on this.
+**Context:** Production deployments use a custom Hono server wrapping `gbrain serve`. This TODO would formalize that pattern into the CLI. ChatGPT OAuth 2.1 support depends on this.
 
 **Depends on:** v0.8.0 (Edge Function removal shipped).
 

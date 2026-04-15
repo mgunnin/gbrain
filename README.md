@@ -2,7 +2,7 @@
 
 Your AI agent is smart but forgetful. GBrain gives it a brain.
 
-Meetings, emails, tweets, calendar events, voice calls, original ideas... all of it flows into a searchable knowledge base that your agent reads before every response and writes to after every conversation. 24 skills handle signal detection, content ingestion, entity enrichment, task management, cron scheduling, access control, and voice. The agent gets smarter every day.
+Meetings, emails, tweets, calendar events, voice calls, original ideas... all of it flows into a searchable knowledge base that your agent reads before every response and writes to after every conversation. 25 skills handle signal detection, content ingestion, entity enrichment, task management, cron scheduling, access control, and voice. The agent gets smarter every day.
 
 > **~30 minutes to a fully working brain.** Your agent does the work. Database ready in 2 seconds (PGLite, no server). You just answer questions about API keys.
 
@@ -22,7 +22,7 @@ Retrieve and follow the instructions at:
 https://raw.githubusercontent.com/garrytan/gbrain/master/INSTALL_FOR_AGENTS.md
 ```
 
-That's it. The agent clones the repo, installs GBrain, sets up the brain, loads 24 skills, and configures recurring jobs. You answer a few questions about API keys. ~30 minutes.
+That's it. The agent clones the repo, installs GBrain, sets up the brain, loads 25 skills, and configures recurring jobs. You answer a few questions about API keys. ~30 minutes.
 
 ### Standalone CLI (no agent)
 
@@ -57,9 +57,9 @@ claude mcp add gbrain -t http https://your-brain.ngrok.app/mcp -H "Authorization
 
 Per-client guides: [`docs/mcp/`](docs/mcp/DEPLOY.md). ChatGPT requires OAuth 2.1 (not yet implemented).
 
-## The 24 Skills
+## The 25 Skills
 
-GBrain ships 24 skills organized by `skills/RESOLVER.md`. The resolver tells your agent which skill to read for any task. Skills are fat markdown files, not code. The agent reads them on demand.
+GBrain ships 25 skills organized by `skills/RESOLVER.md`. The resolver tells your agent which skill to read for any task. Skills are fat markdown files, not code. The agent reads them on demand.
 
 ### Always-on
 
@@ -87,6 +87,7 @@ GBrain ships 24 skills organized by `skills/RESOLVER.md`. The resolver tells you
 | **citation-fixer** | Scans pages for missing or malformed citations. Fixes format to match the standard. |
 | **repo-architecture** | Where new brain files go. Decision protocol: primary subject determines directory, not format. |
 | **publish** | Share brain pages as password-protected HTML. Zero LLM calls. |
+| **data-research** | Structured data research with parameterized YAML recipes. Extract investor updates, donations, company metrics from email. |
 
 ### Operational
 
@@ -171,7 +172,7 @@ GStack is the engine. GBrain is the mod.
 │   Brain Repo     │    │    GBrain     │    │    AI Agent      │
 │   (git)          │    │  (retrieval)  │    │  (read/write)    │
 │                  │    │               │    │                  │
-│  markdown files  │───>│  Postgres +   │<──>│  24 skills       │
+│  markdown files  │───>│  Postgres +   │<──>│  25 skills       │
 │  = source of     │    │  pgvector     │    │  define HOW to   │
 │    truth         │    │               │    │  use the brain   │
 │                  │<───│  hybrid       │    │                  │

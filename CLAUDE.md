@@ -36,6 +36,12 @@ markdown files (tool-agnostic, work with both CLI and plugin contexts).
 - `src/core/search/eval.ts` — Retrieval eval harness: P@k, R@k, MRR, nDCG@k metrics + runEval() orchestrator
 - `src/commands/eval.ts` — `gbrain eval` command: single-run table + A/B config comparison
 - `src/core/embedding.ts` — OpenAI text-embedding-3-large, batch, retry, backoff
+- `src/core/check-resolvable.ts` — Resolver validation: reachability, MECE overlap, DRY checks, structured fix objects
+- `src/core/backoff.ts` — Adaptive load-aware throttling: CPU/memory checks, exponential backoff, active hours multiplier
+- `src/core/fail-improve.ts` — Deterministic-first, LLM-fallback loop with JSONL failure logging and auto-test generation
+- `src/core/transcription.ts` — Audio transcription: Groq Whisper (default), OpenAI fallback, ffmpeg segmentation for >25MB
+- `src/core/enrichment-service.ts` — Global enrichment service: entity slug generation, tier auto-escalation, batch throttling
+- `src/core/data-research.ts` — Recipe validation, field extraction (MRR/ARR regex), dedup, tracker parsing, HTML stripping
 - `src/mcp/server.ts` — MCP stdio server (generated from operations)
 - `src/commands/auth.ts` — Standalone token management (create/list/revoke/test)
 - `src/commands/upgrade.ts` — Self-update CLI with post-upgrade feature discovery
@@ -77,6 +83,7 @@ markdown files (tool-agnostic, work with both CLI and plugin contexts).
 - `skills/testing/SKILL.md` — Skill validation framework
 - `skills/soul-audit/SKILL.md` — 6-phase interview for SOUL.md, USER.md, ACCESS_POLICY.md, HEARTBEAT.md
 - `skills/webhook-transforms/SKILL.md` — External events to brain signals
+- `skills/data-research/SKILL.md` — Structured data research: email-to-tracker pipeline with parameterized YAML recipes
 - `templates/` — SOUL.md, USER.md, ACCESS_POLICY.md, HEARTBEAT.md templates
 - `skills/migrations/` — Version migration files with feature_pitch YAML frontmatter
 - `src/commands/publish.ts` — Deterministic brain page publisher (code+skill pair, zero LLM calls)
@@ -95,7 +102,7 @@ Key commands added in v0.7:
 
 ## Testing
 
-`bun test` runs all tests (28 unit test files + 5 E2E test files). Unit tests run
+`bun test` runs all tests (34 unit test files + 5 E2E test files). Unit tests run
 without a database. E2E tests skip gracefully when `DATABASE_URL` is not set.
 
 Unit tests: `test/markdown.test.ts` (frontmatter parsing), `test/chunkers/recursive.test.ts`
@@ -120,7 +127,13 @@ parity), `test/cli.test.ts` (CLI structure), `test/config.test.ts` (config redac
 `test/search.test.ts` (RRF normalization, compiled truth boost, cosine similarity, dedup key),
 `test/dedup.test.ts` (source-aware dedup, compiled truth guarantee, layer interactions),
 `test/intent.test.ts` (query intent classification: entity/temporal/event/general),
-`test/eval.test.ts` (retrieval metrics: precisionAtK, recallAtK, mrr, ndcgAtK, parseQrels).
+`test/eval.test.ts` (retrieval metrics: precisionAtK, recallAtK, mrr, ndcgAtK, parseQrels),
+`test/check-resolvable.test.ts` (resolver reachability, MECE overlap, gap detection, DRY checks),
+`test/backoff.test.ts` (load-aware throttling, concurrency limits, active hours),
+`test/fail-improve.test.ts` (deterministic/LLM cascade, JSONL logging, test generation, rotation),
+`test/transcription.test.ts` (provider detection, format validation, API key errors),
+`test/enrichment-service.test.ts` (entity slugification, extraction, tier escalation),
+`test/data-research.test.ts` (recipe validation, MRR/ARR extraction, dedup, tracker parsing, HTML stripping).
 
 E2E tests (`test/e2e/`): Run against real Postgres+pgvector. Require `DATABASE_URL`.
 - `bun run test:e2e` runs Tier 1 (mechanical, all operations, no API keys)
@@ -177,7 +190,7 @@ stop and remove it before starting a new one.
 
 ## Skills
 
-Read the skill files in `skills/` before doing brain operations. GBrain ships 24 skills
+Read the skill files in `skills/` before doing brain operations. GBrain ships 25 skills
 organized by `skills/RESOLVER.md`:
 
 **Original 8 (conformance-migrated):** ingest (thin router), query, maintain, enrich,
