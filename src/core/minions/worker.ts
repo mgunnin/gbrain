@@ -12,7 +12,10 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import type { MinionJob, MinionJobContext, MinionHandler, MinionWorkerOpts, TokenUpdate } from './types.ts';
+import type {
+  MinionJob, MinionJobContext, MinionHandler, MinionWorkerOpts,
+  MinionQueueOpts, TokenUpdate,
+} from './types.ts';
 import { UnrecoverableError } from './types.ts';
 import { MinionQueue } from './queue.ts';
 import { calculateBackoff } from './backoff.ts';
@@ -38,9 +41,12 @@ export class MinionWorker {
 
   constructor(
     private engine: BrainEngine,
-    opts?: MinionWorkerOpts,
+    opts?: MinionWorkerOpts & MinionQueueOpts,
   ) {
-    this.queue = new MinionQueue(engine);
+    this.queue = new MinionQueue(engine, {
+      maxSpawnDepth: opts?.maxSpawnDepth,
+      maxAttachmentBytes: opts?.maxAttachmentBytes,
+    });
     this.opts = {
       queue: opts?.queue ?? 'default',
       concurrency: opts?.concurrency ?? 1,
@@ -78,7 +84,9 @@ export class MinionWorker {
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
 
-    // Stall detection on interval
+    // Stall + timeout detection on interval. Order matters: handleStalled FIRST
+    // so a stalled job (lock_until expired) gets requeued before handleTimeouts'
+    // `lock_until > now()` guard would skip it. Stall → retry, timeout → dead.
     const stalledTimer = setInterval(async () => {
       try {
         const { requeued, dead } = await this.queue.handleStalled();
@@ -86,6 +94,12 @@ export class MinionWorker {
         if (dead.length > 0) console.log(`Stall detector: dead-lettered ${dead.length} jobs`);
       } catch (e) {
         console.error('Stall detection error:', e instanceof Error ? e.message : String(e));
+      }
+      try {
+        const timedOut = await this.queue.handleTimeouts();
+        if (timedOut.length > 0) console.log(`Timeout detector: dead-lettered ${timedOut.length} jobs (timeout exceeded)`);
+      } catch (e) {
+        console.error('Timeout detection error:', e instanceof Error ? e.message : String(e));
       }
     }, this.opts.stalledInterval);
 
@@ -160,9 +174,25 @@ export class MinionWorker {
       }
     }, this.opts.lockDuration / 2);
 
+    // Per-job wall-clock timeout safety net. Cooperative: fires abort() so the
+    // handler's signal flips. Handlers ignoring AbortSignal can't be force-killed
+    // from JS; the DB-side handleTimeouts is the authoritative status flip.
+    // The .finally clearTimeout below ensures process exit isn't delayed by a
+    // dangling timer on normal completion.
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+    if (job.timeout_ms != null) {
+      timeoutTimer = setTimeout(() => {
+        if (!abort.signal.aborted) {
+          console.warn(`Job ${job.id} (${job.name}) hit per-job timeout (${job.timeout_ms}ms), aborting`);
+          abort.abort();
+        }
+      }, job.timeout_ms);
+    }
+
     const promise = this.executeJob(job, lockToken, abort, lockTimer)
       .finally(() => {
         clearInterval(lockTimer);
+        if (timeoutTimer) clearTimeout(timeoutTimer);
         this.inFlight.delete(job.id);
       });
 
@@ -231,11 +261,9 @@ export class MinionWorker {
         console.warn(`Job ${job.id} completion dropped (lock token mismatch, job was reclaimed)`);
         return;
       }
-
-      // Resolve parent if this is a child job
-      if (job.parent_job_id) {
-        await this.queue.resolveParent(job.parent_job_id);
-      }
+      // resolveParent is folded into queue.completeJob() (same transaction as
+      // status flip + token rollup + child_done), so a process crash here can't
+      // strand the parent in waiting-children.
     } catch (err) {
       clearInterval(lockTimer);
 
@@ -268,26 +296,10 @@ export class MinionWorker {
         console.warn(`Job ${job.id} failure dropped (lock token mismatch)`);
         return;
       }
-
-      // Handle parent-child failure policies
-      if (job.parent_job_id && (newStatus === 'dead' || newStatus === 'failed')) {
-        const parentJob = await this.queue.getJob(job.parent_job_id);
-        if (parentJob && parentJob.status === 'waiting-children') {
-          switch (job.on_child_fail) {
-            case 'fail_parent':
-              await this.queue.failParent(job.parent_job_id, job.id, errorText);
-              break;
-            case 'remove_dep':
-              await this.queue.removeChildDependency(job.id);
-              await this.queue.resolveParent(job.parent_job_id);
-              break;
-            case 'ignore':
-            case 'continue':
-              await this.queue.resolveParent(job.parent_job_id);
-              break;
-          }
-        }
-      }
+      // Parent-failure hook (fail_parent / remove_dep / ignore / continue) is
+      // folded into queue.failJob() in the same transaction as the child status
+      // flip + remove_on_fail delete. Worker stays out of multi-statement
+      // crash-window territory.
 
       if (newStatus === 'delayed') {
         console.log(`Job ${job.id} (${job.name}) failed, retrying in ${Math.round(backoffMs)}ms (attempt ${job.attempts_made + 1}/${job.max_attempts})`);
