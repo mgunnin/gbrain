@@ -22,6 +22,7 @@
     "build:schema": "bash scripts/build-schema.sh",
     "test": "bun test",
     "test:e2e": "bun test test/e2e/",
+    "postinstall": "gbrain --version >/dev/null 2>&1 && gbrain apply-migrations --yes --non-interactive 2>/dev/null || true",
     "prepublish:clawhub": "bun run build:all",
     "publish:clawhub": "clawhub package publish . --family bundle-plugin"
   },

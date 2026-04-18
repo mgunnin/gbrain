@@ -248,7 +248,7 @@ async function handleCliOnly(command: string, args: string[]) {
   }
   if (command === 'post-upgrade') {
     const { runPostUpgrade } = await import('./commands/upgrade.ts');
-    runPostUpgrade();
+    await runPostUpgrade();
     return;
   }
   if (command === 'check-update') {

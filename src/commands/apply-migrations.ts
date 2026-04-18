@@ -13,6 +13,7 @@
  */
 
 import { VERSION } from '../version.ts';
+import { loadConfig } from '../core/config.ts';
 import { loadCompletedMigrations, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
 
@@ -215,6 +216,17 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   if (cli.help) { printHelp(); return; }
 
   const installed = VERSION.replace(/^v/, '').trim() || '0.0.0';
+
+  // First-install guard (postinstall hook calls us even on `bun add gbrain`
+  // before the user has run `gbrain init`). No config = no brain = nothing
+  // to migrate. Exit silently for --yes / --non-interactive so postinstall
+  // stays quiet; mention the init step when invoked interactively.
+  if (!loadConfig()) {
+    if (cli.list) console.log('No brain configured. Run `gbrain init` to set one up.');
+    else if (cli.dryRun) console.log('No brain configured (run `gbrain init` first). Nothing to migrate.');
+    return;
+  }
+
   const completed = loadCompletedMigrations();
   const idx = indexCompleted(completed);
   const plan = buildPlan(idx, installed, cli.specificMigration);
