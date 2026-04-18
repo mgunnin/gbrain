@@ -262,11 +262,33 @@ const put_page: Operation = {
       }
     }
 
+    // Post-write validator lint (PR 2.5): feature-flag-gated, non-blocking.
+    // When `writer.lint_on_put_page` is enabled, runs the BrainWriter's
+    // validators on the freshly-written page and logs findings to
+    // ingest_log + ~/.gbrain/validator-lint.jsonl. Does NOT reject the
+    // write — that's the deferred strict-mode flip after the 7-day soak.
+    let writerLint: { error_count: number; warning_count: number } | { skipped: string } | undefined;
+    try {
+      const { runPostWriteLint } = await import('./output/post-write.ts');
+      const lint = await runPostWriteLint(ctx.engine, result.slug);
+      if (lint.ran) {
+        writerLint = {
+          error_count: lint.findings.filter(f => f.severity === 'error').length,
+          warning_count: lint.findings.filter(f => f.severity === 'warning').length,
+        };
+      } else if (lint.skippedReason) {
+        writerLint = { skipped: lint.skippedReason };
+      }
+    } catch {
+      // Non-fatal; never blocks put_page.
+    }
+
     return {
       slug: result.slug,
       status: result.status === 'imported' ? 'created_or_updated' : result.status,
       chunks: result.chunks,
       ...(autoLinks ? { auto_links: autoLinks } : {}),
+      ...(writerLint ? { writer_lint: writerLint } : {}),
     };
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
