@@ -100,13 +100,11 @@ prunes stale references when page content changes.
 This matters for cron-style maintenance. Wintermute can run `extract --source db`
 nightly and not blow up the link table.
 
-## Relational query accuracy
+## Relational query accuracy (Configuration C only)
 
 The graph layer makes questions like "who works at Acme AI?" and "who attended this
-meeting?" answerable. Without the graph, the agent would do keyword search and miss
-people who aren't textually adjacent.
+meeting?" answerable. The benchmark runs 5 relational queries:
 
-Tested 5 relational queries against the seeded graph:
 - "Who works at startup-N?" → 100% recall (founders + engineers found)
 - "Who advises company-N?" → 100% recall (advisor links found)
 - "What did partner-N invest in?" → 100% recall (VC investment chain)
@@ -115,6 +113,67 @@ Tested 5 relational queries against the seeded graph:
 
 100% relational recall on the seeded graph. Real-world recall depends on extraction
 recall (94.4%), which depends on whether content uses recognizable patterns.
+
+## Configuration A (no graph) vs C (full graph)
+
+The headline question: **what does this PR actually buy you?** Same data, same
+queries, but Configuration A skips extraction entirely (empty `links` table) and
+falls back to what a pre-v0.10.3 agent could do — regex-extract entity references
+from the seed page for outgoing queries, grep all pages for the seed slug for
+incoming queries.
+
+| Metric                | A: no graph | C: full graph | Delta    |
+|-----------------------|-------------|----------------|----------|
+| relational_recall     | 100.0%      | 100.0%         | +0%      |
+| relational_precision  | 58.8%       | 100.0%         | **+70%** |
+
+**Recall is identical because the answers are in the markdown content either way.**
+A's fallback finds the same correct answers as C — the slugs are right there in the
+text. **Precision is where the graph wins.** Without typed links, the agent can't
+distinguish `works_at` from `advises` from just-happens-to-mention.
+
+### Per-query breakdown
+
+| Question                          | Expected | A: found / returned | C: found / returned |
+|-----------------------------------|----------|---------------------|---------------------|
+| Who attended Demo Day 0?          | 3        | 3 / 3               | 3 / 3               |
+| Who attended Board 0?             | 2        | 2 / 2               | 2 / 2               |
+| What companies has uma advised?   | 2        | 2 / 2               | 2 / 2               |
+| Who works at startup-0?           | 2        | **2 / 5**           | 2 / 2               |
+| Which VCs invested in startup-0?  | 1        | **1 / 5**           | 1 / 1               |
+
+**Outgoing queries** ("who attended X?", "what has Y advised?") — A and C tie. The
+seed page enumerates the answers as markdown links; both configs find them.
+
+**Incoming queries** ("who works at X?", "who invested in X?") — A returns the right
+answers buried in noise. For "who works at startup-0?", A finds 5 candidates (every
+page that mentions `startup-0`) — 2 employees plus 3 noise (a VC, a concept page,
+another startup that mentions startup-0 in its description). C returns exactly 2.
+
+For an LLM agent reading these results, that's the difference between:
+- **A:** "Here are 5 pages mentioning startup-0. I'll read each and figure out who
+  actually works there."
+- **C:** "Here are the 2 employees of startup-0."
+
+The 70% precision delta means the agent does ~3x less reading work to answer
+relational questions correctly. On a 30K-page brain with hundreds of incoming
+queries per day, that's the difference between a brain that responds quickly and one
+that scans like grep.
+
+### What this benchmark does NOT test (yet)
+
+- **Multi-hop traversal** ("who attended meetings with people who work at startup-0?").
+  A's fallback would need 2 sequential greps and manual stitching; C does it in one
+  recursive CTE. Adding multi-hop queries would show recall divergence (not just
+  precision), but isn't in the v0.10.3 query set.
+- **Search ranking with backlink boost.** This benchmark tests graph traversal, not
+  hybrid search. The existing [search-quality benchmark](2026-04-14-search-quality.md)
+  covers nDCG; future work could combine A/B/C across both.
+- **Aggregate queries** ("who is the most-connected person?"). C makes these trivial
+  via `getBacklinkCounts`. A would require reading every page.
+- **Type-disagreement queries** ("which advisors are also investors?"). C handles
+  these via two filtered traversals and set intersection. A can't do them without
+  inferring types from prose.
 
 ## What shipped in PR #188
 

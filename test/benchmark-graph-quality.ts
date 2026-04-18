@@ -312,6 +312,90 @@ interface Metrics {
   total_pages: number;
 }
 
+// ─── Baseline (no graph) measurement ────────────────────────────
+
+interface BaselineResult {
+  relational_recall: number;
+  relational_precision: number;
+  per_query: Array<{ question: string; expected: number; found: number; returned: number }>;
+}
+
+/**
+ * Simulate a pre-v0.10.3 agent answering relational queries WITHOUT the
+ * structured graph. The fallback techniques an agent had available:
+ *
+ * 1. Outgoing-direction queries (e.g., "who attended demo-day-0?"):
+ *    Read the seed page content and regex-extract entity references.
+ *    Markdown links like `[Name](people/slug)` are findable; bare slug
+ *    refs are findable.
+ *
+ * 2. Incoming-direction queries (e.g., "who works at startup-0?"):
+ *    Scan ALL pages for content that mentions the seed slug. This is
+ *    what `grep -rl 'startup-0' brain/` does.
+ *
+ * 3. Type filtering: NOT POSSIBLE without inferLinkType. The fallback
+ *    returns all matching refs regardless of relationship type. So a
+ *    query for `--type works_at` returns whoever mentions the seed
+ *    page, not just employees. Counted as a recall hit if the expected
+ *    slug appears anywhere; precision suffers because non-employees
+ *    also surface.
+ */
+async function measureBaselineRelational(
+  seeds: SeededPage[],
+  queries: ReturnType<typeof buildQueries>,
+): Promise<BaselineResult> {
+  // Build a content index: slug -> compiled_truth + timeline text.
+  const contentBySlug = new Map<string, string>();
+  for (const s of seeds) {
+    contentBySlug.set(s.slug, `${s.page.compiled_truth}\n${s.page.timeline ?? ''}`);
+  }
+  const ENTITY_REF_RE = /\[[^\]]+\]\(([^)]+)\)|\b((?:people|companies|meetings|concepts)\/[a-z0-9-]+)\b/gi;
+
+  const perQuery: Array<{ question: string; expected: number; found: number }> = [];
+  let totalExpected = 0, totalFound = 0;
+  let totalReturned = 0, totalValid = 0;
+
+  for (const q of queries) {
+    const expected = new Set(q.expected);
+    let returned: Set<string>;
+
+    if ((q.direction ?? 'out') === 'out') {
+      // Read seed page, extract refs from its content.
+      const content = contentBySlug.get(q.seed) ?? '';
+      returned = new Set();
+      for (const match of content.matchAll(ENTITY_REF_RE)) {
+        const ref = (match[1] ?? match[2] ?? '').replace(/\.md$/, '').replace(/^\.\.\//, '');
+        if (ref && ref.includes('/')) returned.add(ref);
+      }
+    } else {
+      // Incoming: scan ALL pages for the seed slug. This is the grep fallback.
+      // Returns any page that mentions the seed — undifferentiated by relationship type.
+      returned = new Set();
+      for (const [slug, content] of contentBySlug) {
+        if (slug === q.seed) continue;
+        if (content.includes(q.seed)) returned.add(slug);
+      }
+    }
+
+    let foundForQuery = 0;
+    for (const e of expected) {
+      totalExpected++;
+      if (returned.has(e)) { totalFound++; foundForQuery++; }
+    }
+    for (const r of returned) {
+      totalReturned++;
+      if (expected.has(r)) totalValid++;
+    }
+    perQuery.push({ question: q.question, expected: expected.size, found: foundForQuery, returned: returned.size });
+  }
+
+  return {
+    relational_recall: totalExpected > 0 ? totalFound / totalExpected : 1,
+    relational_precision: totalReturned > 0 ? totalValid / totalReturned : 1,
+    per_query: perQuery,
+  };
+}
+
 // ─── Main runner ────────────────────────────────────────────────
 
 async function main() {
@@ -427,6 +511,7 @@ async function main() {
   // Relational query accuracy.
   const queries = buildQueries();
   let relExpected = 0, relFound = 0, relTotalReturned = 0, relValidReturned = 0;
+  const cPerQuery: Array<{ found: number; returned: number }> = [];
   for (const q of queries) {
     const paths = await engine.traversePaths(q.seed, {
       depth: q.depth ?? 1,
@@ -437,14 +522,16 @@ async function main() {
       paths.map(p => q.direction === 'in' ? p.from_slug : p.to_slug),
     );
     const expected = new Set(q.expected);
+    let foundForQuery = 0;
     for (const e of expected) {
       relExpected++;
-      if (returned.has(e)) relFound++;
+      if (returned.has(e)) { relFound++; foundForQuery++; }
     }
     for (const r of returned) {
       relTotalReturned++;
       if (expected.has(r)) relValidReturned++;
     }
+    cPerQuery.push({ found: foundForQuery, returned: returned.size });
   }
   const relational_recall = relExpected > 0 ? relFound / relExpected : 1;
   const relational_precision = relTotalReturned > 0 ? relValidReturned / relTotalReturned : 1;
@@ -469,6 +556,13 @@ async function main() {
   //  the e2e/graph-quality.test.ts covers the full operation handler path.)
   const reconciliation_correct = 1; // covered by e2e tests; benchmark records as 100%.
 
+  // ── Configuration A: NO graph layer ──
+  // Spin up a fresh engine, seed the same pages, do NOT run extract.
+  // For each relational query, simulate what a pre-v0.10.3 agent could do:
+  // grep page content for entity references and the seed slug.
+  // This is the honest "what does the brain do without our PR" baseline.
+  const baseline = await measureBaselineRelational(seeds, queries);
+
   await engine.disconnect();
 
   const m: Metrics = {
@@ -486,7 +580,7 @@ async function main() {
   // ── Output ──
 
   if (json) {
-    process.stdout.write(JSON.stringify(m, null, 2) + '\n');
+    process.stdout.write(JSON.stringify({ ...m, baseline }, null, 2) + '\n');
   } else {
     log('## Metrics');
     log('| Metric                | Value | Target | Pass |');
@@ -507,6 +601,36 @@ async function main() {
     log('## Type confusion matrix (predicted -> { actual: count })');
     for (const [pred, actuals] of Object.entries(typeConfusion)) {
       log(`  ${pred}:  ${JSON.stringify(actuals)}`);
+    }
+    log('');
+
+    // ── A vs C comparison ──
+    log('## Configuration A (no graph) vs C (full graph)');
+    log('Same data, same queries. A = pre-v0.10.3 brain (no extract, fallback to');
+    log('content scanning). C = full graph layer (typed traversal).');
+    log('');
+    log('| Metric                 | A: no graph | C: full graph | Delta       |');
+    log('|------------------------|-------------|----------------|-------------|');
+    const delta = (a: number, c: number) => {
+      if (a === 0 && c > 0) return `+∞ (was 0)`;
+      const d = ((c - a) / Math.max(a, 0.001)) * 100;
+      return `${d >= 0 ? '+' : ''}${d.toFixed(0)}%`;
+    };
+    log(`| relational_recall      | ${pct(baseline.relational_recall).padEnd(11)} | ${pct(relational_recall).padEnd(14)} | ${delta(baseline.relational_recall, relational_recall).padEnd(11)} |`);
+    log(`| relational_precision   | ${pct(baseline.relational_precision).padEnd(11)} | ${pct(relational_precision).padEnd(14)} | ${delta(baseline.relational_precision, relational_precision).padEnd(11)} |`);
+    log('');
+
+    log('## Per-query: A vs C');
+    log('Found = correct hits. Returned = total results (correct + noise).');
+    log('Lower returned-count at same found-count means less noise to filter.');
+    log('');
+    log('| Question                                 | Expected | A: found / returned | C: found / returned |');
+    log('|------------------------------------------|----------|---------------------|---------------------|');
+    for (let i = 0; i < queries.length; i++) {
+      const q = queries[i];
+      const b = baseline.per_query[i];
+      const c = cPerQuery[i];
+      log(`| ${q.question.slice(0, 40).padEnd(40)} | ${String(b.expected).padEnd(8)} | ${String(`${b.found} / ${b.returned}`).padEnd(19)} | ${String(`${c.found} / ${c.returned}`).padEnd(19)} |`);
     }
     log('');
   }
