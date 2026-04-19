@@ -18,7 +18,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'apply-migrations', 'skillpack-check']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'apply-migrations', 'skillpack-check', 'repair-jsonb']);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -304,6 +304,11 @@ async function handleCliOnly(command: string, args: string[]) {
     // `gbrain init --migrate-only` and `gbrain jobs smoke`.
     const { runApplyMigrations } = await import('./commands/apply-migrations.ts');
     await runApplyMigrations(args);
+    return;
+  }
+  if (command === 'repair-jsonb') {
+    const { runRepairJsonbCli } = await import('./commands/repair-jsonb.ts');
+    await runRepairJsonbCli(args);
     return;
   }
   if (command === 'skillpack-check') {
