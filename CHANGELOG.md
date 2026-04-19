@@ -70,6 +70,78 @@ Four subcommands: `check` (read-only report with `--json`, `--type`, `--limit`),
 - Schema v11 not v8 (graph layer took v8-v10).
 - `gray-matter` + line tokenizer for citation parsing, not `marked.lexer`.
 
+## [0.12.3] - 2026-04-19
+
+## **Reliability wave: the pieces v0.12.2 didn't cover.**
+## **Sync stops hanging. Search timeouts stop leaking. `[[Wikilinks]]` are edges.**
+
+v0.12.2 shipped the data-correctness hotfix (JSONB double-encode, splitBody, `/wiki/` types, parseEmbedding). This wave lands the remaining reliability fixes from the same community review pass, plus a graph-layer feature a 2,100-page brain needed to stop bleeding edges. No schema changes. No migration. `gbrain upgrade` pulls it.
+
+### What was broken
+
+**Incremental sync deadlocked past 10 files.** `src/commands/sync.ts` wrapped the whole import in `engine.transaction`, and `importFromContent` also wrapped each file. PGLite's `_runExclusiveTransaction` is non-reentrant — the inner call parks on the mutex the outer call holds, forever. In practice: 3 files synced fine, 15 files hung in `ep_poll` until you killed the process. Bulk Minions jobs and citation-fixer dream-cycles regularly hit this. Discovered by @sunnnybala.
+
+**`statement_timeout` leaked across the postgres.js pool.** `searchKeyword` and `searchVector` bounded queries with `SET statement_timeout='8s'` + `finally SET 0`. But every tagged template picks an arbitrary pool connection, so the SET, the query, and the reset could land on three different sockets. The 8s cap stuck to whichever connection ran the SET, got returned to the pool, and the next unrelated caller inherited it. Long-running `embed --all` jobs and imports clipped silently. Fix by @garagon.
+
+**Obsidian `[[WikiLinks]]` were invisible to the auto-link post-hook.** `extractEntityRefs` only matched `[Name](people/slug)`. On a 2,100-page brain with wikilinks throughout, `put_page` extracted zero auto-links. `DIR_PATTERN` also missed domain-organized wiki roots (`entities`, `projects`, `tech`, `finance`, `personal`, `openclaw`). After the fix: 1,377 new typed edges on a single `extract --source db` pass. Discovered and fixed by @knee5.
+
+**Corrupt embedding rows broke every query that touched them.** `getEmbeddingsByChunkIds` on Supabase could return a pgvector string instead of a `Float32Array`. v0.12.2 fixed the normal path by normalizing inputs, but one genuinely bad row still threw and killed the ranking pass. Availability matters more than strictness on the read path.
+
+### What you can do now that you couldn't before
+
+- **Sync 100 files without hanging.** Per-file atomicity preserved, outer wrap removed. Regression test asserts `engine.transaction` is not called at the top level of `src/commands/sync.ts`. Contributed by @sunnnybala.
+- **Run a long `embed --all` on Supabase without strangling unrelated queries.** `searchKeyword` / `searchVector` use `sql.begin` + `SET LOCAL` so the timeout dies with the transaction. 5 regression tests in `test/postgres-engine.test.ts` pin the new shape. Contributed by @garagon.
+- **Write `[[people/balaji|Balaji Srinivasan]]` in a page and see a typed edge.** Same extractor, two syntaxes. Matches the filesystem walker — the db and fs sources now produce the same link graph from the same content. Contributed by @knee5.
+- **Find your under-connected pages.** `gbrain orphans` surfaces pages with zero inbound wikilinks, grouped by domain. `--json`, `--count`, and `--include-pseudo` flags. Also exposed as the `find_orphans` MCP operation so agents can run enrichment cycles without CLI glue. Contributed by @knee5.
+- **Degraded embedding rows skip+warn instead of throwing.** New `tryParseEmbedding()` sibling of `parseEmbedding()`: returns `null` on unknown input and warns once per process. Used on the search/rescore path. Migration and ingest paths still throw — data integrity there is non-negotiable.
+- **`gbrain doctor` tells you which brains still need repair.** Two new checks: `jsonb_integrity` scans the four v0.12.0 write sites and reports rows where `jsonb_typeof = 'string'`; `markdown_body_completeness` heuristically flags pages whose `compiled_truth` is <30% of raw source length when raw has multiple H2/H3 boundaries. Fix hint points at `gbrain repair-jsonb` and `gbrain sync --force`.
+
+### How to upgrade
+
+```bash
+gbrain upgrade
+```
+
+No migration, no schema change, no data touch. If you're on Postgres and haven't run `gbrain repair-jsonb` since v0.12.2, the v0.12.2 orchestrator still runs on upgrade. New `gbrain doctor` will tell you if anything still looks off.
+
+### Itemized changes
+
+**Sync deadlock fix (#132)**
+- `src/commands/sync.ts` — remove outer `engine.transaction` wrap; per-file atomicity preserved by `importFromContent`'s own wrap.
+- `test/sync.test.ts` — new regression guard asserting top-level `engine.transaction` is not called on > 10-file sync paths.
+- Contributed by @sunnnybala.
+
+**postgres-engine statement_timeout scoping (#158)**
+- `src/core/postgres-engine.ts` — `searchKeyword` and `searchVector` rewritten to `sql.begin(async (tx) => { await tx\`SET LOCAL statement_timeout = ...\`; ... })`. GUC dies with the transaction; pool reuse is safe.
+- `test/postgres-engine.test.ts` — 5 regression tests including a source-level guardrail grep against the production file (not a test fixture) asserting no bare `SET statement_timeout` outside `sql.begin`.
+- Contributed by @garagon.
+
+**Obsidian wikilinks + extended domain patterns (#187 slice)**
+- `src/core/link-extraction.ts` — `extractEntityRefs` matches both `[Name](people/slug)` and `[[people/slug|Name]]`. `DIR_PATTERN` extended with `entities`, `projects`, `tech`, `finance`, `personal`, `openclaw`.
+- Matches existing filesystem-walker behavior.
+- Contributed by @knee5.
+
+**`gbrain orphans` command (#187 slice)**
+- `src/commands/orphans.ts` — new command with text/JSON/count outputs and domain grouping.
+- `src/core/operations.ts` — `find_orphans` MCP operation.
+- `src/cli.ts` — `orphans` added to `CLI_ONLY`.
+- `test/orphans.test.ts` — 203 lines covering detection, filters, and all output modes.
+- Contributed by @knee5.
+
+**`tryParseEmbedding()` availability helper**
+- `src/core/utils.ts` — new `tryParseEmbedding(value)`: returns `null` on unknown input, warns once per process via a module-level flag.
+- `src/core/postgres-engine.ts` — `getEmbeddingsByChunkIds` uses `tryParseEmbedding` so one bad row degrades ranking instead of killing the query.
+- `test/utils.test.ts` — new cases for null-return and single-warn.
+- Hand-authored; codifies the split-by-call-site rule from the #97/#175 review.
+
+**Doctor detection checks**
+- `src/commands/doctor.ts` — `jsonb_integrity` scans `pages.frontmatter`, `raw_data.data`, `ingest_log.pages_updated`, `files.metadata` and reports `jsonb_typeof='string'` counts; `markdown_body_completeness` heuristic for ≥30% shrinkage vs raw source on multi-H2 pages.
+- `test/doctor.test.ts` — detection unit tests assert both checks exist and cover the four JSONB sites.
+- `test/e2e/jsonb-roundtrip.test.ts` — the regression test that should have caught the original v0.12.0 double-encode bug; round-trips all four JSONB write sites against real Postgres.
+- `docs/integrations/reliability-repair.md` — guide for v0.12.0 users: detect via `gbrain doctor`, repair via `gbrain repair-jsonb`.
+
+**No schema changes. No migration. No data touch.**
+
 ## [0.12.2] - 2026-04-19
 
 ## **Postgres frontmatter queries actually work now.**

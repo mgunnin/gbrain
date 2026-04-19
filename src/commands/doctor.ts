@@ -208,10 +208,10 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
     checks.push({ name: 'graph_coverage', status: 'warn', message: 'Could not check graph coverage' });
   }
 
-  // 9. Integrity sample scan (non-fast only). Read-only — no network,
-  // no writes, no resolver calls. Samples the first 500 pages by slug
-  // order and surfaces bare-tweet + dead-link counts as a warning.
-  // Full-brain scan: `gbrain integrity check`.
+  // 9. Integrity sample scan (v0.13 knowledge runtime).
+  // Read-only — no network, no writes, no resolver calls. Samples the first
+  // 500 pages by slug order and surfaces bare-tweet + dead-link counts as a
+  // warning. Full-brain scan: `gbrain integrity check`.
   try {
     const { scanIntegrity } = await import('./integrity.ts');
     const res = await scanIntegrity(engine, { limit: 500 });
@@ -237,6 +237,74 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
     }
   } catch (e) {
     checks.push({ name: 'integrity', status: 'warn', message: `integrity scan skipped: ${e instanceof Error ? e.message : String(e)}` });
+  }
+
+  // 10. JSONB integrity (v0.12.3 reliability wave).
+  // v0.12.0's JSON.stringify()::jsonb pattern stored JSONB string literals
+  // instead of objects on real Postgres. PGLite masked this; Supabase did not.
+  // Scan the 4 known sites (pages.frontmatter, raw_data.data, ingest_log.pages_updated,
+  // files.metadata) for rows whose top-level jsonb_typeof is 'string'.
+  try {
+    const sql = db.getConnection();
+    const targets: Array<{ table: string; col: string; expected: 'object' | 'array' }> = [
+      { table: 'pages',      col: 'frontmatter',    expected: 'object' },
+      { table: 'raw_data',   col: 'data',           expected: 'object' },
+      { table: 'ingest_log', col: 'pages_updated',  expected: 'array'  },
+      { table: 'files',      col: 'metadata',       expected: 'object' },
+    ];
+    let totalBad = 0;
+    const breakdown: string[] = [];
+    for (const { table, col } of targets) {
+      const rows = await sql.unsafe(
+        `SELECT count(*)::int AS n FROM ${table} WHERE jsonb_typeof(${col}) = 'string'`,
+      );
+      const n = Number((rows as any)[0]?.n ?? 0);
+      if (n > 0) { totalBad += n; breakdown.push(`${table}.${col}=${n}`); }
+    }
+    if (totalBad === 0) {
+      checks.push({ name: 'jsonb_integrity', status: 'ok', message: 'All JSONB columns store objects/arrays' });
+    } else {
+      checks.push({
+        name: 'jsonb_integrity',
+        status: 'warn',
+        message: `${totalBad} row(s) double-encoded (${breakdown.join(', ')}). Fix: gbrain repair-jsonb`,
+      });
+    }
+  } catch {
+    checks.push({ name: 'jsonb_integrity', status: 'warn', message: 'Could not check JSONB integrity' });
+  }
+
+  // 11. Markdown body completeness (v0.12.3 reliability wave).
+  // v0.12.0's splitBody ate everything after the first `---` horizontal rule,
+  // truncating wiki-style pages. Heuristic: pages whose body is <30% of the
+  // raw source content length when raw has multiple H2/H3 boundaries.
+  try {
+    const sql = db.getConnection();
+    const rows = await sql`
+      SELECT p.slug,
+             length(p.compiled_truth) AS body_len,
+             length(rd.data ->> 'content') AS raw_len
+      FROM pages p
+      JOIN raw_data rd ON rd.page_id = p.id
+      WHERE rd.data ? 'content'
+        AND length(rd.data ->> 'content') > 1000
+        AND length(p.compiled_truth) < length(rd.data ->> 'content') * 0.3
+        AND (rd.data ->> 'content') ~ '(^|\n)##+ '
+      LIMIT 100
+    `;
+    if (rows.length === 0) {
+      checks.push({ name: 'markdown_body_completeness', status: 'ok', message: 'No truncated bodies detected' });
+    } else {
+      const sample = rows.slice(0, 3).map((r: any) => r.slug).join(', ');
+      checks.push({
+        name: 'markdown_body_completeness',
+        status: 'warn',
+        message: `${rows.length} page(s) appear truncated (sample: ${sample}). Re-import with: gbrain sync --force`,
+      });
+    }
+  } catch {
+    // pages_raw.raw_data may not exist on older schemas; best-effort.
+    checks.push({ name: 'markdown_body_completeness', status: 'ok', message: 'Skipped (raw_data unavailable)' });
   }
 
   const hasFail = outputResults(checks, jsonOutput);
