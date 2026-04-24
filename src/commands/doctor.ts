@@ -649,6 +649,106 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     mbcHb();
   }
 
+  // 11b. Queue health (v0.19.1 queue-resilience wave).
+  // Postgres-only because PGLite has no multi-process worker surface. Two
+  // subchecks, both cheap (single SELECT each, status-index-covered):
+  //
+  //   1. stalled-forever: any active job whose started_at is > 1h old. The
+  //      incident that motivated this release ran 90+ min before surfacing.
+  //      Surface the ID so the operator can `gbrain jobs get <id>` to inspect
+  //      or `gbrain jobs cancel <id>` to force-kill.
+  //
+  //   2. backpressure-missed: per-name waiting depth exceeds the threshold
+  //      (default 10, override via GBRAIN_QUEUE_WAITING_THRESHOLD env). Signal
+  //      that a submitter probably needs maxWaiting set. Bounded by per-name
+  //      aggregation so a single name's pile shows up clearly instead of
+  //      getting lost in the total.
+  //
+  // Not included in v0.19.1 (tracked as B7 follow-up): worker-heartbeat
+  // staleness. It needs a minion_workers table; the lock_until-on-active-jobs
+  // proxy can't distinguish "no worker" from "worker idle," and a check that
+  // cries wolf erodes trust in every other doctor check.
+  progress.heartbeat('queue_health');
+  if (engine.kind === 'pglite') {
+    checks.push({
+      name: 'queue_health',
+      status: 'ok',
+      message: 'Skipped (PGLite — no multi-process worker surface)',
+    });
+  } else {
+    const queueHealthHb = startHeartbeat(progress, 'scanning queue health…');
+    try {
+      const sql = db.getConnection();
+      // Subcheck 1: stalled-forever active jobs (>1h wall-clock).
+      const stalledRows: Array<{ id: number; name: string; started_at: string }> = await sql`
+        SELECT id, name, started_at::text AS started_at
+          FROM minion_jobs
+         WHERE status = 'active'
+           AND started_at IS NOT NULL
+           AND started_at < now() - interval '1 hour'
+         ORDER BY started_at ASC
+         LIMIT 5
+      `;
+      // Subcheck 2: per-name waiting depth exceeds threshold.
+      const rawThreshold = process.env.GBRAIN_QUEUE_WAITING_THRESHOLD;
+      const parsedThreshold = rawThreshold ? parseInt(rawThreshold, 10) : 10;
+      const threshold = Number.isFinite(parsedThreshold) && parsedThreshold >= 1
+        ? parsedThreshold
+        : 10;
+      const depthRows: Array<{ name: string; queue: string; depth: number }> = await sql`
+        SELECT name, queue, count(*)::int AS depth
+          FROM minion_jobs
+         WHERE status = 'waiting'
+         GROUP BY name, queue
+        HAVING count(*) > ${threshold}
+         ORDER BY depth DESC
+         LIMIT 5
+      `;
+
+      const problems: string[] = [];
+      if (stalledRows.length > 0) {
+        const sample = stalledRows
+          .map(r => `#${r.id}(${r.name})`)
+          .join(', ');
+        problems.push(
+          `${stalledRows.length} stalled-forever job(s): ${sample}. ` +
+          `Fix: gbrain jobs get <id> to inspect; gbrain jobs cancel <id> to force-kill.`
+        );
+      }
+      if (depthRows.length > 0) {
+        const sample = depthRows
+          .map(r => `${r.name}@${r.queue}=${r.depth}`)
+          .join(', ');
+        problems.push(
+          `waiting-queue depth exceeds ${threshold} for: ${sample}. ` +
+          `Fix: set maxWaiting on the submitter (or raise GBRAIN_QUEUE_WAITING_THRESHOLD).`
+        );
+      }
+
+      if (problems.length === 0) {
+        checks.push({
+          name: 'queue_health',
+          status: 'ok',
+          message: `No stalled-forever jobs; no queue over depth ${threshold}.`,
+        });
+      } else {
+        checks.push({
+          name: 'queue_health',
+          status: 'warn',
+          message: problems.join(' '),
+        });
+      }
+    } catch (e) {
+      checks.push({
+        name: 'queue_health',
+        status: 'warn',
+        message: `queue_health scan skipped: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    } finally {
+      queueHealthHb();
+    }
+  }
+
   // 12. Index audit (opt-in via --index-audit). v0.13.1 follow-up to #170.
   // Reports indexes with zero recorded scans on Postgres. Informational only;
   // we DO NOT auto-drop. On #170's brain, idx_pages_frontmatter and

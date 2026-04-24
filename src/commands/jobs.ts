@@ -17,6 +17,42 @@ function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
 
+/** Parse `--max-waiting N` from CLI args. Returns undefined if absent.
+ *  Throws on malformed input (caller should surface the error and exit).
+ *  Clamps to [1, 100] to match the queue-layer clamp in MinionQueue.add.
+ *  Exported for unit tests; the CLI handler at `jobs submit` wraps this
+ *  with process.exit(1) on throw so operators see 'must be positive integer'. */
+export function parseMaxWaitingFlag(args: string[]): number | undefined {
+  const raw = parseFlag(args, '--max-waiting');
+  if (raw === undefined) return undefined;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error('--max-waiting must be a positive integer (will be clamped to [1, 100])');
+  }
+  return Math.max(1, Math.min(100, parsed));
+}
+
+export function resolveWorkerConcurrency(args: string[], env: NodeJS.ProcessEnv = process.env): number {
+  const raw = parseFlag(args, '--concurrency') ?? env.GBRAIN_WORKER_CONCURRENCY ?? '1';
+  const parsed = parseInt(raw, 10);
+  // Without validation, NaN / 0 / negative values flow through to the worker
+  // loop where `inFlight.size < concurrency` is always false → the worker
+  // claims zero jobs and the queue silently wedges. One typo in a systemd
+  // unit reproduces the original production incident. Clamp to ≥1 and surface
+  // the misconfig loudly so operators see it at worker startup.
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    const source = parseFlag(args, '--concurrency') !== undefined
+      ? '--concurrency flag'
+      : 'GBRAIN_WORKER_CONCURRENCY env';
+    process.stderr.write(
+      `[gbrain jobs] invalid concurrency from ${source} (${JSON.stringify(raw)}); ` +
+      `falling back to 1. Set a positive integer.\n`
+    );
+    return 1;
+  }
+  return parsed;
+}
+
 function formatJob(job: MinionJob): string {
   const dur = job.finished_at && job.started_at
     ? `${((job.finished_at.getTime() - job.started_at.getTime()) / 1000).toFixed(1)}s`
@@ -58,6 +94,7 @@ export async function runJobs(engine: BrainEngine, args: string[]): Promise<void
 USAGE
   gbrain jobs submit <name> [--params JSON] [--follow] [--priority N]
                             [--delay Nms] [--max-attempts N] [--max-stalled N]
+                            [--max-waiting N]
                             [--backoff-type fixed|exponential] [--backoff-delay Nms]
                             [--backoff-jitter 0..1] [--timeout-ms Nms]
                             [--idempotency-key K] [--queue Q] [--dry-run]
@@ -144,6 +181,12 @@ HANDLER TYPES (built in)
       const maxAttempts = parseInt(parseFlag(args, '--max-attempts') ?? '3', 10);
       const maxStalledRaw = parseFlag(args, '--max-stalled');
       const maxStalled = maxStalledRaw !== undefined ? parseInt(maxStalledRaw, 10) : undefined;
+      // --max-waiting N: submission-time backpressure cap. Mirrors --max-stalled
+      // clamp [1, 100]. Feature is usable from CLI as of v0.19.1; pre-v0.19.1
+      // only programmatic callers reached it.
+      let maxWaiting: number | undefined;
+      try { maxWaiting = parseMaxWaitingFlag(args); }
+      catch (e) { console.error(`Error: ${e instanceof Error ? e.message : String(e)}`); process.exit(1); }
       // v0.13.1 field audit: expose retry/backoff/timeout/idempotency knobs so
       // users can tune Minions behavior without dropping into TypeScript.
       const backoffTypeRaw = parseFlag(args, '--backoff-type');
@@ -172,6 +215,7 @@ HANDLER TYPES (built in)
         console.log(`  Priority: ${priority}`);
         console.log(`  Max attempts: ${maxAttempts}`);
         if (maxStalled !== undefined) console.log(`  Max stalled: ${maxStalled}`);
+        if (maxWaiting !== undefined) console.log(`  Max waiting: ${maxWaiting}`);
         if (backoffType) console.log(`  Backoff type: ${backoffType}`);
         if (backoffDelay !== undefined) console.log(`  Backoff delay: ${backoffDelay}ms`);
         if (backoffJitter !== undefined) console.log(`  Backoff jitter: ${backoffJitter}`);
@@ -199,6 +243,7 @@ HANDLER TYPES (built in)
         delay: delay > 0 ? delay : undefined,
         max_attempts: maxAttempts,
         max_stalled: maxStalled,
+        maxWaiting,
         backoff_type: backoffType,
         backoff_delay: backoffDelay,
         backoff_jitter: backoffJitter,
@@ -415,6 +460,7 @@ HANDLER TYPES (built in)
       }
 
       const sigkillRescue = hasFlag(args, '--sigkill-rescue');
+      const wedgeRescue = hasFlag(args, '--wedge-rescue');
 
       const worker = new MinionWorker(engine, { queue: 'smoke', pollInterval: 100 });
       worker.register('noop', async () => ({ ok: true, at: new Date().toISOString() }));
@@ -481,9 +527,70 @@ HANDLER TYPES (built in)
         try { await queue.removeJob(rescueJob.id); } catch { /* non-fatal cleanup */ }
       }
 
+      // --wedge-rescue: regression case for the v0.19.1 production incident.
+      // In prod, a wedged worker held a row lock via a pending txn. The
+      // lock-renewal UPDATE blocked, lock_until fell below now(), handleStalled
+      // saw the candidate but FOR UPDATE SKIP LOCKED skipped (row lock held),
+      // handleTimeouts was disqualified (lock_until > now() fails).
+      // Only handleWallClockTimeouts' no-constraint sweep evicted.
+      //
+      // The smoke is single-connection, so we can't simulate a row lock held
+      // by another txn. Instead we forge the state where BOTH handleStalled
+      // and handleTimeouts are disqualified so only wall-clock fires:
+      //   - lock_until far in the future → handleStalled skips (not a stall)
+      //   - timeout_at = NULL → handleTimeouts skips (needs NOT NULL)
+      //   - started_at 10s ago with timeout_ms=1000 → wall-clock matches
+      //     (2 × timeout_ms = 2000ms threshold exceeded)
+      if (wedgeRescue) {
+        const wedgedJob = await queue.add('noop', {}, {
+          queue: 'smoke',
+          timeout_ms: 1000,
+        });
+        await engine.executeRaw(
+          `UPDATE minion_jobs
+              SET status='active',
+                  lock_token='smoke-wedge-rescue',
+                  lock_until=now() + interval '30 seconds',
+                  started_at=now() - interval '10 seconds',
+                  timeout_at=NULL,
+                  attempts_started = attempts_started + 1
+            WHERE id=$1`,
+          [wedgedJob.id]
+        );
+
+        const stallResult = await queue.handleStalled();
+        const stalledStatus = await queue.getJob(wedgedJob.id);
+        const timeoutResult = await queue.handleTimeouts();
+        const timedStatus = await queue.getJob(wedgedJob.id);
+        const wallResult = await queue.handleWallClockTimeouts(30000);
+        const finalStatus = await queue.getJob(wedgedJob.id);
+
+        if (finalStatus?.status !== 'dead') {
+          console.error(
+            `SMOKE FAIL (--wedge-rescue) — wall-clock sweep did not evict job #${wedgedJob.id}. ` +
+            `Status: ${finalStatus?.status}. ` +
+            `handleStalled: requeued=${stallResult.requeued.length} dead=${stallResult.dead.length}, after: ${stalledStatus?.status}; ` +
+            `handleTimeouts: ${timeoutResult.length}, after: ${timedStatus?.status}; ` +
+            `handleWallClockTimeouts: ${wallResult.length}, final: ${finalStatus?.status}.`
+          );
+          process.exit(1);
+        }
+        if (finalStatus.error_text !== 'wall-clock timeout exceeded') {
+          console.error(
+            `SMOKE FAIL (--wedge-rescue) — dead, but error_text='${finalStatus.error_text}' ` +
+            `(expected 'wall-clock timeout exceeded').`
+          );
+          process.exit(1);
+        }
+        try { await queue.removeJob(wedgedJob.id); } catch { /* non-fatal cleanup */ }
+      }
+
       const cfg = (await import('../core/config.ts')).loadConfig();
       const engineLabel = cfg?.engine ?? 'unknown';
-      const tag = sigkillRescue ? ' + SIGKILL rescue' : '';
+      const tags: string[] = [];
+      if (sigkillRescue) tags.push('SIGKILL rescue');
+      if (wedgeRescue) tags.push('wedge rescue');
+      const tag = tags.length > 0 ? ` + ${tags.join(' + ')}` : '';
       console.log(`SMOKE PASS — Minions healthy${tag} in ${elapsedSec}s (engine: ${engineLabel})`);
       if (engineLabel === 'pglite') {
         console.log('Note: the `gbrain jobs work` daemon requires Postgres. PGLite');
@@ -503,7 +610,7 @@ HANDLER TYPES (built in)
       }
 
       const queueName = parseFlag(args, '--queue') ?? 'default';
-      const concurrency = parseInt(parseFlag(args, '--concurrency') ?? '1', 10);
+      const concurrency = resolveWorkerConcurrency(args);
 
       try { await queue.ensureSchema(); }
       catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
@@ -819,16 +926,17 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
     };
   });
 
-  // Shell handler: registered ONLY when GBRAIN_ALLOW_SHELL_JOBS=1 is set on the
-  // worker process. Default-closed; opt-in per-host. Without the flag, shell
-  // jobs submitted via CLI insert rows but no worker claims them (they sit in
-  // 'waiting' — the CLI prints a starvation warning for that case).
-  if (process.env.GBRAIN_ALLOW_SHELL_JOBS === '1') {
+  // Shell handler is always registered. Runtime env guard lives inside the
+  // handler so claimed jobs emit a clear rejection log on workers missing
+  // GBRAIN_ALLOW_SHELL_JOBS=1.
+  {
     const { shellHandler } = await import('../core/minions/handlers/shell.ts');
     worker.register('shell', shellHandler);
-    process.stderr.write('[minion worker] shell handler enabled (GBRAIN_ALLOW_SHELL_JOBS=1)\n');
-  } else {
-    process.stderr.write('[minion worker] shell handler disabled (set GBRAIN_ALLOW_SHELL_JOBS=1 to enable)\n');
+    if (process.env.GBRAIN_ALLOW_SHELL_JOBS === '1') {
+      process.stderr.write('[minion worker] shell handler enabled (GBRAIN_ALLOW_SHELL_JOBS=1)\n');
+    } else {
+      process.stderr.write('[minion worker] shell handler registered in guarded mode (set GBRAIN_ALLOW_SHELL_JOBS=1 to execute shell jobs)\n');
+    }
   }
 
   // v0.15 subagent handlers: always-on. Unlike shell (which needs an env

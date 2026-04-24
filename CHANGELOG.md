@@ -2,6 +2,101 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.20.3] - 2026-04-24
+
+## **Your queue now rescues itself when a wedged worker holds a row lock. Wall-clock sweep kills the job that stall detection can't see.**
+## **`maxWaiting` is race-proof, observable, and reachable from the CLI — three bugs in one patch.**
+
+A production autopilot-cycle job wedged for over an hour on a single OpenClaw deployment because the worker's handler got stuck mid-transaction holding a row lock. Both eviction paths were blocked: the stall detector's `FOR UPDATE SKIP LOCKED` pass skipped the row-locked candidate, and the timeout sweep's `lock_until > now()` predicate disqualified the job once lock-renewal had been blocked. Neither could see the job. The shell-job pipeline starved completely behind the wedge.
+
+v0.19.0 shipped the wall-clock sweep as the third-layer kill shot: drop both constraints, evict on `started_at` alone, worst case at `2 × timeout_ms + stalledInterval`. This release locks down three correctness holes the v0.19.0 PR introduced — then closes the observability gap that let the incident run to minute 90 in the first place.
+
+### The queue-resilience numbers that matter
+
+Measured against the real incident on 2026-04-23 (OpenClaw autopilot + shell-job pipeline, Postgres engine, concurrency=1 worker).
+
+| Behavior | Before v0.20.3 | After v0.20.3 |
+|---|---|---|
+| Wedged worker escape window | 90+ minutes (manual kill) | `~2 × timeout_ms + 30s` sweep interval |
+| Per-name waiting pile during wedge | 18 deferred per-slot jobs | capped at `maxWaiting` |
+| `maxWaiting` under concurrent submit (2 submitters, cap=2) | up to 3 rows (TOCTOU race) | exactly 2 rows (advisory-lock serialization) |
+| Same name across queues | cross-queue bleed — `shell` suppressed by `default` | isolated per `(name, queue)` |
+| `GBRAIN_WORKER_CONCURRENCY=foo` | silent wedge (`inFlight < NaN` false) | clamped to 1, loud stderr warning |
+| `gbrain jobs submit --max-waiting 2` | flag didn't exist | wired through to MinionJobInput |
+| Silent coalesce events | invisible | JSONL audit at `~/.gbrain/audit/backpressure-YYYY-Www.jsonl` |
+| `gbrain doctor` visibility into wedge | no check | new `queue_health` with 2 subchecks |
+
+The two big shifts: (1) every silent-failure vector the v0.19.0 patches introduced now has a loud signal — JSONL audit files, doctor check, stderr warnings, peer-liveness probe. (2) `maxWaiting` is now actually a cap under concurrency, not a soft suggestion. A future multi-submitter pattern (parallel workspaces, dispatched children, OpenClaw + ycli cron) doesn't walk through it.
+
+### What this means for OpenClaw users
+
+If you're running `gbrain autopilot` on a daily-driver deployment, the wall-clock sweep is the difference between a 90-minute outage and a 30-second one. The `queue_health` doctor check means the next time your queue wedges, you notice in minute 2 instead of minute 90. If you've been writing programmatic Minion submitters and setting `maxWaiting`, it's worth re-reading the JSONL audit file the next time your agent does anything "interesting" — you'll see exactly which submission coalesces into which returned job.
+
+## To take advantage of v0.20.3
+
+`gbrain upgrade` handles the binary. You MUST restart long-running worker daemons so the new sweep runs in-process — the wall-clock eviction is a method on `MinionQueue`, not a cron job, so it only fires inside a worker loop.
+
+1. **Upgrade the binary:**
+   ```bash
+   gbrain upgrade
+   ```
+2. **Restart autopilot + workers:**
+   ```bash
+   # systemd / launchd / OpenClaw service-manager: restart the unit.
+   # Manual: kill the old `gbrain autopilot` and `gbrain jobs work`, start new ones.
+   ```
+3. **Verify:**
+   ```bash
+   gbrain jobs smoke --wedge-rescue   # exercises the new wall-clock path
+   gbrain doctor --json | jq '.checks[] | select(.name == "queue_health")'
+   ```
+4. **If `gbrain doctor` flags anything unexpected,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/audit/backpressure-*.jsonl` (redact freely)
+   - what commands you ran leading up to the wedge
+
+### Itemized changes
+
+**Queue core** (`src/core/minions/queue.ts`)
+- `maxWaiting` coalesce path wraps `count → select → insert` in `pg_advisory_xact_lock` keyed on `(name, queue)`. Concurrent submitters for the SAME key serialize; different keys stay parallel. Lock auto-releases on transaction commit/rollback — no cleanup path to leak. Fixes TOCTOU race caught by adversarial review.
+- `maxWaiting` count and select now filter on `queue` in addition to `name`. Pre-v0.20.3 code filtered on name alone, so a waiting `autopilot-cycle` in `queue=default` would suppress submissions to `queue=shell` with the same name. Cross-queue bleed is gone.
+
+**Backpressure observability** (new `src/core/minions/backpressure-audit.ts`)
+- Every coalesce event writes one JSONL line to `~/.gbrain/audit/backpressure-YYYY-Www.jsonl` (ISO-week rotation, override dir via `GBRAIN_AUDIT_DIR`, mirrors the v0.14 shell-audit pattern).
+- Fields: `ts, queue, name, waiting_count, max_waiting, decision='coalesced', returned_job_id`.
+- Best-effort: write failures log to stderr but never block submission.
+
+**CLI** (`src/commands/jobs.ts`)
+- New `--max-waiting N` flag on `gbrain jobs submit`. Clamps to `[1, 100]`, mirrors the existing `--max-stalled` wiring. The `MinionJobInput.maxWaiting` field was programmatic-only before; now it's reachable from the command line too.
+- `resolveWorkerConcurrency` clamps against invalid input. `parseInt` returns `NaN` for `"foo"`, `0` for `"0"`, negatives for `"-5"` — all of which silently wedge a worker (`inFlight.size < NaN/0/negative` is always false). Now clamped to ≥1 with a loud stderr warning naming the bad value. One typo in a systemd unit no longer reproduces the 90-minute outage.
+- New `gbrain jobs smoke --wedge-rescue` opt-in case. Forges a wedged-worker row state, invokes `handleStalled` + `handleTimeouts` + `handleWallClockTimeouts` in sequence, asserts only the wall-clock sweep evicts. Mirrors the v0.14.3 `--sigkill-rescue` shape.
+
+**Doctor** (`src/commands/doctor.ts`)
+- New `queue_health` check (Postgres-only; PGLite skips with `Skipped (PGLite — no multi-process worker surface)`).
+- Subcheck 1 — **stalled-forever**: flags active jobs whose `started_at` is older than 1 hour. Reports the top 5 by start time with `gbrain jobs get/cancel <id>` fix hints.
+- Subcheck 2 — **waiting-depth**: flags per-name queues whose waiting count exceeds threshold. Default 10, overridable via `GBRAIN_QUEUE_WAITING_THRESHOLD` env. Reports the top 5 by depth with "consider setting maxWaiting on the submitter" fix hint.
+- Worker-heartbeat staleness subcheck intentionally deferred to follow-up because `lock_until`-on-active-jobs is a lossy proxy. A check that cries wolf erodes trust in every other doctor subcheck. Needs a `minion_workers` table to produce ground-truth signal.
+
+**Autopilot** (`src/commands/autopilot.ts`)
+- `--no-worker` mode gains a peer-worker-liveness probe. Every cycle runs a cheap `SELECT count(*)` checking for active jobs with `lock_until` refreshed in the last 2 minutes. After 3 consecutive idle ticks, logs a loud `WARNING` naming the silent-wedge vector (`--no-worker` set but no worker running). Re-arms once a live signal returns, so a healthy-but-idle worker doesn't trigger spam.
+- Probe is documented as a proxy, not ground truth — idle worker with no active jobs reads as "no worker." The ground-truth fix needs a `minion_workers` heartbeat table (tracked as follow-up).
+
+**Docs**
+- New `docs/guides/queue-operations-runbook.md`: the "my queue looks wedged — what do I run?" reference. One viewport, in order of escalation. What each `queue_health` subcheck means. Self-check for the `--no-worker + no-worker-running` footgun.
+- `CLAUDE.md` Key-files section updated for the new `handleWallClockTimeouts` method (v0.19.0, described here for the first time), the new `backpressure-audit.ts` module, the updated `maxWaiting` semantics, and the new `queue_health` doctor check.
+
+**Tests** (`test/minions.test.ts`)
+- 23 new unit cases. Wall-clock sweep (3 cases + non-interference with `handleTimeouts`). `maxWaiting` (coalesce, clamp 0 → 1, floor 1.7 → 1, concurrent-submitter race via `Promise.all`, cross-queue isolation, unset fallthrough). Concurrency clamp (7 cases including `NaN`/`0`/negative). `parseMaxWaitingFlag` (5 cases). Backpressure audit file write. All 143 minions tests pass.
+- E2E wall-clock case against real Postgres is next on the roadmap (needs a second-connection row-lock helper; the unit-level coverage above exercises the sweep mechanics directly).
+
+### For contributors
+
+- The v0.19.0 PR's narrative framed the 18-job pileup as "duplicate submissions from a cron loop with no idempotency key." That framing was wrong. Autopilot already sets `idempotency_key: autopilot-cycle:${slot}` where slot is a 5-minute tick boundary — within-slot duplicates are structurally impossible. The 18 jobs were 18 different slots stacking up behind the wedged one. `maxWaiting` still caps the pile; the incident just wasn't about idempotency. Adversarial review caught this before v0.20.3 shipped.
+- Follow-up issues tracked: B2 (autopilot heartbeat file), B3 (doctor `--fix` learns queue rescue), B4 (backpressure counts surfaced in `jobs stats`), B5 (cross-cutting "health-delivery-agent" pattern), B7 (`minion_workers` heartbeat table — unblocks both the dropped `queue_health` subcheck and a ground-truth `--no-worker` probe), P1 (composite indexes `(status, started_at)` and `(status, name)` on `minion_jobs` — currently the new sweeps fall back to `idx_minion_jobs_status`, selective enough on healthy queues, worth tightening in v0.20.4).
+
+Full plan with CEO + Eng + Codex adversarial decisions lives at `~/.claude/plans/` for the operators who care about how this release was reviewed.
+
 ## [0.20.2] - 2026-04-24
 
 ## **`gbrain jobs supervisor` is now a self-healing daemon you can actually drive. The Minions worker stops dying silently.**
