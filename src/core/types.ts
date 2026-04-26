@@ -122,6 +122,18 @@ export interface SearchOpts {
   offset?: number;
   type?: PageType;
   exclude_slugs?: string[];
+  /**
+   * Slug-prefix excludes — additive over DEFAULT_HARD_EXCLUDES (test/, archive/,
+   * attachments/, .raw/) and the GBRAIN_SEARCH_EXCLUDE env var. Stacks with
+   * `exclude_slugs` (exact match) — a row is filtered if it matches either set.
+   */
+  exclude_slug_prefixes?: string[];
+  /**
+   * Opt-back-in list — subtracts entries from the resolved hard-exclude set.
+   * E.g. `include_slug_prefixes: ['test/']` lets a query see test/ pages even
+   * though they're hard-excluded by default.
+   */
+  include_slug_prefixes?: string[];
   detail?: 'low' | 'medium' | 'high';
   /**
    * v0.20.0 Cathedral II: filter by content_chunks.language (e.g., 'typescript',

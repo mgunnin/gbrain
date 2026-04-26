@@ -20,6 +20,8 @@ import type {
   EngineConfig,
 } from './types.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult } from './utils.ts';
+import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
+import { buildSourceFactorCase, buildHardExcludeClause } from './search/sql-ranking.ts';
 
 type PGLiteDB = PGlite;
 
@@ -239,6 +241,12 @@ export class PGLiteEngine implements BrainEngine {
     // Fetch 3x to give dedup headroom, then page-dedup + re-limit.
     const innerLimit = Math.min(limit * 3, MAX_SEARCH_LIMIT * 3);
 
+    // Source-aware ranking (v0.22): see postgres-engine.ts for rationale.
+    const boostMap = resolveBoostMap();
+    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
+    const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
+    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+
     // v0.20.0 Cathedral II Layer 10 C1/C2: language + symbol-kind filters.
     const params: unknown[] = [query, innerLimit, limit, offset];
     let extraFilter = '';
@@ -256,13 +264,13 @@ export class PGLiteEngine implements BrainEngine {
          SELECT
            p.slug, p.id as page_id, p.title, p.type, p.source_id,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-           ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) AS score,
+           ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
            CASE WHEN p.updated_at < (
              SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
            ) THEN true ELSE false END AS stale
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
-         WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter}
+         WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause}
          ORDER BY score DESC
          LIMIT $2
        ),
@@ -301,6 +309,13 @@ export class PGLiteEngine implements BrainEngine {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
 
+    // Source-aware ranking applied here too — searchKeywordChunks is the
+    // chunk-grain anchor primitive that two-pass retrieval (Layer 7) uses.
+    const boostMap = resolveBoostMap();
+    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
+    const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
+    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+
     const params: unknown[] = [query, limit, offset];
     let extraFilter = '';
     if (opts?.language) {
@@ -316,13 +331,13 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT
          p.slug, p.id as page_id, p.title, p.type, p.source_id,
          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-         ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) AS score,
+         ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
          CASE WHEN p.updated_at < (
            SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
          ) THEN true ELSE false END AS stale
        FROM content_chunks cc
        JOIN pages p ON p.id = cc.page_id
-       WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter}
+       WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause}
        ORDER BY score DESC
        LIMIT $2 OFFSET $3`,
       params
@@ -341,7 +356,23 @@ export class PGLiteEngine implements BrainEngine {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
 
-    const params: unknown[] = [vecStr, limit, offset];
+    // Two-stage CTE (v0.22): pure-distance ORDER BY in inner CTE preserves
+    // HNSW; outer SELECT re-ranks by raw_score * source_factor over the
+    // narrow candidate pool. innerLimit scales with offset to preserve the
+    // pagination contract. See postgres-engine.ts searchVector for rationale.
+    const boostMap = resolveBoostMap();
+    // Outer SELECT references the aliased CTE column. Aliasing the CTE as `hc`
+    // disambiguates the correlated subquery (`te.page_id = hc.page_id`) from
+    // the inner column. Without the alias, an unqualified `page_id` in the
+    // subquery's WHERE would lexically resolve back to `te.page_id` itself
+    // and degrade to `te.page_id = te.page_id` (always true), making every
+    // result stale=true. Codex caught this in adversarial review.
+    const sourceFactorCaseOnSlug = buildSourceFactorCase('hc.slug', boostMap, opts?.detail);
+    const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
+    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+    const innerLimit = offset + Math.max(limit * 5, 100);
+
+    const params: unknown[] = [vecStr, innerLimit, limit, offset];
     let extraFilter = '';
     if (opts?.language) {
       params.push(opts.language);
@@ -353,19 +384,28 @@ export class PGLiteEngine implements BrainEngine {
     }
 
     const { rows } = await this.db.query(
-      `SELECT
-        p.slug, p.id as page_id, p.title, p.type, p.source_id,
-        cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-        1 - (cc.embedding <=> $1::vector) AS score,
-        CASE WHEN p.updated_at < (
-          SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
-        ) THEN true ELSE false END AS stale
-      FROM content_chunks cc
-      JOIN pages p ON p.id = cc.page_id
-      WHERE cc.embedding IS NOT NULL ${detailFilter}${extraFilter}
-      ORDER BY cc.embedding <=> $1::vector
-      LIMIT $2
-      OFFSET $3`,
+      `WITH hnsw_candidates AS (
+         SELECT
+           p.slug, p.id as page_id, p.title, p.type, p.source_id, p.updated_at,
+           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+           1 - (cc.embedding <=> $1::vector) AS raw_score
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+         WHERE cc.embedding IS NOT NULL ${detailFilter}${extraFilter} ${hardExcludeClause}
+         ORDER BY cc.embedding <=> $1::vector
+         LIMIT $2
+       )
+       SELECT
+         hc.slug, hc.page_id, hc.title, hc.type, hc.source_id,
+         hc.chunk_id, hc.chunk_index, hc.chunk_text, hc.chunk_source,
+         hc.raw_score * ${sourceFactorCaseOnSlug} AS score,
+         CASE WHEN hc.updated_at < (
+           SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = hc.page_id
+         ) THEN true ELSE false END AS stale
+       FROM hnsw_candidates hc
+       ORDER BY score DESC
+       LIMIT $3
+       OFFSET $4`,
       params
     );
 

@@ -505,6 +505,8 @@ Question
   │    ├─ Multi-query expansion (Haiku rephrases the question 3 ways)
   │    ├─ Vector search (HNSW cosine over OpenAI embeddings)
   │    ├─ Keyword search (Postgres tsvector + websearch_to_tsquery)
+  │    ├─ Source-aware ranking (curated dirs outrank chat/daily swamp at SQL layer)
+  │    ├─ Hard-exclude (test/ archive/ attachments/ .raw/ filtered before retrieval)
   │    ├─ Reciprocal Rank Fusion (score = sum 1/(60+rank) across both)
   │    ├─ Cosine re-scoring (re-rank chunks against actual query embedding)
   │    ├─ Compiled-truth boost (assessments outrank timeline noise)

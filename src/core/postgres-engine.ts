@@ -18,6 +18,8 @@ import type {
 import { GBrainError } from './types.ts';
 import * as db from './db.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding } from './utils.ts';
+import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
+import { buildSourceFactorCase, buildHardExcludeClause } from './search/sql-ranking.ts';
 
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
@@ -236,51 +238,83 @@ export class PostgresEngine implements BrainEngine {
     // ship < limit pages. 3x gives dedup enough to pick top N distinct pages.
     const innerLimit = Math.min(limit * 3, MAX_SEARCH_LIMIT * 3);
 
-    // Search-only timeout: prevents DoS via expensive queries without
-    // affecting long-running operations like embed --all or bulk import.
-    // SET LOCAL inside sql.begin() scopes the GUC to the transaction so
-    // it can never leak onto a pooled connection returned to other
-    // callers. A bare `SET statement_timeout` goes to an arbitrary
-    // connection from the pool, lives past this method, and either
-    // clips an unrelated caller's long-running query (DoS) or — via
-    // `SET statement_timeout = 0` — disables the guard for them.
+    // Source-aware ranking (v0.22): boost curated content (originals/,
+    // concepts/, writing/) and dampen bulk content (chat/, daily/, media/x/)
+    // by multiplying the chunk-grain ts_rank with a source-factor CASE.
+    // Detail-gated — disabled for `detail='high'` (temporal queries) so
+    // chat surfaces normally for date-framed lookups. Hard-exclude prefixes
+    // (test/, archive/, attachments/, .raw/ by default) filter at the
+    // chunk-rank stage so they never enter the candidate set.
+    const boostMap = resolveBoostMap();
+    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
+    const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
+    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+
+    const params: unknown[] = [query];
+    let typeClause = '';
+    if (type) {
+      params.push(type);
+      typeClause = `AND p.type = $${params.length}`;
+    }
+    let excludeSlugsClause = '';
+    if (excludeSlugs?.length) {
+      params.push(excludeSlugs);
+      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
+    }
+    let languageClause = '';
+    if (language) {
+      params.push(language);
+      languageClause = `AND cc.language = $${params.length}`;
+    }
+    let symbolKindClause = '';
+    if (symbolKind) {
+      params.push(symbolKind);
+      symbolKindClause = `AND cc.symbol_type = $${params.length}`;
+    }
+    params.push(innerLimit);
+    const innerLimitParam = `$${params.length}`;
+    params.push(limit);
+    const limitParam = `$${params.length}`;
+    params.push(offset);
+    const offsetParam = `$${params.length}`;
+
+    const rawQuery = `
+      WITH ranked_chunks AS (
+        SELECT
+          p.slug, p.id as page_id, p.title, p.type, p.source_id,
+          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+          ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score
+        FROM content_chunks cc
+        JOIN pages p ON p.id = cc.page_id
+        WHERE cc.search_vector @@ websearch_to_tsquery('english', $1)
+          ${typeClause}
+          ${excludeSlugsClause}
+          ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+          ${languageClause}
+          ${symbolKindClause}
+          ${hardExcludeClause}
+        ORDER BY score DESC
+        LIMIT ${innerLimitParam}
+      ),
+      best_per_page AS (
+        SELECT DISTINCT ON (slug) *
+        FROM ranked_chunks
+        ORDER BY slug, score DESC
+      )
+      SELECT slug, page_id, title, type, source_id,
+        chunk_id, chunk_index, chunk_text, chunk_source, score,
+        false AS stale
+      FROM best_per_page
+      ORDER BY score DESC
+      LIMIT ${limitParam}
+      OFFSET ${offsetParam}
+    `;
+
+    // Search-only timeout. SET LOCAL inside sql.begin() scopes the GUC
+    // to the transaction so it can never leak onto a pooled connection.
     const rows = await sql.begin(async sql => {
       await sql`SET LOCAL statement_timeout = '8s'`;
-      // CTE chain: rank chunks by FTS → DISTINCT ON (slug) to pick best
-      // chunk per page → order by score → limit. The external shape is
-      // page-grain; chunk-grain ranking wins because A4 weights mean
-      // doc-comment hits (and, once Layer 5 populates them, qualified
-      // symbol hits) beat body-text hits at the chunk level.
-      return await sql`
-        WITH ranked_chunks AS (
-          SELECT
-            p.slug, p.id as page_id, p.title, p.type, p.source_id,
-            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-            ts_rank(cc.search_vector, websearch_to_tsquery('english', ${query})) AS score
-          FROM content_chunks cc
-          JOIN pages p ON p.id = cc.page_id
-          WHERE cc.search_vector @@ websearch_to_tsquery('english', ${query})
-            ${type ? sql`AND p.type = ${type}` : sql``}
-            ${excludeSlugs?.length ? sql`AND p.slug != ALL(${excludeSlugs})` : sql``}
-            ${detailLow ? sql`AND cc.chunk_source = 'compiled_truth'` : sql``}
-            ${language ? sql`AND cc.language = ${language}` : sql``}
-            ${symbolKind ? sql`AND cc.symbol_type = ${symbolKind}` : sql``}
-          ORDER BY score DESC
-          LIMIT ${innerLimit}
-        ),
-        best_per_page AS (
-          SELECT DISTINCT ON (slug) *
-          FROM ranked_chunks
-          ORDER BY slug, score DESC
-        )
-        SELECT slug, page_id, title, type, source_id,
-          chunk_id, chunk_index, chunk_text, chunk_source, score,
-          false AS stale
-        FROM best_per_page
-        ORDER BY score DESC
-        LIMIT ${limit}
-        OFFSET ${offset}
-      `;
+      return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
     return rows.map(rowToSearchResult);
   }
@@ -308,26 +342,64 @@ export class PostgresEngine implements BrainEngine {
       console.warn(`[gbrain] Warning: search limit clamped from ${opts.limit} to ${MAX_SEARCH_LIMIT}`);
     }
 
+    // Source-aware ranking applies here too — searchKeywordChunks is the
+    // chunk-grain anchor primitive that two-pass retrieval (Layer 7) uses,
+    // so curated-vs-bulk dampening should affect the anchor pool. Same
+    // detail-gate, same hard-exclude behavior as searchKeyword.
+    const boostMap = resolveBoostMap();
+    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
+    const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
+    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+
+    const params: unknown[] = [query];
+    let typeClause = '';
+    if (type) {
+      params.push(type);
+      typeClause = `AND p.type = $${params.length}`;
+    }
+    let excludeSlugsClause = '';
+    if (excludeSlugs?.length) {
+      params.push(excludeSlugs);
+      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
+    }
+    let languageClause = '';
+    if (language) {
+      params.push(language);
+      languageClause = `AND cc.language = $${params.length}`;
+    }
+    let symbolKindClause = '';
+    if (symbolKind) {
+      params.push(symbolKind);
+      symbolKindClause = `AND cc.symbol_type = $${params.length}`;
+    }
+    params.push(limit);
+    const limitParam = `$${params.length}`;
+    params.push(offset);
+    const offsetParam = `$${params.length}`;
+
+    const rawQuery = `
+      SELECT
+        p.slug, p.id as page_id, p.title, p.type, p.source_id,
+        cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+        ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
+        false AS stale
+      FROM content_chunks cc
+      JOIN pages p ON p.id = cc.page_id
+      WHERE cc.search_vector @@ websearch_to_tsquery('english', $1)
+        ${typeClause}
+        ${excludeSlugsClause}
+        ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+        ${languageClause}
+        ${symbolKindClause}
+        ${hardExcludeClause}
+      ORDER BY score DESC
+      LIMIT ${limitParam}
+      OFFSET ${offsetParam}
+    `;
+
     const rows = await sql.begin(async sql => {
       await sql`SET LOCAL statement_timeout = '8s'`;
-      return await sql`
-        SELECT
-          p.slug, p.id as page_id, p.title, p.type, p.source_id,
-          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-          ts_rank(cc.search_vector, websearch_to_tsquery('english', ${query})) AS score,
-          false AS stale
-        FROM content_chunks cc
-        JOIN pages p ON p.id = cc.page_id
-        WHERE cc.search_vector @@ websearch_to_tsquery('english', ${query})
-          ${type ? sql`AND p.type = ${type}` : sql``}
-          ${excludeSlugs?.length ? sql`AND p.slug != ALL(${excludeSlugs})` : sql``}
-          ${detailLow ? sql`AND cc.chunk_source = 'compiled_truth'` : sql``}
-          ${language ? sql`AND cc.language = ${language}` : sql``}
-          ${symbolKind ? sql`AND cc.symbol_type = ${symbolKind}` : sql``}
-        ORDER BY score DESC
-        LIMIT ${limit}
-        OFFSET ${offset}
-      `;
+      return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
     return rows.map(rowToSearchResult);
   }
@@ -348,29 +420,80 @@ export class PostgresEngine implements BrainEngine {
 
     const vecStr = '[' + Array.from(embedding).join(',') + ']';
 
-    // Search-only timeout (see searchKeyword for rationale). SET LOCAL +
-    // sql.begin ensures the GUC stays transaction-scoped on the pooled
-    // connection.
-    const rows = await sql.begin(async sql => {
-      await sql`SET LOCAL statement_timeout = '8s'`;
-      return await sql`
+    // Two-stage CTE (v0.22): inner CTE keeps a pure-distance ORDER BY so
+    // the HNSW index stays usable. Folding source-boost into the inner
+    // ORDER BY would force a sequential scan over every chunk (seconds vs
+    // ~10ms with HNSW). Outer SELECT re-ranks the candidate pool by
+    // raw_score * source_factor.
+    //
+    // innerLimit scales with offset to preserve the pagination contract:
+    // a fixed cap of 100 would silently empty offset > 100.
+    const boostMap = resolveBoostMap();
+    const sourceFactorCaseOnSlug = buildSourceFactorCase('slug', boostMap, opts?.detail);
+    const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
+    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+    const innerLimit = offset + Math.max(limit * 5, 100);
+
+    const params: unknown[] = [vecStr];
+    let typeClause = '';
+    if (type) {
+      params.push(type);
+      typeClause = `AND p.type = $${params.length}`;
+    }
+    let excludeSlugsClause = '';
+    if (excludeSlugs?.length) {
+      params.push(excludeSlugs);
+      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
+    }
+    let languageClause = '';
+    if (language) {
+      params.push(language);
+      languageClause = `AND cc.language = $${params.length}`;
+    }
+    let symbolKindClause = '';
+    if (symbolKind) {
+      params.push(symbolKind);
+      symbolKindClause = `AND cc.symbol_type = $${params.length}`;
+    }
+    params.push(innerLimit);
+    const innerLimitParam = `$${params.length}`;
+    params.push(limit);
+    const limitParam = `$${params.length}`;
+    params.push(offset);
+    const offsetParam = `$${params.length}`;
+
+    const rawQuery = `
+      WITH hnsw_candidates AS (
         SELECT
           p.slug, p.id as page_id, p.title, p.type, p.source_id,
           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-          1 - (cc.embedding <=> ${vecStr}::vector) AS score,
-          false AS stale
+          1 - (cc.embedding <=> $1::vector) AS raw_score
         FROM content_chunks cc
         JOIN pages p ON p.id = cc.page_id
         WHERE cc.embedding IS NOT NULL
-          ${detailLow ? sql`AND cc.chunk_source = 'compiled_truth'` : sql``}
-          ${type ? sql`AND p.type = ${type}` : sql``}
-          ${excludeSlugs?.length ? sql`AND p.slug != ALL(${excludeSlugs})` : sql``}
-          ${language ? sql`AND cc.language = ${language}` : sql``}
-          ${symbolKind ? sql`AND cc.symbol_type = ${symbolKind}` : sql``}
-        ORDER BY cc.embedding <=> ${vecStr}::vector
-        LIMIT ${limit}
-        OFFSET ${offset}
-      `;
+          ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+          ${typeClause}
+          ${excludeSlugsClause}
+          ${languageClause}
+          ${symbolKindClause}
+          ${hardExcludeClause}
+        ORDER BY cc.embedding <=> $1::vector
+        LIMIT ${innerLimitParam}
+      )
+      SELECT
+        slug, page_id, title, type, source_id,
+        chunk_id, chunk_index, chunk_text, chunk_source,
+        raw_score * ${sourceFactorCaseOnSlug} AS score,
+        false AS stale
+      FROM hnsw_candidates
+      ORDER BY score DESC
+      LIMIT ${limitParam}
+      OFFSET ${offsetParam}
+    `;
+
+    const rows = await sql.begin(async sql => {
+      await sql`SET LOCAL statement_timeout = '8s'`;
+      return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
     return rows.map(rowToSearchResult);
   }

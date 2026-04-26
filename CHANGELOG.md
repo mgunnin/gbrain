@@ -2,6 +2,85 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.22.0] - 2026-04-25
+
+**Search stops getting swamped by chat logs. Curated pages win by default.**
+
+For the last few releases, multi-word topic queries against a real brain returned chat-log pages at #1 and #2 because chat pages are 50KB and contain mentions of every topic. The actual article you wrote about the topic ranked #5. v0.22.0 fixes that at the SQL layer ... ranking is now source-aware, curated directories outrank bulk content, and bookkeeping directories like `test/` and `archive/` never enter the candidate set.
+
+The fix layers on top of v0.21.0's Cathedral II chunk-grain FTS and two-pass retrieval. Different mechanism, additive effect. Chat pages get dampened at the chunk-rank stage; curated content gets boosted; the two-pass walk and source-boost both run in the same pipeline. Temporal queries (`when`, `last week`, `YYYY-MM`) bypass the gate entirely so date-framed chat lookups still work. Two new env vars (`GBRAIN_SOURCE_BOOST`, `GBRAIN_SEARCH_EXCLUDE`) tune per-deployment. `unset` them to revert to v0.21.0 ranking exactly.
+
+Two SearchOpts additions plumb hard-exclude through the API: `exclude_slug_prefixes` (additive over defaults + env) and `include_slug_prefixes` (subtractive opt-back-in). The four default hard-excludes (`test/`, `archive/`, `attachments/`, `.raw/`) were silently polluting search results before.
+
+### The numbers that matter
+
+A new BrainBench category — **Cat 13b: Source Swamp Resistance** — ships in the sibling [gbrain-evals](https://github.com/garrytan/gbrain-evals) repo. The corpus is 20 pages: 10 short opinionated `originals/` pages and 10 long `wintermute/chat/` dumps that mention the same multi-word phrases at higher per-byte density. 30 hand-curated queries assert the curated page wins.
+
+| gbrain version                       | Top-1 hit | Top-3 hit | Swamp@top |
+|--------------------------------------|-----------|-----------|-----------|
+| v0.20.4 (pre-Cathedral II)           | 90.0%     | 100.0%    | 10.0%     |
+| v0.21.0 (Cathedral II — two-pass)    | 90.0%     | 100.0%    | 10.0%     |
+| **v0.22.0 (this release)**           | **93.3%** | **100.0%** | **6.7%**  |
+
+v0.21.0's two-pass retrieval is orthogonal to source-swamp resistance — it's about call-graph edges and parent-scope chunking, which doesn't reach the directory-level ranking signal that source-boost provides. v0.22.0 adds +3.3pts top-1 and -3.3pts swamp on top of v0.21.0.
+
+The world-v1 corpus (BrainBench Cats 1+2 retrieval, 145 relational queries) is unchanged at P@5 49.1% / R@5 97.9% — every existing benchmark axis stays put within ±2pp tolerance.
+
+### What this means for you
+
+If your brain's biggest directories are chat dumps, daily logs, or X archives, search just got dramatically better for the topic queries you actually run. If you depend on chat surfacing for date-framed questions ("what did we discuss last week"), nothing changed ... the intent classifier routes those to `detail=high` which bypasses source-boost. If you want a different boost map, set `GBRAIN_SOURCE_BOOST=originals/:1.8,wintermute/chat/:0.3` and ship.
+
+## To take advantage of v0.22.0
+
+`gbrain upgrade` should do this automatically. No DB migration is needed ... the change is purely a SQL ranking refactor on existing tables.
+
+1. **No manual migration step required.** The new ranking is on by default. Defaults are tuned for a brain with the canonical `originals/`, `concepts/`, `writing/`, `meetings/`, `daily/`, `media/x/`, `wintermute/chat/` shape.
+2. **Tune for your brain (optional):**
+   ```bash
+   # Stronger originals boost, harder chat dampening
+   export GBRAIN_SOURCE_BOOST="originals/:1.8,wintermute/chat/:0.3"
+   # Add a directory to the hard-exclude list
+   export GBRAIN_SEARCH_EXCLUDE="scratch/,private/"
+   ```
+3. **Verify the outcome:**
+   ```bash
+   gbrain search "<a multi-word topic phrase from your brain>"
+   # Expect: curated content (originals/, concepts/, writing/) at the top.
+   gbrain search "<phrase>" --detail high
+   # Expect: source-boost bypassed; chat pages allowed back.
+   ```
+4. **Rollback one-liner** if something looks off:
+   ```bash
+   unset GBRAIN_SOURCE_BOOST GBRAIN_SEARCH_EXCLUDE
+   ```
+   Reverts ranking to v0.21.0 behavior exactly.
+
+### Itemized changes
+
+#### Source-aware retrieval
+
+- New module `src/core/search/source-boost.ts` ships the default boost map (`originals/` 1.5, `concepts/` 1.3, `writing/` 1.4, `people/companies/deals/` 1.2, `daily/` 0.8, `media/x/` 0.7, `wintermute/chat/` 0.5) and the four default hard-exclude prefixes (`test/`, `archive/`, `attachments/`, `.raw/`). Both knobs override via env (`GBRAIN_SOURCE_BOOST`, `GBRAIN_SEARCH_EXCLUDE`) or per-call SearchOpts.
+- New module `src/core/search/sql-ranking.ts` is a pair of pure SQL-fragment builders shared between Postgres and PGLite engines. `buildSourceFactorCase` emits a longest-prefix-match CASE expression and returns literal `'1.0'` when `detail === 'high'` so temporal queries bypass source-boost. `buildHardExcludeClause` emits `NOT (col LIKE 'p1%' OR col LIKE 'p2%')` ... OR-chain wrapped in NOT, never `NOT LIKE ALL/ANY` (those don't express set-exclusion). LIKE meta-character escape covers `%`, `_`, AND `\` (backslash matters because it's Postgres LIKE's default escape char). Single-quote doubling renders SQL-injection-style inputs inert.
+- `src/core/postgres-engine.ts` and `src/core/pglite-engine.ts` ... three methods wired: `searchKeyword` (chunk-grain CTE → DISTINCT ON page dedup, multiplies ts_rank by source-factor), `searchKeywordChunks` (the chunk-grain anchor primitive used by Cathedral II two-pass retrieval, also gets source-boost so the anchor pool is dampened on chat dirs), and `searchVector` (becomes a two-stage CTE: pure-distance HNSW inner ORDER BY, source-boost re-rank in outer SELECT, innerLimit scales with offset to preserve pagination).
+- `src/core/types.ts` ... SearchOpts gains two fields: `exclude_slug_prefixes?: string[]` (additive over defaults + env) and `include_slug_prefixes?: string[]` (subtractive opt-back-in).
+
+#### Tests
+
+- `test/sql-ranking.test.ts` ... 39 unit cases covering longest-prefix-match, detail=high temporal-bypass, three-meta-char LIKE escape, single-quote SQL-literal doubling, env-var parsing, resolver merge semantics.
+- `test/e2e/search-swamp.test.ts` ... reproduces the headline case in PGLite. Curated article competes with two chat pages stuffed with the same multi-word phrase. Asserts article wins both keyword and vector ranking, detail=high lets chat re-surface, source_id passes through two-stage CTE.
+- `test/e2e/search-exclude.test.ts` ... verifies test/ + archive/ pages hidden by default, include_slug_prefixes opts back in, exclude_slug_prefixes adds to defaults.
+- `test/e2e/engine-parity.test.ts` ... Postgres ↔ PGLite top-result + result-set parity for both search methods plus a hard-exclude parity case. Skips gracefully when DATABASE_URL is unset.
+
+#### Won't break what was already working
+
+The change is additive at the SQL layer; no `hybrid.ts`, `intent.ts`, `dedup.ts`, `expansion.ts`, `two-pass.ts`, or operations-layer changes. RRF fusion, compiled-truth boost, backlink boost, multi-query expansion, source-aware dedup, and v0.21.0's Cathedral II two-pass retrieval all run unchanged downstream of the new ranking. The `sql.begin` + `SET LOCAL statement_timeout` v0.19 wrap is preserved (transaction-scoped GUC; bare SET would leak onto pooled connections, documented DoS vector). RLS-enabled brains still work because both inner and outer CTE SELECTs are subject to row-level policies.
+
+### For contributors
+
+- The two new helpers are pure functions with explicit params and zero engine dependencies. Both engines call them to build identical SQL. Useful pattern for any future SQL-side ranking signal that needs to land in both Postgres and PGLite.
+- The two-stage CTE pattern (HNSW-safe pure-distance inner ORDER BY, re-rank in outer SELECT) is the right shape for any future per-prefix or per-page boost in vector search. Folding extra factors into the outer ORDER BY keeps the index usable.
+- BrainBench Cat 13b lives in [gbrain-evals](https://github.com/garrytan/gbrain-evals) on `feat/cat13b-source-swamp` ... 20-page corpus + 30 hand-curated queries. Companion PR.
+
 ## [0.21.0] - 2026-04-25
 
 ## **Your brain walks the code graph now.**
