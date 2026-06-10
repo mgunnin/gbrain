@@ -248,7 +248,9 @@ export class PostgresEngine implements BrainEngine {
       this.connectionManager = null;
     }
     if (this._sql) {
-      await this._sql.end();
+      // #1972: gbrain-owned hard bound so a PgBouncer drain that never settles
+      // can't block teardown until the CLI's 10s force-exit truncates stdout.
+      await db.endPoolBounded(this._sql);
       this._sql = null;
       // After this point, _connectionStyle stays 'instance' so a second
       // disconnect() is a no-op rather than falling through and clearing

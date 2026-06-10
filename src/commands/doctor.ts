@@ -2346,12 +2346,39 @@ export function checkAutopilotLockScope(): Check {
  * but the main work is blocked. Requires explicit heartbeat probe;
  * speculation until production data shows the case.
  */
-export async function checkStaleLocks(engine: BrainEngine): Promise<Check> {
+export async function checkStaleLocks(
+  engine: BrainEngine,
+  opts: { fix?: boolean; dryRun?: boolean } = {},
+): Promise<Check> {
   try {
-    const { listStaleLocks } = await import('../core/db-lock.ts');
+    const { listStaleLocks, reapDeadHolderLocks } = await import('../core/db-lock.ts');
+
+    // #1972: under `gbrain doctor --fix`, reap dead-holder sync/cycle locks
+    // using the SAME namespace-scoped, host-scoped, snapshot-matched reaper the
+    // cycle runs at start. This is the self-heal path for no-autopilot brains: a
+    // brain that never runs `gbrain dream` never hits the cycle-start sweep, so
+    // doctor --fix is how its crashed-sync locks get cleared. DB-only, so it's
+    // orthogonal to (and unaffected by) the skills-dir --fix safety gate above.
+    // Best-effort: a reap failure falls through to the warn path below.
+    let reapedIds: string[] = [];
+    if (opts.fix && !opts.dryRun) {
+      try {
+        reapedIds = (await reapDeadHolderLocks(engine)).reapedIds;
+      } catch { /* fall through; listStaleLocks still surfaces remaining locks */ }
+    }
+    const reapedNote = reapedIds.length > 0
+      ? `Reaped ${reapedIds.length} dead-holder lock(s): ${reapedIds.join(', ')}.`
+      : null;
+
     const stale = await listStaleLocks(engine);
     if (stale.length === 0) {
-      return { name: 'stale_locks', status: 'ok', message: 'No stale locks (no rows with ttl_expires_at < NOW())' };
+      return {
+        name: 'stale_locks',
+        status: 'ok',
+        message: reapedNote
+          ? `${reapedNote} No stale locks remain.`
+          : 'No stale locks (no rows with ttl_expires_at < NOW())',
+      };
     }
     const lines = stale.slice(0, 10).map(s => {
       const ageH = Math.floor(s.age_ms / 3600_000);
@@ -2360,11 +2387,15 @@ export async function checkStaleLocks(engine: BrainEngine): Promise<Check> {
       return `  ${s.id} (pid ${s.holder_pid} on ${s.holder_host}, age ${ageH}h) → ${breakHint}`;
     });
     const tail = stale.length > 10 ? `  ... and ${stale.length - 10} more.` : null;
+    const header = opts.fix
+      ? `${stale.length} stale lock(s) remain that could not be auto-reaped (live holder, cross-host, or within the PID-reuse grace):`
+      : `${stale.length} stale lock(s) detected (ttl_expires_at < NOW()):`;
     return {
       name: 'stale_locks',
       status: 'warn',
       message: [
-        `${stale.length} stale lock(s) detected (ttl_expires_at < NOW()):`,
+        reapedNote,
+        header,
         ...lines,
         tail,
       ].filter(Boolean).join('\n'),
@@ -6951,7 +6982,7 @@ export async function buildChecks(
     checks.push(checkAutopilotLockScope());
     // v0.41.6.0 D3 — stale_locks (gbrain_cycle_locks rows with ttl_expires_at < NOW())
     progress.heartbeat('stale_locks');
-    checks.push(await checkStaleLocks(engine));
+    checks.push(await checkStaleLocks(engine, { fix: doFix, dryRun }));
     // v0.38 — cycle_phase_scope (informational; no DB cost)
     progress.heartbeat('cycle_phase_scope');
     checks.push(checkCyclePhaseScope());
