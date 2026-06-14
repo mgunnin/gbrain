@@ -36,7 +36,12 @@ import { readFileSync } from 'fs';
 
 const MB = 1024 * 1024;
 export const RSS_DEFAULT_FLOOR_MB = 4096;
-export const RSS_DEFAULT_CEIL_MB = 16384;
+// Lyra-local: raised 16384 → 32768. On Matt's 128GB host the 16GB ceiling
+// OOM-killed legit autopilot-cycle working sets (~17GB during propose_takes)
+// and starved embed passes on a 15k-page brain. 32GB stays far below the
+// 128GB ceiling so graceful drain still beats the kernel OOM-killer.
+// (Upstream default is 16384; preserve-on-merge.)
+export const RSS_DEFAULT_CEIL_MB = 32768;
 export const RSS_DEFAULT_FRACTION = 0.5;
 
 export interface ResolvedMaxRss {
