@@ -12,10 +12,18 @@ on:
 permissions:
   contents: read
 
+# Cancel a superseded run when a newer commit lands on the same PR/branch.
+# PR number for pull_request events (fork-safe), github.ref fallback for
+# push/scheduled runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tier1:
     name: Tier 1 (Mechanical)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -49,6 +57,7 @@ jobs:
     # from repo/org secrets. Nightly + manual triggers still supported via
     # the workflow-level `on:` list.
     needs: tier1
+    timeout-minutes: 30
     services:
       postgres:
         image: pgvector/pgvector:pg16
