@@ -186,6 +186,13 @@ describe('shouldExclude — orphan filter regression (preserve curation)', () =>
     expect(shouldExclude('entities/anonymous')).toBe(true);
     expect(shouldExclude('atoms/fact-123')).toBe(true);
     expect(shouldExclude('skills/gbrain-operations')).toBe(true);
+    expect(shouldExclude('artifacts/codex-import/session')).toBe(true);
+    expect(shouldExclude('extracts/2026-06-22/foo')).toBe(true);
+    expect(shouldExclude('transcripts/claude-code/session')).toBe(true);
+    expect(shouldExclude('agent-lyra/daily/2026-06-22')).toBe(true);
+    expect(shouldExclude('agent-ella/daily/2026-06-22')).toBe(true);
+    expect(shouldExclude('agent-shared/live-context')).toBe(true);
+    expect(shouldExclude('.sources/nexus/raw/session')).toBe(true);
   });
 
   test('regular slugs are NOT excluded', () => {
