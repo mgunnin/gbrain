@@ -697,6 +697,22 @@ async function processPage(
   const segments = splitIntoSegments(messages, { sinceIso });
   if (segments.length === 0) {
     state.result.pages_skipped++;
+    // A parsed-but-empty page is still terminal for backlog purposes: there
+    // are no extractable segments to process, so leaving it without the audit
+    // row makes doctor report permanent debt that reruns can never drain.
+    // Keep dry-run side-effect free and preserve sinceIso resumability: pages
+    // already completed have their terminal row; pages with genuinely no
+    // messages get one here.
+    if (!state.dryRun && sinceIso === undefined) {
+      try {
+        await writeTerminalAuditRow(state.engine, state.sourceId, page.slug, 0);
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        process.stderr.write(
+          `[extract-conversation-facts] ${page.slug} empty-page terminal audit write failed: ${(err as Error).message}\n`,
+        );
+      }
+    }
     return { newEndIso: null };
   }
 

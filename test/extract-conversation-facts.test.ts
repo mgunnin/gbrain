@@ -380,6 +380,33 @@ describe('runExtractConversationFactsCore', () => {
     expect(Number(terminalRows[0]?.count ?? 0)).toBe(1);
   });
 
+  test('writes terminal audit row for parseable-empty pages so backlog can drain', async () => {
+    await engine.putPage('conversations/imessage/empty-example', {
+      type: 'conversation',
+      title: 'Empty Conversation',
+      compiled_truth: 'not a supported conversation transcript',
+      timeline: '',
+      frontmatter: {},
+    });
+
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/empty-example',
+      sleepMs: 0,
+    });
+
+    expect(result.pages_considered).toBe(1);
+    expect(result.pages_skipped).toBe(1);
+    expect(result.pages_processed).toBe(0);
+    expect(result.segments_processed).toBe(0);
+
+    const terminalRows = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
+      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/empty-example`],
+    );
+    expect(Number(terminalRows[0]?.count ?? 0)).toBe(1);
+  });
+
   test('row_num accumulator: segment 2 facts start after segment 1 (Codex C1)', async () => {
     await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
