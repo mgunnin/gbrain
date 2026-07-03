@@ -31,8 +31,8 @@ describe('resolveDefaultMaxRssMb — clamp', () => {
     expect(resolveDefaultMaxRssMb({ totalMemBytes: 32 * GB, cgroupLimitBytes: null })).toBe(16384);
   });
 
-  it('126GB host → ceil 16384 (the incident box)', () => {
-    expect(resolveDefaultMaxRssMb({ totalMemBytes: 126 * GB, cgroupLimitBytes: null })).toBe(16384);
+  it('126GB host → 64512 (0.5x host RAM, below the 64GB local ceiling)', () => {
+    expect(resolveDefaultMaxRssMb({ totalMemBytes: 126 * GB, cgroupLimitBytes: null })).toBe(64512);
   });
 
   it('result always within [floor, ceil] for huge hosts', () => {
