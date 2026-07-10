@@ -28,6 +28,9 @@ export const DENY_PREFIXES = [
   'scripts/',
   'templates/',
   'openclaw/config/',
+  // Life Chronicle emits immutable event leaves. They are temporal evidence
+  // for their linked entities, not curation targets requiring inbound links.
+  'life/events/',
 ] as const;
 
 /** First slug segments where no inbound links is expected. */
@@ -97,16 +100,18 @@ export function orphanScoringExclusionSql(alias = 'p'): string {
   const pseudo = PSEUDO_SLUGS.map(sqlString).join(', ');
   const firstSegments = FIRST_SEGMENT_EXCLUSIONS.map(sqlString).join(', ');
   const denyPrefixes = DENY_PREFIXES
-    .map((prefix) => `${slug} LIKE ${sqlLike(`${prefix}%`)} ESCAPE '\\'`)
+    // Escape only the literal prefix; the appended % must remain a LIKE wildcard.
+    .map((prefix) => `${slug} LIKE ${sqlString(prefix)} || '%' ESCAPE '\\'`)
     .join(' OR ');
   const suffixes = AUTO_SUFFIX_PATTERNS
-    .map((suffix) => `${slug} LIKE ${sqlLike(`%${suffix}`)} ESCAPE '\\'`)
+    // Escape only the literal suffix; the prepended % must remain a LIKE wildcard.
+    .map((suffix) => `${slug} LIKE '%' || ${sqlString(suffix)} ESCAPE '\\'`)
     .join(' OR ');
 
   return `NOT (
     ${slug} IN (${pseudo})
     OR ${suffixes}
-    OR ${slug} LIKE ${sqlLike(`%${RAW_SEGMENT}%`)} ESCAPE '\\'
+    OR ${slug} LIKE '%' || ${sqlString(RAW_SEGMENT)} || '%' ESCAPE '\\'
     OR ${denyPrefixes}
     OR split_part(${slug}, '/', 1) IN (${firstSegments})
   )`;

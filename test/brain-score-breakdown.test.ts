@@ -71,6 +71,15 @@ describe('Bug 11 — brain_score breakdown sums to total', () => {
 });
 
 describe('Bug 11 — orphan_pages is "no inbound links"', () => {
+  test('a life Chronicle event is excluded from scoreable page and orphan counts', async () => {
+    await engine.putPage('life/events/2026-07-10-abc123', {
+      type: 'event', title: 'Chronicle event', compiled_truth: 'generated event', frontmatter: {},
+    });
+    const h = await engine.getHealth();
+    expect(h.page_count).toBe(0);
+    expect(h.orphan_pages).toBe(0);
+  });
+
   test('a page with outbound-only links is NOT an orphan', async () => {
     // Hub page: links out to three others, but nothing links back to it.
     // Previous (buggy) behavior: hub counted as orphan because it had no

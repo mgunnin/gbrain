@@ -177,6 +177,7 @@ describe('shouldExclude — orphan filter regression (preserve curation)', () =>
     expect(shouldExclude('dashboards/_index')).toBe(true);
     expect(shouldExclude('scripts/build')).toBe(true);
     expect(shouldExclude('output/foo')).toBe(true);
+    expect(shouldExclude('life/events/2026-07-10-abc123')).toBe(true);
   });
 
   test('first-segment exclusions fire', () => {
