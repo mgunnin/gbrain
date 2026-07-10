@@ -851,6 +851,30 @@ async function writeTerminalAuditRow(
   slug: string,
   rowNum: number,
 ): Promise<void> {
+  // Empty pages have no timestamp checkpoint, so they can be revisited on every
+  // cycle. Reusing the same terminal row is success; another fact at this key
+  // remains a real integrity error.
+  const existing = await engine.executeRaw<{
+    source: string;
+    source_session: string | null;
+    fact: string;
+  }>(
+    `SELECT source, source_session, fact
+       FROM facts
+      WHERE source_id = $1 AND source_markdown_slug = $2 AND row_num = $3
+      LIMIT 1`,
+    [sourceId, slug, rowNum],
+  );
+  const row = existing[0];
+  if (row) {
+    if (
+      row.source === TERMINAL_AUDIT_SOURCE &&
+      row.source_session === `${TERMINAL_AUDIT_SOURCE}:${slug}` &&
+      row.fact === 'EXTRACTION_COMPLETE'
+    ) return;
+    throw new Error(`facts row ${rowNum} for ${slug} is occupied by a non-terminal fact`);
+  }
+
   const fact: NewFact & { row_num: number; source_markdown_slug: string } = {
     fact: 'EXTRACTION_COMPLETE',
     kind: 'fact',

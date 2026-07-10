@@ -179,6 +179,13 @@ describe('runExtractFacts — happy path', () => {
 
 describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
   test('refuses to run when legacy v0.31 rows are pending the v0_32_2 backfill', async () => {
+    // A legacy fence row can only be backfilled for a source with a local repo.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `INSERT INTO sources (id, name, local_path, config)
+       VALUES ('default', 'default', '/tmp/legacy-brain', '{}'::jsonb)
+       ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
+    );
     // Seed a legacy fact (row_num NULL, entity_slug NOT NULL — the
     // v0.31 hot-memory shape pre-backfill).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -245,6 +252,31 @@ describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {
 
     const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
     expect(r.guardTriggered).toBe(false);
+    expect(r.factsInserted).toBe(1);
+  });
+
+  test('DB-only facts do not masquerade as unfinished fence migration debt', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `INSERT INTO sources (id, name, local_path, config)
+       VALUES ('db-only', 'DB only', NULL, '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
+                          valid_from, source, confidence)
+       VALUES ('db-only', 'people/remote', 'remote-only fact', 'fact', 'private', 'medium',
+               now(), 'mcp:extract_facts', 1.0)`,
+    );
+
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | F | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    ));
+
+    const r = await runExtractFacts(engine, { slugs: ['people/alice'] });
+    expect(r.guardTriggered).toBe(false);
+    expect(r.legacyRowsPending).toBe(0);
     expect(r.factsInserted).toBe(1);
   });
 });

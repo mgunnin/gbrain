@@ -112,13 +112,17 @@ export async function runExtractFacts(
     phantomsMorePending: false,
   };
 
-  // ── Empty-fence guard (Codex R2-#7) ────────────────────────────
-  // Pre-check: if any legacy fact rows exist (row_num NULL but
-  // entity_slug NOT NULL), refuse to run the destructive
-  // reconciliation pass. The v0_32_2 orchestrator must complete
-  // first.
+  // Pre-check only facts that can still be reconciled from an on-disk fence.
+  // DB-only sources intentionally write NULL row_num facts and have no fence to
+  // backfill, so treating them as legacy migration debt blocks every cycle.
   const legacy = await engine.executeRaw<{ n: string }>(
-    `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NOT NULL`,
+    `SELECT COUNT(*) AS n
+       FROM facts f
+       JOIN sources s ON s.id = f.source_id
+      WHERE f.row_num IS NULL
+        AND f.entity_slug IS NOT NULL
+        AND s.local_path IS NOT NULL
+        AND f.entity_slug LIKE '%/%'`,
   );
   const legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
   result.legacyRowsPending = legacyCount;

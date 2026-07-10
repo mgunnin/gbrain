@@ -405,6 +405,29 @@ describe('runExtractConversationFactsCore', () => {
       [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/empty-example`],
     );
     expect(Number(terminalRows[0]?.count ?? 0)).toBe(1);
+
+    const stderr: string[] = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      stderr.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/imessage/empty-example',
+        sleepMs: 0,
+      });
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+
+    const afterRerun = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
+      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/empty-example`],
+    );
+    expect(Number(afterRerun[0]?.count ?? 0)).toBe(1);
+    expect(stderr.join('')).not.toContain('terminal audit write failed');
   });
 
   test('row_num accumulator: segment 2 facts start after segment 1 (Codex C1)', async () => {
