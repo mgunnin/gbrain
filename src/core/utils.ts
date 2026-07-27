@@ -329,6 +329,7 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
     parent_symbol_path: (row.parent_symbol_path as string[] | null | undefined) ?? null,
     doc_comment: (row.doc_comment as string | null | undefined) ?? null,
     symbol_name_qualified: (row.symbol_name_qualified as string | null | undefined) ?? null,
+    modality: (row.modality as 'text' | 'image' | undefined) ?? undefined,
   };
 }
 
@@ -379,6 +380,19 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
     } else if (typeof raw === 'string' && raw) {
       result.effective_date_source = raw;
     }
+  }
+  if (typeof row.message_id === 'string' && row.message_id.trim().length > 0) {
+    result.message_id = row.message_id;
+  }
+  if (typeof row.thread_id === 'string' && row.thread_id.length > 0) {
+    result.thread_id = row.thread_id;
+  }
+  if (
+    result.message_id &&
+    typeof row.source_subject === 'string' &&
+    row.source_subject.length > 0
+  ) {
+    result.source_subject = row.source_subject;
   }
   return result;
 }

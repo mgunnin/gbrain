@@ -29,6 +29,7 @@ import {
 } from '../core/takes-fence.ts';
 import { withPageLock } from '../core/page-lock.ts';
 import { resolveSourceId } from '../core/source-resolver.ts';
+import { resolveOwnerHolder } from '../core/owner-holder.ts';
 
 // --- Helpers ---
 
@@ -101,12 +102,18 @@ async function getPageId(engine: BrainEngine, slug: string, sourceId?: string): 
   return rows[0].id;
 }
 
-async function resolveTakesSourceId(engine: BrainEngine): Promise<string | undefined> {
-  try {
-    return await resolveSourceId(engine, null);
-  } catch {
-    return undefined;
-  }
+// Fail-closed (#2698 residual, TODOS.md): `resolveSourceId` only ever
+// throws when a source WAS explicitly in play — an invalid or
+// unregistered `GBRAIN_SOURCE`, a `.gbrain-source` dotfile pointing at a
+// source that doesn't exist, or a genuine DB error — never for "nothing
+// configured" (that path resolves cleanly to the seeded `'default'`
+// source, tier 6 of resolveSourceId). Swallowing those errors here used
+// to fall back to the unscoped slug-only page lookup, silently
+// reintroducing the pre-#2698 cross-source write bug whenever resolution
+// merely errored instead of resolving cleanly. Let it propagate so the
+// write is blocked instead of silently unscoped.
+async function resolveTakesSourceId(engine: BrainEngine): Promise<string> {
+  return resolveSourceId(engine, null);
 }
 
 function readBodyOrEmpty(path: string): string {
@@ -285,7 +292,7 @@ async function cmdSupersede(engine: BrainEngine, args: string[], sourceId?: stri
     const pageId = await getPageId(engine, slug, sourceId);
 
     // Read existing row to inherit kind/holder unless overridden
-    const existing = await engine.listTakes({ page_id: pageId, active: false, limit: 500 });
+    const existing = await engine.listTakes({ page_id: pageId, active: true, limit: 500 });
     const target = existing.find(t => t.row_num === rowNum);
     if (!target) {
       console.error(`Row #${rowNum} not found on ${slug}.`);
@@ -358,7 +365,7 @@ async function cmdResolve(engine: BrainEngine, args: string[], sourceId?: string
   // --evidence is the v0.30.0 alias for --source on the resolve subcommand
   // (semantic clarity: "what evidence resolved this bet?").
   const source = flagValue(args, '--evidence') ?? flagValue(args, '--source');
-  const resolvedBy = flagValue(args, '--by') ?? 'garry';
+  const resolvedBy = flagValue(args, '--by') ?? resolveOwnerHolder({ configValue: await engine.getConfig('emotional_weight.user_holder') });
   const dirArg = flagValue(args, '--dir');
 
   const pageId = await getPageId(engine, slug, sourceId);

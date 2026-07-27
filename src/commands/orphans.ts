@@ -15,7 +15,11 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { createProgress, startHeartbeat } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
-import { shouldExcludeFromOrphanScoring } from '../core/orphan-exclusions.ts';
+import {
+  shouldExcludeFromOrphanReporting,
+  loadOrphanPolicyOverrides,
+  type OrphanPolicyOverrides,
+} from '../core/orphan-policy.ts';
 
 // --- Types ---
 
@@ -39,8 +43,8 @@ export interface OrphanResult {
  * Returns true if a slug should be excluded from orphan reporting by default.
  * These are pages where having no inbound links is expected / not a content problem.
  */
-export function shouldExclude(slug: string): boolean {
-  return shouldExcludeFromOrphanScoring(slug);
+export function shouldExclude(slug: string, overrides?: OrphanPolicyOverrides): boolean {
+  return shouldExcludeFromOrphanReporting(slug, overrides);
 }
 
 /**
@@ -106,6 +110,7 @@ export async function findOrphans(
   let allOrphans: { slug: string; title: string; domain: string | null }[];
   let total: number;
   let excludedAll: number;
+  const overrides = includePseudo ? undefined : await loadOrphanPolicyOverrides(engine);
   try {
     allOrphans = await engine.findOrphanPages(
       sourceIds ? { sourceIds } : sourceId ? { sourceId } : undefined,
@@ -134,7 +139,7 @@ export async function findOrphans(
     total = liveRows.length;
     excludedAll = includePseudo
       ? 0
-      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug) ? 1 : 0), 0);
+      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug, overrides) ? 1 : 0), 0);
   } finally {
     stopHb();
     progress.finish();
@@ -142,7 +147,7 @@ export async function findOrphans(
 
   const filtered = includePseudo
     ? allOrphans
-    : allOrphans.filter(row => !shouldExclude(row.slug));
+    : allOrphans.filter(row => !shouldExclude(row.slug, overrides));
 
   const orphans: OrphanPage[] = filtered.map(row => ({
     slug: row.slug,
