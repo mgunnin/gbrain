@@ -1,4 +1,5 @@
 import type { BrainEngine } from '../core/engine.ts';
+import { REPAIR_SOURCE_CONFIG_SQL } from '../core/source-config-sql.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
@@ -52,6 +53,7 @@ import { isUndefinedColumnError } from '../core/utils.ts';
 // drift from what search actually filters.
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
+import { hnswIndexExpected, hnswMaxDimsForType } from '../core/vector-index.ts';
 
 export interface Check {
   name: string;
@@ -615,10 +617,8 @@ export async function checkSourceConfigShape(engine: BrainEngine): Promise<Check
         `${rows.length} source(s) have a non-object config — a JSON string/scalar ` +
         `instead of an object (the #2829 re-wrapping bug): ${affected}. ` +
         `Federation and ACL settings on these sources won't be read correctly. ` +
-        `Repair by running any 'gbrain sources' config write (self-heals up to 10 ` +
-        `nested layers), or in SQL: ` +
-        `UPDATE sources SET config = (config #>> '{}')::jsonb ` +
-        `WHERE jsonb_typeof(config) <> 'object';`,
+        `Repair by running any 'gbrain sources' config write (self-heals nested ` +
+        `strings and recoverable arrays), or in SQL: ${REPAIR_SOURCE_CONFIG_SQL}`,
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -878,8 +878,8 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   checks.push(await checkEmbeddingEnvOverride(engine));
 
   // v0.31.12 subagent runtime enforcement (Layer 3 of 3 — Codex F13).
-  // The subagent loop is Anthropic-only. If models.tier.subagent or
-  // models.default is explicitly set to a non-Anthropic provider, warn here
+  // The subagent loop requires native tool-calling. If models.subagent,
+  // models.tier.subagent, or models.default resolves to a limited provider, warn here
   // so the user sees it at the next `gbrain doctor` run instead of at the
   // next subagent job submission. (Layers 1+2 also enforce — this is the
   // surfacing layer.)
@@ -3053,6 +3053,7 @@ async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Check> {
 export async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
   try {
     const { classifyCapabilities } = await import('../core/ai/capabilities.ts');
+    const modelsSubagent = await engine.getConfig('models.subagent');
     const tierSubagent = await engine.getConfig('models.tier.subagent');
     const modelsDefault = await engine.getConfig('models.default');
 
@@ -3093,11 +3094,22 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
       return null;
     };
 
-    if (tierSubagent) {
-      const issue = explain(tierSubagent, 'models.tier.subagent');
+    let resolvedSource: string | null = null;
+    let resolvedModel: string | null = null;
+    if (modelsSubagent) {
+      resolvedSource = 'models.subagent';
+      resolvedModel = modelsSubagent;
+      const issue = explain(modelsSubagent, resolvedSource);
       if (issue) return issue;
     } else if (modelsDefault) {
+      resolvedSource = 'models.default';
+      resolvedModel = modelsDefault;
       const issue = explain(modelsDefault, 'models.default');
+      if (issue) return issue;
+    } else if (tierSubagent) {
+      resolvedSource = 'models.tier.subagent';
+      resolvedModel = tierSubagent;
+      const issue = explain(tierSubagent, resolvedSource);
       if (issue) return issue;
     }
     // v0.37 (T10 / D7) + v0.38 (D7 capability rename): warn when the configured
@@ -3111,9 +3123,9 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
       const { loadConfig } = await import('../core/config.ts');
       const cfg = loadConfig();
       const chatModel = cfg?.chat_model;
+      const { isConfigTruthy } = await import('../core/config.ts');
       const gatewayLoopRaw = await engine.getConfig('agent.use_gateway_loop').catch(() => null);
-      const gatewayLoopEnabled = typeof gatewayLoopRaw === 'string'
-        && ['true', '1', 'yes', 'on'].includes(gatewayLoopRaw.trim().toLowerCase());
+      const gatewayLoopEnabled = isConfigTruthy(gatewayLoopRaw);
       const { isAnthropicProvider } = await import('../core/model-config.ts');
       if (chatModel && !isAnthropicProvider(chatModel) && !process.env.ANTHROPIC_API_KEY && !gatewayLoopEnabled) {
         return {
@@ -3131,8 +3143,8 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
     return {
       name: 'subagent_capability',
       status: 'ok',
-      message: tierSubagent
-        ? `Subagent tier resolves to "${tierSubagent}" with full tool-loop capability`
+      message: resolvedModel && resolvedSource
+        ? `Subagent model resolves via ${resolvedSource} to "${resolvedModel}" with full tool-loop capability`
         : `Subagent tier resolves to default (claude-sonnet-4-6) — full tool-loop capability`,
     };
   } catch (e) {
@@ -6147,6 +6159,12 @@ export async function buildChecks(
           continue;
         }
         if (engine.kind === 'postgres' && haveIndex.get(colName) === false) {
+          if (!hnswIndexExpected(entry.type, entry.dimensions)) {
+            okColumns.push(
+              `${colName} (exact scan: ${entry.type}(${entry.dimensions}) exceeds HNSW cap ${hnswMaxDimsForType(entry.type)})`,
+            );
+            continue;
+          }
           issues.push(
             `${colName}: no HNSW index. Search works but uses sequential scan. ` +
               `Fix: CREATE INDEX IF NOT EXISTS idx_chunks_${colName} ON content_chunks USING hnsw (${quoteIdentifier(colName)} ${entry.type}_cosine_ops);`,

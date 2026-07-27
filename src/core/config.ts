@@ -1085,6 +1085,27 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
 ];
 
+/**
+ * Canonical truthiness for DB-plane boolean config values (#2753).
+ *
+ * Config values arrive as opaque strings from `gbrain config set`, so every
+ * reader has to decide what counts as "on". Left to each call site those sets
+ * drift, and the drift is silent in the worst possible way: the doctor accepted
+ * `yes`/`on` while the subagent worker accepted only `true`/`1`, so
+ * `gbrain config set agent.use_gateway_loop yes` produced a healthy doctor
+ * report AND a runtime refusal of the very job the setting was supposed to
+ * enable. One parser, used by every reader, is what keeps a green health check
+ * honest.
+ *
+ * Accepts `true` / `1` / `yes` / `on` (case-insensitive, surrounding whitespace
+ * trimmed). Everything else — including `null`, non-strings, and the empty
+ * string — is false, so an unset or garbled value fails closed.
+ */
+export function isConfigTruthy(raw: unknown): boolean {
+  return typeof raw === 'string'
+    && ['true', '1', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
 export function saveConfig(config: GBrainConfig): void {
   mkdirSync(getConfigDir(), { recursive: true });
   writeFileSync(getConfigPath(), JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
