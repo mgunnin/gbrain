@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
-import { assessContentSanity } from '/Users/mgunnin/gbrain/src/core/content-sanity.ts';
-import { parseMarkdown } from '/Users/mgunnin/gbrain/src/core/markdown.ts';
+import { assessContentSanity } from '../src/core/content-sanity.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
 
 test('assessContentSanity does not throw when title is a number (YAML coercion)', () => {
   // @ts-expect-error — simulating runtime YAML coercion to number
