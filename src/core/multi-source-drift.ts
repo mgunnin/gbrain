@@ -59,6 +59,11 @@ const DEFAULT_FILE_LIMIT = 10_000;
 const DEFAULT_TIMEOUT_MS = 5_000;
 const SAMPLE_LIMIT = 5;
 
+function positiveEnvInt(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
 /**
  * Walk a directory tree for `.md` + `.mdx` files. Skips dotfiles (`.git`),
  * `_*.md` files (the existing extract.ts convention), and silently swallows
@@ -185,8 +190,8 @@ export async function findMisroutedPages(
   sources: SourceWithPath[],
   opts: { limit?: number; timeoutMs?: number } = {},
 ): Promise<MisroutedResult> {
-  const limit = opts.limit ?? DEFAULT_FILE_LIMIT;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const limit = opts.limit ?? positiveEnvInt('GBRAIN_DRIFT_LIMIT', DEFAULT_FILE_LIMIT);
+  const timeoutMs = opts.timeoutMs ?? positiveEnvInt('GBRAIN_DRIFT_TIMEOUT_MS', DEFAULT_TIMEOUT_MS);
   const deadlineMs = Date.now() + timeoutMs;
 
   let totalCount = 0;

@@ -23,6 +23,7 @@ import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { findMisroutedPages } from '../src/core/multi-source-drift.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 const TMP_ROOTS: string[] = [];
@@ -144,6 +145,18 @@ describe('findMisroutedPages — heuristic correctness', () => {
       timeoutMs: 5000,
     });
     expect(result.walk_truncated).toBe(true);
+  });
+
+  test('GBRAIN_DRIFT_LIMIT overrides the default walk limit', async () => {
+    const root = makeTmpRoot('env-limit');
+    for (let i = 0; i < 12; i++) seedFile(root, `topics/env-file-${i}.md`);
+
+    await withEnv({ GBRAIN_DRIFT_LIMIT: '5' }, async () => {
+      const result = await findMisroutedPages(engine, [
+        { id: 'src-env-fake', local_path: root },
+      ]);
+      expect(result.walk_truncated).toBe(true);
+    });
   });
 
   test('case 6 (OV13): unreadable local_path does NOT crash; returns empty', async () => {
