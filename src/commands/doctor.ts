@@ -5643,14 +5643,25 @@ export async function buildChecks(
       } else {
         const hitsByPattern: Record<string, number> = {};
         let unmatched = 0;
+        let evaluated = 0;
+        const llmFallbackEnabled =
+          (await engine.getConfig('conversation_parser.llm_fallback_enabled')) === 'true';
         for (const page of sample) {
           const body = await readConversationBodyForParsing(engine, page);
+          // Empty collector placeholders and operational skill docs are not
+          // conversations, even when legacy schema inference labels them slack.
+          if (!body.trim() || page.slug.startsWith('skills/')) continue;
+          evaluated++;
           const result = parseConversation(body, { page, noPolish: true, noFallback: true });
-          const id = result.matched_pattern_id ?? '_no_match';
+          const usesMeetingFallback =
+            result.phase === 'no_match' && page.type === 'meeting' && llmFallbackEnabled;
+          const id = usesMeetingFallback
+            ? '_llm_fallback'
+            : (result.matched_pattern_id ?? '_no_match');
           hitsByPattern[id] = (hitsByPattern[id] ?? 0) + 1;
-          if (result.phase === 'no_match') unmatched++;
+          if (result.phase === 'no_match' && !usesMeetingFallback) unmatched++;
         }
-        const unmatchedPct = (unmatched / sample.length) * 100;
+        const unmatchedPct = evaluated === 0 ? 0 : (unmatched / evaluated) * 100;
         const breakdown = Object.entries(hitsByPattern)
           .sort(([, a], [, b]) => b - a)
           .map(([k, v]) => `${k}=${v}`)
@@ -5660,7 +5671,7 @@ export async function buildChecks(
             name: 'conversation_format_coverage',
             status: 'warn',
             message:
-              `${unmatched}/${sample.length} conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
+              `${unmatched}/${evaluated} conversation pages (${unmatchedPct.toFixed(1)}%) have no deterministic pattern or configured fallback. ` +
               `Breakdown: ${breakdown}. ` +
               `Investigate: gbrain conversation-parser scan <slug>`,
           });
@@ -5668,7 +5679,7 @@ export async function buildChecks(
           checks.push({
             name: 'conversation_format_coverage',
             status: 'ok',
-            message: `${sample.length} pages: ${breakdown}`,
+            message: `${evaluated} non-empty conversation pages: ${breakdown}`,
           });
         }
       }

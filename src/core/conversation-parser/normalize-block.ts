@@ -36,10 +36,29 @@
 const BLOCK_HEADER =
   /^\s*-\s+\*\*(.+?)\*\*\s+\((?:[A-Za-z]{2,9}\.?\s+)?(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp][Mm])?\)\s*$/;
 
+// Nexus Slack archive: `**[2026-07-03T08:34:04-05:00] Name ↪** (ts=...)`.
+const SLACK_ARCHIVE_HEADER =
+  /^\s*\*\*\[(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})\]\s+(.+?)\*\*\s+\([^)]*\)\s*$/;
+
+function parseHeader(line: string): { name: string; time: string; date?: string } | null {
+  const block = BLOCK_HEADER.exec(line);
+  if (block) {
+    const hour = to24h(parseInt(block[2], 10), block[4]);
+    return { name: block[1].trim(), time: `${String(hour).padStart(2, '0')}:${block[3]}` };
+  }
+  const archive = SLACK_ARCHIVE_HEADER.exec(line);
+  if (!archive) return null;
+  return {
+    name: archive[4].replace(/\s+↪$/, '').trim(),
+    date: archive[1],
+    time: `${archive[2]}:${archive[3]}`,
+  };
+}
+
 /** True when at least one line is a block-format message header. */
 export function looksLikeBlockConversation(body: string): boolean {
   for (const line of body.split('\n')) {
-    if (BLOCK_HEADER.test(line)) return true;
+    if (parseHeader(line)) return true;
   }
   return false;
 }
@@ -61,25 +80,24 @@ export function normalizeBlockConversation(body: string): string {
 
   const lines = body.split('\n');
   const out: string[] = [];
-  let current: { name: string; time: string } | null = null;
+  let current: { name: string; time: string; date?: string } | null = null;
   let bodyParts: string[] = [];
 
   const flush = () => {
     if (current) {
       const text = bodyParts.join(' ').replace(/\s+/g, ' ').trim();
-      out.push(`**${current.name}** (${current.time}): ${text}`);
+      const timestamp = current.date ? `${current.date} ${current.time}` : current.time;
+      out.push(`**${current.name}** (${timestamp}): ${text}`);
     }
     current = null;
     bodyParts = [];
   };
 
   for (const line of lines) {
-    const m = BLOCK_HEADER.exec(line);
-    if (m) {
+    const header = parseHeader(line);
+    if (header) {
       flush();
-      const hour = to24h(parseInt(m[2], 10), m[4]);
-      const time = `${String(hour).padStart(2, '0')}:${m[3]}`;
-      current = { name: m[1].trim(), time };
+      current = header;
     } else if (current) {
       // Body line of the current message. Drop blank lines; keep the rest.
       const trimmed = line.trim();
