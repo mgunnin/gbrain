@@ -38,7 +38,7 @@ const BLOCK_HEADER =
 
 // Nexus Slack archive: `**[2026-07-03T08:34:04-05:00] Name ↪** (ts=...)`.
 const SLACK_ARCHIVE_HEADER =
-  /^\s*\*\*\[(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})\]\s+(.+?)\*\*\s+\([^)]*\)\s*$/;
+  /^\s*\*\*\[(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::\d{2})?(Z|[+-]\d{2}:\d{2})\]\s+(.+?)\*\*\s+\([^)]*\)\s*$/;
 
 function parseHeader(line: string): { name: string; time: string; date?: string } | null {
   const block = BLOCK_HEADER.exec(line);
@@ -48,10 +48,11 @@ function parseHeader(line: string): { name: string; time: string; date?: string 
   }
   const archive = SLACK_ARCHIVE_HEADER.exec(line);
   if (!archive) return null;
+  const utc = new Date(`${archive[1]}T${archive[2]}:${archive[3]}:00${archive[4]}`).toISOString();
   return {
-    name: archive[4].replace(/\s+↪$/, '').trim(),
-    date: archive[1],
-    time: `${archive[2]}:${archive[3]}`,
+    name: archive[5].replace(/\s+↪$/, '').trim(),
+    date: utc.slice(0, 10),
+    time: utc.slice(11, 16),
   };
 }
 

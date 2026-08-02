@@ -63,8 +63,8 @@ describe('normalizeBlockConversation', () => {
 
   test('normalizes Nexus Slack archive headers and reply markers', () => {
     expect(normalizeBlockConversation(NEXUS_SLACK).split('\n')).toEqual([
-      '**Kit Joubert** (2026-07-03 08:34): How does formatting work?',
-      '**Matt Gunnin** (2026-07-03 09:18): Fixed now.',
+      '**Kit Joubert** (2026-07-03 13:34): How does formatting work?',
+      '**Matt Gunnin** (2026-07-03 14:18): Fixed now.',
     ]);
   });
 
