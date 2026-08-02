@@ -1,5 +1,27 @@
 # Contributing to GBrain
 
+## Human-authored intent (required, no exceptions)
+
+Effective 2026-08-02, every issue and every pull request must include:
+
+1. **A paragraph you wrote yourself**, explaining why you are opening this.
+   What you were doing, what went wrong or what you needed, why it matters to
+   you. AI-generated or AI-polished text is not accepted here — this one
+   paragraph is the human part. Rough grammar is fine and preferred over
+   polish.
+2. **A screenshot showing gbrain actually being used** in the situation you
+   are describing — your terminal, your agent session, your logs. Proof the
+   need is real, not hypothetical.
+
+Issues or PRs without both are closed without review. You may reopen once
+they're added.
+
+Scrub anything private before you attach a screenshot: real names, companies,
+API keys, brain contents. See the privacy rule in `CLAUDE.md`. A redacted
+screenshot is fine; a missing one is not.
+
+AI assistance for the *code* is fine. The intent paragraph is not code.
+
 ## Setup
 
 ```bash
@@ -10,6 +32,34 @@ bun test
 ```
 
 Requires Bun 1.0+.
+
+### Windows
+
+`bun run test`, `verify`, `ci:local` and `test:e2e` all dispatch through bash, so
+the shell scripts under `scripts/` must be checked out with Unix line endings.
+The root `.gitattributes` pins `*.sh text eol=lf`, which overrides the
+`core.autocrlf=true` that Git for Windows installs by default. A fresh clone is
+correct with no extra steps.
+
+`.gitattributes` pins `*.md text eol=lf` for the same reason. The frontmatter
+readers anchor on a `---` fence followed by a Unix line ending, so a CRLF
+checkout makes a well-formed document parse as having no frontmatter. That
+failure is silent: no error, the field just comes back empty.
+
+If you cloned before either pin existed, your working copy still has the old
+Windows line endings. Bash will fail with `$'\r': command not found`, and
+frontmatter will read as absent. Refresh it once, from the repository root:
+
+```bash
+git rm --cached -r . -q
+git reset --hard
+bash -n scripts/run-unit-parallel.sh          # silence means bash can read the scripts
+git ls-files --eol -- '*.md' | grep -c w/crlf # 0 means Markdown is clean
+```
+
+Every `check:*` entry in `package.json` invokes its script as `bash scripts/<name>.sh`
+rather than relying on the shebang, because bun on Windows cannot exec a `.sh`
+directly. Keep that prefix when you add a new shell-script check.
 
 ## Project structure
 
@@ -162,6 +212,14 @@ host port with `GBRAIN_CI_PG_PORT=5435 bun run ci:local` if 5434 collides.
 
 Fail-closed selector: an unmapped `src/` change runs all 29 E2E files. Hand-tune
 narrower mappings via `scripts/e2e-test-map.ts`.
+
+### PR-side security checks
+
+Besides the test gate, PRs may trigger three security workflows: Semgrep CE
+SAST (every PR — **advisory/non-blocking** while the baseline is tuned, so a
+Semgrep finding won't fail your PR), OSV-Scanner (only when `package.json` or
+`bun.lock` change), and actionlint (only when `.github/workflows/**` change).
+See `SECURITY.md` → "Automated security scanning" for details.
 
 ## Building
 

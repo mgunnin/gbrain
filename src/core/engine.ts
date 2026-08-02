@@ -995,7 +995,7 @@ export interface BrainEngine {
    * same-slug source (importCodeFile uses this for incremental embedding
    * reuse, which would then attach the wrong source's embeddings).
    */
-  getChunks(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]>;
+  getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]>;
   /**
    * Count chunks across the brain where embedding IS NULL.
    * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain
@@ -1005,8 +1005,13 @@ export interface BrainEngine {
    * counts across every source in the brain. Operators running
    * `gbrain embed --stale --source media-corpus` expect only that
    * source's NULLs touched; the caller threads `sourceId` here.
+   *
+   * `includeNullSignature` (only meaningful with `signature`, #3391): also
+   * count embedded chunks whose page has NO recorded signature (v108
+   * grandfathered). Provider-migration paths set this so pre-stamp pages
+   * aren't silently left in the old embedding space.
    */
-  countStaleChunks(opts?: { sourceId?: string; signature?: string }): Promise<number>;
+  countStaleChunks(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean }): Promise<number>;
   /**
    * Sum of LENGTH(chunk_text) over stale chunks — the character-count
    * backlog the embed phase / embed-backfill will process. Sibling of
@@ -1020,8 +1025,10 @@ export interface BrainEngine {
    * model signature (a model/dims swap). NULL signature is GRANDFATHERED
    * (never counted) so the post-migration corpus isn't flagged en masse.
    * Omit `signature` for the legacy `embedding IS NULL`-only count.
+   * `includeNullSignature` lifts the grandfather clause (#3391) — see
+   * countStaleChunks.
    */
-  sumStaleChunkChars(opts?: { sourceId?: string; signature?: string }): Promise<number>;
+  sumStaleChunkChars(opts?: { sourceId?: string; signature?: string; includeNullSignature?: boolean }): Promise<number>;
   /**
    * Stamp `pages.embedding_signature = signature` for one page. Called after
    * a page's chunks are (re)embedded so a later model swap can detect it as
@@ -1036,8 +1043,15 @@ export interface BrainEngine {
    * drift pages flow through the existing NULL-embedding cursor (keeps
    * listStaleChunks's keyset pagination untouched). GRANDFATHER: NULL
    * signature is never invalidated. `sourceId` scopes the sweep.
+   *
+   * `includeNullSignature` (#3391): ALSO invalidate embedded chunks whose
+   * page signature is NULL (pre-v108 pages that predate the stamp). After a
+   * provider/model swap those vectors are in the old embedding space; the
+   * default grandfather clause would silently keep them mixed into the new
+   * index. `gbrain migrate embeddings` and `embed --stale
+   * --include-null-signature` set this.
    */
-  invalidateStaleSignatureEmbeddings(opts: { signature: string; sourceId?: string }): Promise<number>;
+  invalidateStaleSignatureEmbeddings(opts: { signature: string; sourceId?: string; includeNullSignature?: boolean }): Promise<number>;
   /**
    * Return every chunk where embedding IS NULL, with the metadata needed
    * to call embedBatch + upsertChunks. The `embedding` column is omitted
@@ -1328,6 +1342,16 @@ export interface BrainEngine {
     pageIds: number[],
   ): Promise<Map<number, { reason: string; detail: string }>>;
   /**
+   * Extraction quarantine lane (issue #160): for a list of page_ids, return
+   * the subset that are unverified auto-extracted entity stubs (frontmatter
+   * `provenance: 'auto-extracted'` + `status: 'unverified'`). Used by hybrid
+   * search to stamp `SearchResult.unverified` pre-fusion so the fusion-level
+   * compiled-truth boost skips them. Single SQL query, not N+1. Empty input
+   * → empty set (no query). SQL predicate is the shared
+   * `unverifiedExtractionFragment` (src/core/extraction-review.ts).
+   */
+  getUnverifiedExtractionPageIds(pageIds: number[]): Promise<Set<number>>;
+  /**
    * v0.27.0: for a list of slugs, return their updated_at timestamps (or created_at fallback).
    * Used by hybrid search recency boost. Single SQL query, not N+1.
    * Slugs with no timestamp get no entry in the map.
@@ -1475,7 +1499,7 @@ export interface BrainEngine {
    * it, multi-source brains return raw_data rows from every same-slug page
    * (preserved via two-branch query for back-compat).
    */
-  getRawData(slug: string, source?: string, opts?: { sourceId?: string }): Promise<RawData[]>;
+  getRawData(slug: string, source?: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<RawData[]>;
 
   // Files (v0.27.1: binary asset metadata + storage_path. Image bytes never
   // enter the DB; storage_path references a path inside the brain repo or an
@@ -1791,11 +1815,22 @@ export interface BrainEngine {
    * never recreate them (the page has no `## Facts` fence). Omitted ⇒ legacy
    * behavior (delete every fact on the page coordinate). NULL/empty `source`
    * rows are always deletable (fence default).
+   *
+   * #2646: `preserveExpiredLegacy` protects soft-expired legacy rows
+   * (`row_num IS NULL AND expired_at IS NOT NULL`) — the record left by
+   * `forget_fact`'s legacy DB-only path. Fence rows always carry a
+   * `row_num`, so these rows are never fence-owned and a wipe would
+   * destroy the forget record (the audit trail of the forget). Note what
+   * this does NOT promise: it protects the record, not the forget itself —
+   * if the fence still carries the same claim, fence canonicality
+   * independently reinserts it as a fresh active row (legacy DB-only
+   * forgets are documented as non-durable; see extract-facts.ts). Omitted
+   * ⇒ legacy behavior.
    */
   deleteFactsForPage(
     slug: string,
     source_id: string,
-    opts?: { excludeSourcePrefixes?: string[] },
+    opts?: { excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean },
   ): Promise<{ deleted: number }>;
 
   /**
@@ -1890,7 +1925,7 @@ export interface BrainEngine {
    * When omitted, returns versions for every same-slug page across sources
    * (pre-v0.31.8 behavior; preserved via two-branch query).
    */
-  getVersions(slug: string, opts?: { sourceId?: string }): Promise<PageVersion[]>;
+  getVersions(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<PageVersion[]>;
   /**
    * v0.31.8 (D12): `opts.sourceId` source-scopes both the version lookup
    * and the page revert. Without it, multi-source brains can revert the
@@ -1916,8 +1951,13 @@ export interface BrainEngine {
    * preserved via stable page_id). `opts.sourceId` scopes the UPDATE — without
    * it, the bare `WHERE slug = old` matches every row across every source and
    * would either rename them all OR violate the (source_id, slug) UNIQUE.
+   *
+   * Returns the number of rows moved. 0 means the old slug had no row in the
+   * scoped source — an UPDATE that matches nothing does NOT throw, so callers
+   * that need to know whether the rename actually happened (the sync rename
+   * path, #3056) must check the return value rather than rely on the catch.
    */
-  updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<void>;
+  updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<number>;
   rewriteLinks(oldSlug: string, newSlug: string): Promise<void>;
 
   /**

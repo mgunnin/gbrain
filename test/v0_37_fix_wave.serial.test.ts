@@ -55,24 +55,20 @@ describe('v0.37 Lane A — defaults sweep', () => {
   test('A.5: embedding-column registry builtin defaults to ZE/1280 on empty config + gateway', async () => {
     // The registry's resolution chain is cfg > gateway > DEFAULT. With
     // no cfg AND no gateway, it should fall through to the canonical
-    // default (ZE/1280). Reset gateway first to exercise that path.
-    const { resetGateway } = await import('../src/core/ai/gateway.ts');
+    // default (ZE/1280). Hard-unconfigure first to exercise that path —
+    // resetGateway() would restore the preload's 1536 baseline (#3554).
+    const { __unconfigureGatewayForTests, resetGateway } = await import('../src/core/ai/gateway.ts');
     const { getEmbeddingColumnRegistry } = await import('../src/core/search/embedding-column.ts');
-    resetGateway();
+    __unconfigureGatewayForTests();
     try {
       const reg = getEmbeddingColumnRegistry({ engine: 'pglite' } as any);
       expect(reg['embedding']).toBeDefined();
       expect(reg['embedding'].provider).toBe('zeroentropyai:zembed-1');
       expect(reg['embedding'].dimensions).toBe(1280);
     } finally {
-      // Re-apply legacy preload defaults so the rest of the file's tests
-      // (and subsequent files in this shard) see a configured gateway.
-      const { configureGateway } = await import('../src/core/ai/gateway.ts');
-      configureGateway({
-        embedding_model: 'openai:text-embedding-3-large',
-        embedding_dimensions: 1536,
-        env: { ...process.env },
-      });
+      // Restore the preload's legacy baseline so the rest of the file's
+      // tests (and subsequent files in this shard) see a configured gateway.
+      resetGateway();
     }
   });
 
@@ -141,6 +137,7 @@ describe('v0.37 Lane B — init paths', () => {
     process.env.GBRAIN_EMBEDDING_MODEL = 'voyage:voyage-3-large';
     process.env.GBRAIN_EMBEDDING_DIMENSIONS = '2048';
     process.env.OPENAI_API_KEY = 'sk-from-env';
+    process.env.OPENROUTER_API_KEY = 'sk-or-from-env';
 
     // Force re-import to pick up env state (the module-level resolver in
     // config.ts reads process.env at call time, so this is safe).
@@ -152,16 +149,19 @@ describe('v0.37 Lane B — init paths', () => {
     expect(fileOnly?.embedding_dimensions).toBe(1536);
     // CDX-5 regression: env keys must NOT leak into file-only loader.
     expect(fileOnly?.openai_api_key).toBeUndefined();
+    expect(fileOnly?.openrouter_api_key).toBeUndefined();
 
     // Control: loadConfig() DOES merge env.
     const merged = loadConfig();
     expect(merged?.embedding_model).toBe('voyage:voyage-3-large');
     expect(merged?.embedding_dimensions).toBe(2048);
     expect(merged?.openai_api_key).toBe('sk-from-env');
+    expect(merged?.openrouter_api_key).toBe('sk-or-from-env');
 
     delete process.env.GBRAIN_EMBEDDING_MODEL;
     delete process.env.GBRAIN_EMBEDDING_DIMENSIONS;
     delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
   });
 
   test('B.4 / CDX-5: loadConfigFileOnly does NOT infer engine from DATABASE_URL', async () => {
@@ -203,9 +203,11 @@ describe('v0.37 Lane C.3 — ZE key reaches buildGatewayConfig', () => {
     const savedZe = process.env.ZEROENTROPY_API_KEY;
     const savedOai = process.env.OPENAI_API_KEY;
     const savedAnth = process.env.ANTHROPIC_API_KEY;
+    const savedOr = process.env.OPENROUTER_API_KEY;
     delete process.env.ZEROENTROPY_API_KEY;
     delete process.env.OPENAI_API_KEY;
     delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
     try {
       const { buildGatewayConfig } = await import('../src/cli.ts');
       const cfg = {
@@ -213,16 +215,19 @@ describe('v0.37 Lane C.3 — ZE key reaches buildGatewayConfig', () => {
         zeroentropy_api_key: 'test-ze-key',
         openai_api_key: 'test-oai',
         anthropic_api_key: 'test-anth',
+        openrouter_api_key: 'test-or',
       };
       const gwCfg = buildGatewayConfig(cfg as any);
       expect(gwCfg.env?.ZEROENTROPY_API_KEY).toBe('test-ze-key');
       // Regression on the existing two keys.
       expect(gwCfg.env?.OPENAI_API_KEY).toBe('test-oai');
       expect(gwCfg.env?.ANTHROPIC_API_KEY).toBe('test-anth');
+      expect(gwCfg.env?.OPENROUTER_API_KEY).toBe('test-or');
     } finally {
       if (savedZe !== undefined) process.env.ZEROENTROPY_API_KEY = savedZe;
       if (savedOai !== undefined) process.env.OPENAI_API_KEY = savedOai;
       if (savedAnth !== undefined) process.env.ANTHROPIC_API_KEY = savedAnth;
+      if (savedOr !== undefined) process.env.OPENROUTER_API_KEY = savedOr;
     }
   });
 

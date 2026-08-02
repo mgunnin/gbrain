@@ -43,7 +43,7 @@
  * trigger lock acquisition.
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSync, realpathSync } from 'fs';
 import { join } from 'path';
 import { gbrainPath } from './config.ts';
 import type { BrainEngine } from './engine.ts';
@@ -362,8 +362,22 @@ export interface CycleReport {
    *   - 'failed'  : lock acquired but all attempted phases failed
    */
   status: CycleStatus;
-  /** Present when status = 'skipped'. E.g., 'cycle_already_running' or 'no_database'. Also 'aborted' when the cycle was cancelled mid-flight (#1972). */
+  /** Present when status = 'skipped'. E.g., 'cycle_already_running' or 'no_database'. Also 'aborted' when the cycle was cancelled mid-flight (#1972), or 'stamp_write_failed' (#3504). */
   reason?: string;
+  /**
+   * #3504: the cycle ran, but persisting `last_source_cycle_at` /
+   * `last_full_cycle_at` threw. Set ONLY on a real write error — never for a
+   * pack that merely omits optional phases (those come back 'skipped' and
+   * `deriveStatus` correctly ignores them).
+   *
+   * When present, `status` is degraded away from success, because a cycle that
+   * cannot record that it finished is not a cycle that finished as far as every
+   * downstream freshness reader is concerned. Before this existed the failure
+   * was a `console.warn` only: `dream --json` reported `status: 'ok'`, doctor
+   * separately reported `cycle_freshness` stale, and nothing connected the two,
+   * so re-running (the advice doctor gives) could never fix it.
+   */
+  stamp_write_failed?: { source_id: string; error: string };
   /**
    * #1972: dead-holder sync/cycle locks the cycle-start reaper cleared this
    * run (count + lock ids). Omitted when nothing was reaped or no engine.
@@ -895,11 +909,68 @@ export async function resolveSourceForDir(
   // (the cycleSourceId precedence) or 'default'.
   if (brainDir === null) return undefined;
   try {
+    // #2540: exclude archived rows (dream's --source guard refuses to stamp
+    // them, so an archived alias winning here means the stamp silently never
+    // lands and doctor's cycle_freshness stays red on a healthy install) and
+    // order deterministically so a duplicate registration of the same path
+    // can't shadow the active source on whichever row the engine scans first.
+    // Ordering matches listAllSources/sources-ops for operator-output parity.
     const rows = await engine.executeRaw<{ id: string }>(
-      `SELECT id FROM sources WHERE local_path = $1 LIMIT 1`,
+      `SELECT id FROM sources
+        WHERE local_path = $1 AND archived = false
+        ORDER BY (id = 'default') DESC, id
+        LIMIT 1`,
       [brainDir],
     );
-    return rows[0]?.id;
+    if (rows[0]) return rows[0].id;
+
+    // #2540: the exact match above compares two path SPELLINGS. `--dir` is
+    // resolved via `resolve()` and `sources.local_path` stores the spelling
+    // the source was registered with (`--path` as typed, or defaultCloneDir);
+    // neither side is canonicalized. So a source registered through a symlink
+    // and dreamt via the real path (or vice versa) never string-matches — the
+    // `--dir` run derives no source, and the #1869 freshness stamp silently
+    // does not land, leaving doctor's cycle_freshness permanently stale on a
+    // healthy install. Symlinked vault locations are ordinary (a brain inside
+    // a synced cloud-storage folder, a /home -> /mnt relocation).
+    //
+    // Retry canonicalized on BOTH sides, so the match is symmetric regardless
+    // of which side holds the link. Kept strictly as a miss-path fallback: the
+    // exact match stays a single indexed lookup, and the scan only pays for
+    // itself when it would otherwise return nothing. Registered paths are
+    // canonicalized here rather than at registration because storing a
+    // canonical column would be a schema + backfill change; that is the
+    // durable fix and is left as a follow-up.
+    let realDir: string;
+    try {
+      realDir = realpathSync(brainDir);
+    } catch {
+      return undefined;
+    }
+    // Archived sources are excluded deliberately: dream's --source guard
+    // already refuses to stamp them (writing last_full_cycle_at to an
+    // archived source masks staleness when it is later restored), so an
+    // archived alias must not win a path match either.
+    const candidates = await engine.executeRaw<{ id: string; local_path: string }>(
+      `SELECT id, local_path FROM sources
+        WHERE local_path IS NOT NULL AND archived = false
+        ORDER BY (id = 'default') DESC, id`,
+    );
+    const matched: string[] = [];
+    for (const row of candidates) {
+      try {
+        if (realpathSync(row.local_path) === realDir) matched.push(row.id);
+      } catch {
+        // Stale/unreadable registered path — not a match, keep scanning.
+      }
+    }
+    // Fail closed when several registered paths canonicalize to the same
+    // directory: a canonical alias is weaker evidence than an exact spelling
+    // match, and picking one arbitrarily would scope the cycle — and its
+    // freshness stamp — to whichever id happened to sort first. Returning
+    // undefined leaves the caller on the pre-existing opts.sourceId/'default'
+    // precedence, i.e. exactly the behaviour before this fallback existed.
+    return matched.length === 1 ? matched[0] : undefined;
   } catch {
     // sources table might not exist on very old brains — fall through.
     return undefined;
@@ -1131,7 +1202,9 @@ async function runPhaseExtractFacts(
         summary: `extract_facts skipped: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill`,
         details: {
           legacyRowsPending: result.legacyRowsPending,
-          hint: 'gbrain apply-migrations --yes',
+          // A bare `apply-migrations --yes` no-ops once the v0.32.2 ledger
+          // entry is complete; the retry marker is what re-runs Phase B.
+          hint: 'gbrain apply-migrations --force-retry 0.32.2 && gbrain apply-migrations --yes',
           warnings: result.warnings,
         },
       };
@@ -1643,7 +1716,14 @@ export async function runCycle(
               await pgliteFileLock!.refresh();
             },
             release: async () => {
-              try { await dbLock!.release(); } catch { /* fall through to file release */ }
+              try {
+                await dbLock!.release();
+              } catch (e) {
+                // #1470: best-effort, but never silent — a swallowed release
+                // failure strands a row in gbrain_cycle_locks and the next
+                // cycle skips with a phantom `cycle_already_running`.
+                console.error(`[cycle] DB lock release failed: ${e instanceof Error ? e.message : String(e)} — a row may remain in gbrain_cycle_locks until TTL expiry`);
+              }
               await pgliteFileLock!.release();
             },
           }
@@ -2382,7 +2462,7 @@ export async function runCycle(
         try {
           const { runSchemaSuggestPhase } = await import('./cycle/schema-suggest.ts');
           const { result, duration_ms } = await timePhase(async () => {
-            const r = await runSchemaSuggestPhase(engine, { dryRun: !!opts.dryRun });
+            const r = await runSchemaSuggestPhase(engine, { sourceId: cycleSourceId, dryRun: !!opts.dryRun });
             return {
               phase: 'schema-suggest' as const,
               status: (r.skipped ? 'skipped' : 'ok') as PhaseStatus,
@@ -2432,7 +2512,14 @@ export async function runCycle(
     }
   } finally {
     if (lock) {
-      try { await lock.release(); } catch { /* best-effort */ }
+      try {
+        await lock.release();
+      } catch (e) {
+        // #1470: best-effort, but never silent — a swallowed release failure
+        // strands a row in gbrain_cycle_locks and the next cycle within the
+        // TTL skips with a phantom `cycle_already_running`.
+        console.error(`[cycle] lock.release() failed: ${e instanceof Error ? e.message : String(e)} — a row may remain in gbrain_cycle_locks until TTL expiry`);
+      }
     }
   }
 
@@ -2476,9 +2563,14 @@ export async function runCycle(
   //   - status is 'failed' or 'skipped' (don't mark a non-run as fresh)
   //   - dryRun (writes are out of scope)
   //
-  // Best-effort: a write failure does NOT change the CycleReport status.
-  // The cost of writing the wrong timestamp post-failure is higher than
-  // the cost of missing a successful write (next cycle will redo work).
+  // #3504: the write is still best-effort in the sense that it never throws out
+  // of runCycle and never aborts the run (the phases already did their work).
+  // But a failure is no longer invisible: it is recorded on the report and
+  // degrades `status` away from success, so a cycle that could not persist its
+  // "done" stamp stops claiming it finished. The cost of writing the wrong
+  // timestamp post-failure is still higher than missing a successful write, so
+  // the stamp itself is unchanged — only the reporting is.
+  let stampWriteFailed: { source_id: string; error: string } | undefined;
   if (opts.sourceId && engine && !dryRun && !aborted && (status === 'ok' || status === 'clean' || status === 'partial')) {
     try {
       const nowIso = new Date().toISOString();
@@ -2494,17 +2586,29 @@ export async function runCycle(
         last_full_cycle_at: nowIso,
       });
     } catch (e) {
-      // Best-effort; cycle already succeeded by the time we get here.
-      console.warn(`[cycle] failed to write last_source_cycle_at for source ${opts.sourceId}: ${e instanceof Error ? e.message : String(e)}`);
+      const message = e instanceof Error ? e.message : String(e);
+      // Record it so `--json` consumers and the autopilot runner can see it.
+      // stderr alone does not survive a cron run, which is how #2251 stayed
+      // invisible while every stamp write failed for weeks.
+      stampWriteFailed = { source_id: opts.sourceId, error: message };
+      console.warn(`[cycle] failed to write last_source_cycle_at for source ${opts.sourceId}: ${message}`);
     }
   }
+
+  // #3504: a stamp-write failure degrades a successful run to 'partial'. It
+  // cannot upgrade or downgrade anything else: 'partial' is already non-success,
+  // and 'failed'/'skipped' never reach the stamp block at all. `aborted` still
+  // wins the reason slot, since an aborted run is the more fundamental fact.
+  const degradedByStamp = stampWriteFailed !== undefined && (status === 'ok' || status === 'clean');
+  const effectiveStatus: CycleStatus = aborted ? 'partial' : degradedByStamp ? 'partial' : status;
 
   return {
     schema_version: '1',
     timestamp,
     duration_ms,
-    status: aborted ? 'partial' : status,
-    ...(aborted ? { reason: 'aborted' } : {}),
+    status: effectiveStatus,
+    ...(aborted ? { reason: 'aborted' } : stampWriteFailed ? { reason: 'stamp_write_failed' } : {}),
+    ...(stampWriteFailed ? { stamp_write_failed: stampWriteFailed } : {}),
     ...(reapedLocks ? { reaped_dead_holder_locks: reapedLocks } : {}),
     brain_dir: opts.brainDir,
     phases: phaseResults,

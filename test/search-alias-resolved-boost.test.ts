@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 12 (11→12 hard-exclude fold invalidates rows written under a different exclude policy, #2825)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(12);
+  it('is 15 (14→15 folds the resolved FTS configuration name, so rows written before a reindex-search-vector language switch become unreachable)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(15);
   });
 });

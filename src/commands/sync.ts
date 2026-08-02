@@ -65,7 +65,11 @@ import {
   slog,
   serr,
 } from '../core/console-prefix.ts';
-import { loadStorageConfig } from '../core/storage-config.ts';
+import { loadStorageConfig, findDbOnlyCollisions } from '../core/storage-config.ts';
+// #2788: collector-output vs db_only collision warning at .gitignore-write
+// time. integrations.ts is side-effect-free at module load (pure recipe I/O
+// helpers), so a static import is safe here.
+import { getConfiguredCollectorOutputs } from './integrations.ts';
 import { getDefaultSourcePath } from '../core/source-resolver.ts';
 // v0.41.32.0: stamp the durable newest-COMMIT timestamp at sync time so the
 // remote staleness path reads a column instead of shelling out to git.
@@ -1980,7 +1984,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   serr(`[gbrain phase] sync.detect_head`);
   // Detect detached HEAD up front so the working-tree fallback fires for both
   // the default sync and `--no-pull` callers. Only the actual git pull is
-  // gated on opts.noPull.
+  // gated on opts.noPull or opts.dryRun.
   const detachedHead = isDetachedHead(gitContextRoot);
   if (detachedHead && !opts.noPull) {
     // Print the caller's repoPath spelling (not the realpathed git root) —
@@ -1988,7 +1992,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     serr(`Detached HEAD on ${repoPath}; skipping git pull. Syncing from local working tree.`);
   }
 
-  // Git pull (unless --no-pull). v0.28.1 codex finding (HIGH): the legacy
+  // Git pull (unless --no-pull or --dry-run). v0.28.1 codex finding (HIGH): the legacy
   // git() helper at sync.ts:192 spawns git without GIT_SSRF_FLAGS, so
   // every steady-state pull was bypassing the redirect/submodule/protocol
   // hardening that cloneRepo applies. Route through pullRepo from
@@ -2032,7 +2036,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // exited 0 with "Already up to date" and doctor's sync_freshness never
   // fired because last_sync_at kept advancing.
   let pullFailed = false;
-  if (!opts.noPull && !detachedHead && originRemotePresent) {
+  if (!opts.dryRun && !opts.noPull && !detachedHead && originRemotePresent) {
     const _t0 = Date.now();
     serr(`[gbrain phase] sync.git_pull start`);
     try {
@@ -2391,6 +2395,31 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     }
   }
 
+  const totalChanges = filtered.added.length + filtered.modified.length +
+    filtered.deleted.length + filtered.renamed.length;
+
+  // Dry run
+  if (opts.dryRun) {
+    slog(`Sync dry run: ${lastCommit.slice(0, 8)}..${headCommit.slice(0, 8)}`);
+    if (filtered.added.length) slog(`  Added: ${filtered.added.join(', ')}`);
+    if (filtered.modified.length) slog(`  Modified: ${filtered.modified.join(', ')}`);
+    if (filtered.deleted.length) slog(`  Deleted: ${filtered.deleted.join(', ')}`);
+    if (filtered.renamed.length) slog(`  Renamed: ${filtered.renamed.map(r => `${r.from} -> ${r.to}`).join(', ')}`);
+    if (totalChanges === 0) slog(`  No syncable changes.`);
+    return {
+      status: 'dry_run',
+      fromCommit: lastCommit,
+      toCommit: headCommit,
+      added: filtered.added.length,
+      modified: filtered.modified.length,
+      deleted: filtered.deleted.length,
+      renamed: filtered.renamed.length,
+      chunksCreated: 0,
+      embedded: 0,
+      pagesAffected: [],
+    };
+  }
+
   // Delete pages that became un-syncable (modified but filtered out).
   // v0.20.0 Cathedral II SP-5: resolveSlugForPath picks the right slug shape
   // (markdown vs code) based on the chunker's classifier, so a Rust file that
@@ -2436,31 +2465,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         slog(`  Deleted un-syncable page: ${slug}`);
       }
     } catch { /* ignore */ }
-  }
-
-  const totalChanges = filtered.added.length + filtered.modified.length +
-    filtered.deleted.length + filtered.renamed.length;
-
-  // Dry run
-  if (opts.dryRun) {
-    slog(`Sync dry run: ${lastCommit.slice(0, 8)}..${headCommit.slice(0, 8)}`);
-    if (filtered.added.length) slog(`  Added: ${filtered.added.join(', ')}`);
-    if (filtered.modified.length) slog(`  Modified: ${filtered.modified.join(', ')}`);
-    if (filtered.deleted.length) slog(`  Deleted: ${filtered.deleted.join(', ')}`);
-    if (filtered.renamed.length) slog(`  Renamed: ${filtered.renamed.map(r => `${r.from} -> ${r.to}`).join(', ')}`);
-    if (totalChanges === 0) slog(`  No syncable changes.`);
-    return {
-      status: 'dry_run',
-      fromCommit: lastCommit,
-      toCommit: headCommit,
-      added: filtered.added.length,
-      modified: filtered.modified.length,
-      deleted: filtered.deleted.length,
-      renamed: filtered.renamed.length,
-      chunksCreated: 0,
-      embedded: 0,
-      pagesAffected: [],
-    };
   }
 
   if (totalChanges === 0) {
@@ -2874,10 +2878,17 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         : await resolveSlugByPathOrSourcePath(engine, from, undefined);
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
+      // #3056: the cheap rename is OBSERVED, not assumed. A zero-row UPDATE
+      // doesn't throw, and a thrown collision used to be swallowed by an
+      // empty catch — both fell through to importFile, which created/updated
+      // the row at the new path while the old row stayed behind live. Both
+      // shapes now fall through to the reconcile below.
+      let renameApplied = false;
       try {
-        await engine.updateSlug(oldSlug, newSlug, renameOpts);
+        renameApplied = (await engine.updateSlug(oldSlug, newSlug, renameOpts)) > 0;
       } catch {
-        // Slug doesn't exist or collision, treat as add
+        // Destination slug occupied or invalid — treat as add; the reconcile
+        // below removes the stale old row once the destination materialized.
       }
       // Reimport at new path (picks up content changes). Wrapped to match the
       // deletes/adds loops: a malformed renamed file is recorded to failedFiles
@@ -2890,9 +2901,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // NAV-1 TOCTOU: refuse a destination that realpath-resolves outside the
       // repo (committed symlink pointing out).
       const filePath = join(gitContextRoot, to);
+      let importResult: Awaited<ReturnType<typeof importFile>> | undefined;
       if (existsSync(filePath) && isPathSafe(filePath, gitContextRoot)) {
         try {
           const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
+          importResult = result;
           if (result.status === 'imported') chunksCreated += result.chunks;
           else if (result.status === 'skipped' && (result as { error?: string }).error) {
             failedFiles.push({ path: to, error: String((result as { error?: string }).error) });
@@ -2901,9 +2914,68 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           failedFiles.push({ path: to, error: e instanceof Error ? e.message : String(e) });
         }
       }
+      // #3056 reconcile: the rename fell back to add semantics, so the row
+      // that still represents the OLD path is the stale half of the rename
+      // (git reported the old path gone; a plain delete of that path would
+      // remove this row). Two safety rails, both from the #3252 review:
+      //
+      //   1. Delete only after the destination demonstrably materialized —
+      //      `imported`, or an errorless `skipped` AT the new slug. Identity
+      //      dedup can skip against the OLD row (result.slug === oldSlug),
+      //      in which case nothing landed at newSlug and deleting the old
+      //      row would destroy the only copy.
+      //   2. Locate the stale row POSITIVELY by `source_path = from`, never
+      //      by the oldSlug guess — after a collision, a path-derived
+      //      fallback slug could name an unrelated (e.g. manually curated)
+      //      row. No source_path match → nothing is deleted (this also means
+      //      code-strategy imports, which don't populate source_path, fall
+      //      back safely to leaving the old row rather than guessing).
+      //
+      // A failed delete records a `<rename:…>` SENTINEL (not an ordinary
+      // path failure): the gate hard-blocks the bookmark, and — unlike a
+      // plain path row — the auto-skip valve can never chronic-skip it after
+      // N attempts, which would advance the bookmark and make a transient
+      // delete outage a permanent duplicate. The sentinel clears through the
+      // ordinary success path once the rename converges on a later run.
+      let reconcileFailed = false;
+      if (!renameApplied && importResult !== undefined) {
+        const destMaterialized = importResult.status === 'imported' ||
+          (importResult.status === 'skipped' && !importResult.error && importResult.slug === newSlug);
+        if (destMaterialized) {
+          try {
+            const staleMap = await engine.resolveSlugsByPaths([from], { sourceId: opts.sourceId ?? DEFAULT_SOURCE_ID });
+            const staleSlug = staleMap.get(from);
+            if (staleSlug !== undefined && staleSlug !== newSlug) {
+              await engine.deletePage(staleSlug, renameOpts);
+              deletedSlugs.add(staleSlug); // never hand a deleted slug to auto-embed
+              serr(`  [sync] rename reconciled: removed stale row ${staleSlug} (${from} -> ${to} fell back to add).`);
+            } else if (staleSlug === undefined) {
+              serr(`  [sync] rename fallback: no row has source_path ${from}; stale row (if any) left in place.`);
+            }
+          } catch (e: unknown) {
+            reconcileFailed = true;
+            failedFiles.push({
+              path: `<rename:${to}>`,
+              error: `rename reconcile failed (stale row for ${from} not removed): ` +
+                `${e instanceof Error ? e.message : String(e)}`,
+            });
+          }
+        } else {
+          serr(
+            `  [sync] rename fallback: ${from} -> ${to} did not materialize at ${newSlug} ` +
+            `(import ${importResult.status}); old row left in place.`,
+          );
+        }
+      }
+      // Converged (cheap rename, clean reconcile, or nothing to reconcile):
+      // clear any `<rename:…>` sentinel a previous failing run recorded.
+      if (!reconcileFailed) succeededPaths.push(`<rename:${to}>`);
       pagesAffected.push(newSlug);
       deletedSlugs.delete(newSlug); // #1284: rename landed on a previously-deleted slug → embeddable again
-      await markCompleted(to);
+      // A failed reconcile must NOT checkpoint: banking `to` would make the
+      // resume filter skip this rename on the retry run, turning a transient
+      // delete failure into a permanent duplicate — the exact bug being fixed.
+      if (!reconcileFailed) await markCompleted(to);
       progress.tick(1, newSlug);
     }
     progress.finish();
@@ -3362,13 +3434,22 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
   if (!gate.advanced) {
     const codeBreakdown = formatCodeBreakdown(failedFiles);
-    if (gate.sentinelBlocked) {
+    // Two sentinel classes block here: `<head>` (pin ancestry broken) and
+    // `<rename:…>` (#3056 — a rename-reconcile delete failed and advancing
+    // would permanently bank the duplicate). Pick the message by which fired.
+    if (gate.sentinelBlocked && failedFiles.some(f => f.path === '<head>')) {
       serr(
         `\nSync blocked: repository history changed during sync (force-push / reset).\n` +
         `${codeBreakdown}\n\n` +
         `The pinned target is no longer an ancestor of HEAD; advancing would record ` +
         `a commit that doesn't match the indexed tree. Re-run sync to re-pin against ` +
         `current HEAD.`,
+      );
+    } else if (gate.sentinelBlocked) {
+      serr(
+        `\nSync blocked: a rename left a stale duplicate that could not be removed:\n` +
+        `${codeBreakdown}\n\n` +
+        `The next 'gbrain sync' retries the reconcile from the same diff.`,
       );
     } else {
       const fileFailCount = failedFiles.filter(f => isSkippablePath(f.path)).length;
@@ -5558,6 +5639,24 @@ export function manageGitignore(
   }
   if (!storageConfig || storageConfig.db_only.length === 0) {
     return;
+  }
+
+  // #2788: a configured collector whose output dir sits inside a db_only
+  // path dies silently — the dir is auto-gitignored below, the git-walking
+  // sync never sees its files, and `gbrain import` honors .gitignore too.
+  // Warn at the moment the config takes effect. Recipe scan failure never
+  // blocks the gitignore housekeeping.
+  try {
+    for (const c of findDbOnlyCollisions(getConfiguredCollectorOutputs(), storageConfig.db_only)) {
+      console.warn(
+        `WARNING: collector '${c.id}' writes to '${c.output_path}', which is inside db_only path ` +
+          `'${c.db_only_dir}'. db_only dirs are auto-gitignored, so gbrain sync and gbrain import ` +
+          `will silently skip its files. Remove the prefix from storage.db_only in gbrain.yml, or ` +
+          `move the collector output.`,
+      );
+    }
+  } catch {
+    // recipes unavailable in this context — the doctor check still covers it
   }
 
   // D4 soft-warn: storage tiering has limited effect on PGLite, but the

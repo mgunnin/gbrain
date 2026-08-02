@@ -48,8 +48,9 @@ import { safeSplitIndex } from '../text-safe.ts';
 import { PAGE_SLUG_SEG } from '../cjk.ts';
 
 // Slug grammar from validatePageSlug — shared via PAGE_SLUG_SEG (#738).
-// Used for the orchestrator-written summary index slug.
-const SUMMARY_SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`);
+// Used for the orchestrator-written summary index slug. `u` flag required
+// by PAGE_SLUG_SEG's \p{...} classes (#3417).
+const SUMMARY_SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`, 'u');
 
 // ── Model context budget (D1, D5, D7, D9) ─────────────────────────────
 
@@ -803,7 +804,6 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
   // Explicit enabled=false still wins for pausing synthesis without removing corpus config.
   const enabled = enabledRaw === 'false' ? false : (enabledRaw === 'true' || !!corpusDir);
   const meetingTranscriptsDir = await engine.getConfig('dream.synthesize.meeting_transcripts_dir');
-  const minCharsStr = await engine.getConfig('dream.synthesize.min_chars');
   const excludeStr = await engine.getConfig('dream.synthesize.exclude_patterns');
   // v0.28: resolveModel() unifies CLI flag > new key > deprecated key > models.default > env > fallback
   const { resolveModel } = await import('../model-config.ts');
@@ -819,7 +819,10 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
     tier: 'utility',
     fallback: 'haiku',
   });
-  const cooldownHoursStr = await engine.getConfig('dream.synthesize.cooldown_hours');
+  // getNumberConfig (not `parseInt(str, 10) || N`) so a configured 0 is honored — a bare
+  // `|| N` coerces an explicit 0 back to the default (cooldown 0 = "no cooldown").
+  const cooldownHours = Math.max(0, await getNumberConfig(engine, 'dream.synthesize.cooldown_hours', 12));
+  const minChars = Math.max(0, await getNumberConfig(engine, 'dream.synthesize.min_chars', 2000));
   const maxPromptTokensStr = await engine.getConfig('dream.synthesize.max_prompt_tokens');
   const maxChunksStr = await engine.getConfig('dream.synthesize.max_chunks_per_transcript');
   const subagentTimeoutMs = await getNumberConfig(
@@ -862,11 +865,11 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
     enabled,
     corpusDir: corpusDir ?? null,
     meetingTranscriptsDir: meetingTranscriptsDir ?? null,
-    minChars: minCharsStr ? Math.max(0, parseInt(minCharsStr, 10) || 2000) : 2000,
+    minChars,
     excludePatterns,
     model,
     verdictModel,
-    cooldownHours: cooldownHoursStr ? Math.max(0, parseInt(cooldownHoursStr, 10) || 12) : 12,
+    cooldownHours,
     maxPromptTokens,
     maxChunksPerTranscript,
     outputRoot: await loadOutputRoot(engine),
@@ -1598,4 +1601,5 @@ export const __testing = {
   stampDreamProvenance,
   reverseWriteRefs,
   runPgliteSubagentsInline,
+  loadSynthConfig,
 };

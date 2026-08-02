@@ -42,6 +42,7 @@ CHECKS=(
   "check:source-id-projection"
   "check:source-config-leak"
   "check:progress"
+  "check:no-tracked-symlinks"
   "check:test-isolation"
   "check:wasm"
   "check:admin-build"
@@ -49,6 +50,7 @@ CHECKS=(
   "check:cli-exec"
   "check:system-of-record"
   "check:eval-glossary"
+  "check:skills-manifest"
   "check:no-pii-agent-voice"
   "check:synthetic-corpus-privacy"
   "check:skill-brain-first"
@@ -63,6 +65,7 @@ CHECKS=(
   "check:source-scope-onboard"
   "check:no-double-retry"
   "check:batch-audit-site"
+  "check:engine-dynamic-import"
   "check:worker-lock-renewal-shape"
   "typecheck"
 )

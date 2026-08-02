@@ -397,11 +397,12 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   }
 
   // v0.28.5 (X1): explicitly apply pending schema migrations.
-  // apply-migrations runs orchestrator migrations and only WARNs about
-  // schema-version drift (apply-migrations.ts:296-302). Without this hook,
-  // `gbrain upgrade` leaves wedged brains wedged — the user has to read
-  // the WARN and run `gbrain init --migrate-only` themselves. We've shipped
-  // 11 wedge incidents asking users to read warnings; close the loop here.
+  // Since #3085, apply-migrations --yes applies schema-version drift itself
+  // (it previously only WARNed), so the in-process call above may have
+  // already run these — runMigrations is idempotent, making this hook a
+  // harmless second pass. It stays because it also covers paths where the
+  // preflight was skipped. We've shipped 11 wedge incidents asking users to
+  // read warnings; keep the loop closed here.
   // A1's hasPendingMigrations probe in connectEngine is belt-and-suspenders
   // for any path that bypasses upgrade (autopilot, direct CLI on stale brain).
   try {
@@ -457,6 +458,53 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
             console.log('  gbrain config set search.searchLimit 20');
             console.log('');
             await engine.setConfig('search.mode_upgrade_notice_shown', 'true');
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
+        // #3390: ZeroEntropy sunset notice. ZE announced (2026-07-24) that
+        // its hosted endpoints — including /models/embed and /models/rerank —
+        // shut down on 2026-09-04. Any brain resolving to a zeroentropyai:*
+        // embedding model (including default-config brains that never set
+        // one) loses SEMANTIC RETRIEVAL ENTIRELY on that date: the query
+        // embedding uses the same endpoint, so existing vectors become
+        // unqueryable. One-shot per install, gated by
+        // `ze_sunset_notice_shown` (same pattern as the search-mode banner).
+        try {
+          const shown = await engine.getConfig('ze_sunset_notice_shown');
+          const { DEFAULT_EMBEDDING_MODEL } = await import('../core/ai/defaults.ts');
+          const effectiveModel = cfgSchema.embedding_model ?? DEFAULT_EMBEDDING_MODEL;
+          const rerankerModel = await engine.getConfig('search.reranker.model');
+          const onZeEmbedding = effectiveModel.startsWith('zeroentropyai:');
+          const onZeReranker = !!rerankerModel?.startsWith('zeroentropyai:');
+          if (shown !== 'true' && (onZeEmbedding || onZeReranker)) {
+            console.log('');
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log('[gbrain] ACTION REQUIRED: ZeroEntropy hosted API sunsets 2026-09-04.');
+            if (onZeEmbedding) {
+              console.log(`[gbrain] This brain embeds with ${effectiveModel}. After the sunset,`);
+              console.log('[gbrain] semantic retrieval STOPS WORKING (queries can no longer be');
+              console.log('[gbrain] embedded against your existing vectors).');
+            }
+            if (onZeReranker) {
+              console.log(`[gbrain] The reranker (${rerankerModel}) also sunsets; search falls`);
+              console.log('[gbrain] back to unreranked ordering.');
+            }
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log('');
+            console.log('Migrate before the sunset (resumable; preview cost first):');
+            console.log('  gbrain migrate embeddings --to <provider:model> --dry-run');
+            console.log('  gbrain migrate embeddings --to <provider:model>');
+            console.log('');
+            console.log('Self-hosting zembed-1 (weights are Apache-2.0) via llama-server /');
+            console.log('ollama also works and preserves your existing vectors — point');
+            console.log('embedding at the local endpoint instead of migrating.');
+            if (onZeReranker) {
+              console.log('Reranker: gbrain config set search.reranker.enabled false (or pick another).');
+            }
+            console.log('');
+            await engine.setConfig('ze_sunset_notice_shown', 'true');
           }
         } catch {
           // Banner is cosmetic; never block the upgrade.

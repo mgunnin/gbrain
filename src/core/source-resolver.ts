@@ -16,9 +16,13 @@
 import { readFileSync, lstatSync, type Stats } from 'fs';
 import { join, dirname, resolve } from 'path';
 import type { BrainEngine } from './engine.ts';
-import { isSourceFederated } from './sources-load.ts';
-import { SOURCE_ID_RE, isValidSourceId } from './source-id.ts';
+import { isSourceFederated, parseSourceConfig } from './sources-load.ts';
+import { SOURCE_ID_RE, isValidSourceId, ALL_SOURCES } from './source-id.ts';
 import { isTrustedDotfile, realpathOrResolve } from './path-confine.ts';
+
+// Re-export so scope-resolution call sites can import the sentinel from
+// either module (#1712).
+export { ALL_SOURCES };
 
 const DOTFILE = '.gbrain-source';
 // Canonical SOURCE_ID_RE imported from `source-id.ts` (single source of truth).
@@ -83,8 +87,11 @@ export async function resolveSourceId(
   explicit: string | null | undefined,
   cwd: string = process.cwd(),
 ): Promise<string> {
-  // 1. Explicit flag wins.
+  // 1. Explicit flag wins. The __all__ sentinel passes through verbatim
+  //    (#1712) — it is not a source id, so it skips both the regex and
+  //    assertSourceExists; sourceScopeOpts gives it span-everything semantics.
   if (explicit) {
+    if (explicit === ALL_SOURCES) return ALL_SOURCES;
     if (!SOURCE_ID_RE.test(explicit)) {
       throw new Error(`Invalid --source value "${explicit}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -92,9 +99,10 @@ export async function resolveSourceId(
     return explicit;
   }
 
-  // 2. Env var.
+  // 2. Env var. Same __all__ pass-through (#2140).
   const env = process.env.GBRAIN_SOURCE;
   if (env && env.length > 0) {
+    if (env === ALL_SOURCES) return ALL_SOURCES;
     if (!SOURCE_ID_RE.test(env)) {
       throw new Error(`Invalid GBRAIN_SOURCE value "${env}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -173,6 +181,7 @@ export function resolveSourceIdEngineFree(
   cwd: string = process.cwd(),
 ): string | null {
   if (explicit) {
+    if (explicit === ALL_SOURCES) return ALL_SOURCES; // #1712 sentinel pass-through
     if (!SOURCE_ID_RE.test(explicit)) {
       throw new Error(`Invalid --source value "${explicit}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -180,6 +189,7 @@ export function resolveSourceIdEngineFree(
   }
   const env = process.env.GBRAIN_SOURCE;
   if (env && env.length > 0) {
+    if (env === ALL_SOURCES) return ALL_SOURCES; // #2140 sentinel pass-through
     if (!SOURCE_ID_RE.test(env)) {
       throw new Error(`Invalid GBRAIN_SOURCE value "${env}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -199,6 +209,12 @@ export function resolveSourceIdEngineFree(
  * Excludes archived sources (`archived = false`) so a soft-deleted source
  * doesn't auto-resolve. Shared by `resolveSourceId` and `resolveSourceWithTier`
  * so the heuristic can't drift between the two entry points.
+ *
+ * NOTE (#2928): this tier deliberately does NOT consult config.federated —
+ * `--no-federated` governs READ mixing, not write routing, and unqualified
+ * `sync`/`import` on a single-vault brain must keep landing in the vault
+ * (#1434, pinned by test/sync-sole-non-default-routing.test.ts). The
+ * unfederate read fix lives in `localFederatedSourceIds` below.
  */
 async function pickSoleNonDefaultSource(engine: BrainEngine): Promise<string | null> {
   // archived column was added in v34 (v0.26.5). Older brains may not have
@@ -315,8 +331,11 @@ export async function resolveSourceWithTier(
   explicit: string | null | undefined,
   cwd: string = process.cwd(),
 ): Promise<{ source_id: string; tier: SourceTier; detail?: string }> {
-  // 1. Explicit flag wins.
+  // 1. Explicit flag wins. __all__ sentinel passes through verbatim (#1712).
   if (explicit) {
+    if (explicit === ALL_SOURCES) {
+      return { source_id: ALL_SOURCES, tier: 'flag', detail: `--source ${ALL_SOURCES} (spans all sources)` };
+    }
     if (!SOURCE_ID_RE.test(explicit)) {
       throw new Error(`Invalid --source value "${explicit}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -324,9 +343,12 @@ export async function resolveSourceWithTier(
     return { source_id: explicit, tier: 'flag', detail: `--source ${explicit}` };
   }
 
-  // 2. Env var.
+  // 2. Env var. Same __all__ pass-through (#2140).
   const env = process.env.GBRAIN_SOURCE;
   if (env && env.length > 0) {
+    if (env === ALL_SOURCES) {
+      return { source_id: ALL_SOURCES, tier: 'env', detail: `GBRAIN_SOURCE=${ALL_SOURCES} (spans all sources)` };
+    }
     if (!SOURCE_ID_RE.test(env)) {
       throw new Error(`Invalid GBRAIN_SOURCE value "${env}". Must match [a-z0-9-]{1,32}.`);
     }
@@ -393,7 +415,10 @@ export async function resolveSourceWithTier(
  *
  *   - explicit tiers (`flag` / `env` / `dotfile`): the user named a source;
  *     scalar scope stands (that IS the qualified case);
- *   - no other federated source exists: keep the scalar fast path unchanged.
+ *   - no other federated source exists: keep the scalar fast path unchanged;
+ *   - #2928: the resolved source is explicitly isolated (config.federated =
+ *     false): it must not be mixed into a cross-source read in EITHER
+ *     direction, so the scalar scope stands.
  *
  * Archived sources are excluded (same rationale as pickSoleNonDefaultSource);
  * the archived column is v34+, so fall back to the un-archived query on older
@@ -415,6 +440,16 @@ export async function localFederatedSourceIds(
     rows = await engine.executeRaw<{ id: string; config: unknown }>(
       `SELECT id, config FROM sources ORDER BY id`,
     );
+  }
+  // #2928: an EXPLICITLY isolated anchor (`sources unfederate` /
+  // `--no-federated` → config.federated = false) opted out of cross-source
+  // read mixing — never widen it into the federated set (which would drag
+  // other sources' pages into its unqualified reads and vice versa). Scalar
+  // scope stands. UNSET federated keeps the pre-#2928 widening behavior;
+  // write routing (tier 5.5 above) is deliberately untouched.
+  const resolvedRow = rows.find((row) => row.id === sourceId);
+  if (resolvedRow && parseSourceConfig(resolvedRow.config).federated === false) {
+    return undefined;
   }
   const ids = [
     sourceId,

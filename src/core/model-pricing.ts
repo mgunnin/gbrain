@@ -84,6 +84,9 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   'openai:gpt-5.5':                       { input:  4.00, output: 16.00 },
 
   // ── Google ─────────────────────────────────────────────────────────────
+  // `gemini-1.5-pro` was retired by Google (#3510); kept so historical
+  // usage/audit rows still price. Not a valid default — it's deliberately
+  // absent from the google recipe's chat list.
   'google:gemini-1.5-pro':                { input:  1.25, output:  5.00 },
   // Gemini 2.0 Flash: $0.10 in / $0.40 out (verified 2026-06-03). Reconciled
   // from a stale $0.30/$1.20 entry that had drifted in takes-quality-eval.
@@ -93,7 +96,12 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
 
   // ── Together / DeepSeek (cross-modal-eval panel) ───────────────────────
   'together:meta-llama/Llama-3.3-70B-Instruct-Turbo': { input: 0.88, output: 0.88 },
+  // `deepseek-chat` was retired by DeepSeek 2026-07-24 (#1255); kept so
+  // historical usage/audit rows still price. New calls use the v4 names.
   'deepseek:deepseek-chat':               { input:  0.14, output:  0.28 },
+  // DeepSeek v4 (verified 2026-07-27 at api-docs.deepseek.com): cache-miss rates.
+  'deepseek:deepseek-v4-flash':           { input:  0.14, output:  0.28 },
+  'deepseek:deepseek-v4-pro':             { input:  0.435, output: 0.87 },
 };
 
 /**

@@ -700,6 +700,17 @@ export interface SearchResult {
    */
   content_flag?: { reason: string; detail: string };
   /**
+   * Extraction quarantine lane (issue #160): true when the result's page is
+   * an unverified auto-extracted entity stub (frontmatter
+   * `provenance: 'auto-extracted'` + `status: 'unverified'`). Such pages are
+   * excluded from the compiled-truth authority boost and the namespace
+   * source-boost — they rank as ordinary content — and this marker tells the
+   * agent the page has NOT been reviewed by the owner. Stamped pre-fusion by
+   * `stampUnverifiedExtractions` (hybrid.ts). Absent for reviewed/ordinary
+   * pages.
+   */
+  unverified?: boolean;
+  /**
    * v0.36 (cross-modal wave): the chunk's modality discriminator from
    * content_chunks.modality. 'text' for the existing text-embedding rows,
    * 'image' for rows populated by importImageFile. Surfaced so callers /
@@ -1192,7 +1203,11 @@ export interface CodeEdgeResult {
 // Links
 export interface Link {
   from_slug: string;
+  /** Exact source identity of the from-page joined by from_page_id. */
+  from_source_id: string;
   to_slug: string;
+  /** Exact source identity of the to-page joined by to_page_id. */
+  to_source_id: string;
   link_type: string;
   context: string;
   /**
@@ -1210,6 +1225,8 @@ export interface Link {
    * multiple pages reference the same (from, to, type) tuple.
    */
   origin_slug?: string | null;
+  /** Exact source identity of origin_slug; null when absent or grant-redacted. */
+  origin_source_id?: string | null;
   /**
    * The frontmatter field name that created this edge (e.g. 'key_people',
    * 'investors'). Used for debug output and the `unresolved` response list.

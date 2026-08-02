@@ -24,6 +24,7 @@ describe('KNOWN_CONFIG_KEYS', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('embedding_disabled');  // v0.37 D9
     expect(KNOWN_CONFIG_KEYS).toContain('expansion_model');
     expect(KNOWN_CONFIG_KEYS).toContain('chat_model');
+    expect(KNOWN_CONFIG_KEYS).toContain('openrouter_api_key');
     expect(KNOWN_CONFIG_KEYS).toContain('provider_chat_options');
   });
 
@@ -35,6 +36,10 @@ describe('KNOWN_CONFIG_KEYS', () => {
   test('contains the models-tier keys (v0.31.12)', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('models.default');
     expect(KNOWN_CONFIG_KEYS).toContain('models.tier.subagent');
+  });
+
+  test('allows the contextual synopsis model key', () => {
+    expect(KNOWN_CONFIG_KEYS).toContain('models.contextual_synopsis');
   });
 
   test('contains the dream synthesize timeout keys (#1594)', () => {

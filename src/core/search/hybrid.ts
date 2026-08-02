@@ -48,6 +48,32 @@ import {
 
 export const RRF_K = 60;
 const COMPILED_TRUTH_BOOST = 2.0;
+
+/**
+ * Which detail levels get the compiled_truth boost (#3430).
+ *
+ * ONLY `low`. The documented contract (`src/core/operations.ts`) is
+ * "low (compiled truth only), medium (default, all with dedup), high (all
+ * chunks)" — so `low` is the level that privileges compiled truth, and both
+ * `medium` and `high` are supposed to see everything on equal footing.
+ *
+ * This was previously spelled `detail !== 'high'`, i.e. written as though
+ * `high` were the special case. Because COMPILED_TRUTH_BOOST is applied AFTER
+ * RRF normalization, and RRF's whole range over a 100-deep pool is 1/60 → 1/160,
+ * a 2.0x multiplier is not a tilt — break-even is `2/(60+r) >= 1/60`, so any
+ * boosted chunk inside the first 60 ranks outranks an unboosted rank-1 chunk.
+ * At the default detail that made search categorically compiled-truth-only:
+ * a page whose answer lived in a `fenced_code` chunk returned the prose chunk,
+ * and the code chunk fell out of the window entirely.
+ *
+ * Extracted as a named predicate rather than left inline at three call sites so
+ * the detail→boost mapping is directly testable. An inline expression can only
+ * be covered through a full `hybridSearch` round trip, which is why the
+ * original inversion went unnoticed.
+ */
+export function shouldBoostCompiledTruth(detail: string | null | undefined): boolean {
+  return detail === 'low';
+}
 const pendingCacheWrites = new Set<Promise<unknown>>();
 
 /**
@@ -73,6 +99,37 @@ export async function stampContentFlags(engine: BrainEngine, results: SearchResu
     }
   } catch {
     // best-effort: a flag-fetch failure must not break retrieval.
+  }
+}
+
+/**
+ * Extraction quarantine lane (issue #160). Stamps `SearchResult.unverified`
+ * for any result whose page is an unverified auto-extracted entity stub
+ * (frontmatter `provenance: 'auto-extracted'` + `status: 'unverified'`).
+ * MUST run PRE-fusion: rrfFusion/rrfFusionWeighted read the flag to skip the
+ * COMPILED_TRUTH_BOOST for these pages, so a stub fabricated by hostile
+ * ingested text ranks as ordinary content, never with entity authority.
+ * One batched query over the candidate arms' page_ids. Fail-open on the
+ * fetch (a marker-fetch failure must not break retrieval) — the boost then
+ * applies, but the SQL-side source-boost guard still holds.
+ */
+export async function stampUnverifiedExtractions(
+  engine: BrainEngine,
+  results: SearchResult[],
+): Promise<void> {
+  if (results.length === 0) return;
+  try {
+    const ids = [...new Set(
+      results.map((r) => r.page_id).filter((n): n is number => typeof n === 'number' && Number.isFinite(n)),
+    )];
+    if (ids.length === 0) return;
+    const unverified = await engine.getUnverifiedExtractionPageIds(ids);
+    if (unverified.size === 0) return;
+    for (const r of results) {
+      if (unverified.has(r.page_id)) r.unverified = true;
+    }
+  } catch {
+    // best-effort: never break retrieval.
   }
 }
 
@@ -810,11 +867,12 @@ export async function embedQueryBounded(
   embedOpts: { embeddingModel?: string; dimensions?: number } | undefined,
   dl: QueryEmbedDeadline,
 ): Promise<Float32Array> {
-  const p = embedQuery(text, { ...(embedOpts ?? {}), abortSignal: dl.signal });
-  p.catch(() => { /* swallow the loser's late rejection */ });
   // Floor the budget so a healthy embed isn't starved when the shared absolute
   // deadline was mostly consumed by prior work (codex). Still bounded overall.
   const remaining = Math.max(MIN_QUERY_EMBED_BUDGET_MS, dl.deadlineAt - Date.now());
+  const signal = AbortSignal.timeout(remaining);
+  const p = embedQuery(text, { ...(embedOpts ?? {}), abortSignal: signal });
+  p.catch(() => { /* swallow the loser's late rejection */ });
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(
@@ -827,6 +885,41 @@ export async function embedQueryBounded(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * #3442 — resolve the public `since`/`until` contract (SearchOpts v0.29.1):
+ * ISO-8601 passes through, relative durations ('7d', '2w', '1y') resolve to a
+ * concrete timestamp, and a plain YYYY-MM-DD `until` lands at end-of-day.
+ * The relative form was documented since v0.29.1 but never implemented — the
+ * raw string ('60d') flowed into the engines' `::timestamptz` casts, every
+ * arm failed fail-open, and the date filter was SILENTLY ignored.
+ * Unparseable input now throws loudly instead of degrading.
+ */
+export function resolveDateBoundary(
+  raw: string | undefined,
+  boundary: 'since' | 'until',
+): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const s = String(raw).trim();
+  if (!s) return undefined;
+  const rel = /^(\d+)\s*([dwmy])$/i.exec(s);
+  if (rel) {
+    const n = parseInt(rel[1], 10);
+    const unit = rel[2].toLowerCase();
+    // m = months (30d). Minutes make no sense for an effective_date filter.
+    const days = unit === 'd' ? n : unit === 'w' ? n * 7 : unit === 'm' ? n * 30 : n * 365;
+    return new Date(Date.now() - days * 86400000).toISOString();
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    // Plain date: `until` lands at end-of-day (documented SearchOpts
+    // semantics); `since` keeps UTC start-of-day.
+    return boundary === 'until' ? `${s}T23:59:59.999Z` : s;
+  }
+  if (Number.isFinite(Date.parse(s))) return s;
+  throw new Error(
+    `Invalid ${boundary} value "${s}" — expected ISO-8601 (YYYY-MM-DD or timestamp) or a relative duration like '7d', '2w', '1y'.`,
+  );
 }
 
 export async function hybridSearch(
@@ -923,8 +1016,10 @@ export async function hybridSearch(
     // v0.29.1: since/until take precedence over deprecated afterDate/beforeDate.
     // The engine still consumes the legacy field names; this aliasing keeps
     // PR #618 callers compiling while the new names are the public surface.
-    afterDate: opts?.since ?? opts?.afterDate,
-    beforeDate: opts?.until ?? opts?.beforeDate,
+    // #3442: resolveDateBoundary implements the documented contract (relative
+    // durations + end-of-day for plain-date `until`) at this single seam.
+    afterDate: resolveDateBoundary(opts?.since ?? opts?.afterDate, 'since'),
+    beforeDate: resolveDateBoundary(opts?.until ?? opts?.beforeDate, 'until'),
     // v0.34.1 (#861, D9 — P0 leak seal): thread source-scoping through so the
     // inner engine.searchKeyword / engine.searchVector calls apply the
     // WHERE source_id filter at SQL level. Pre-fix, this explicit pick
@@ -1101,19 +1196,44 @@ export async function hybridSearch(
   // provider (Voyage, ZE) works fine.
   const { isAvailable } = await import('../ai/gateway.ts');
   const providerProbe = resolvedCol.embeddingModel || undefined;
-  if (!isAvailable('embedding', providerProbe)) {
+  // Image/both/unified routing embeds via the MULTIMODAL provider, not the
+  // text provider — so a multimodal-only install (text provider absent) must
+  // still reach the multimodal branch below. Probe the multimodal provider
+  // explicitly and only short-circuit when neither the text provider nor (for
+  // multimodal-routed queries) the multimodal provider is reachable. Without
+  // this guard a multimodal-only install would fall to keyword-only here and
+  // never run the image/unified vector path.
+  const multimodalProviderProbe =
+    cfgForColumn?.embedding_multimodal_model ?? 'voyage:voyage-multimodal-3';
+  // The LLM intent tie-break (below) can escalate a regex-'text' query to
+  // 'image'/'both'; account for that possibility so an ambiguous query on a
+  // multimodal-only install still reaches the multimodal branch.
+  const mayEscalateToMultimodal =
+    earlyModality === 'text' &&
+    resolvedMode.cross_modal_llm_intent &&
+    isAmbiguousModalityQuery(query);
+  const willTryMultimodal =
+    (resolvedMode.unified_multimodal === true ||
+      earlyModality === 'image' ||
+      earlyModality === 'both' ||
+      mayEscalateToMultimodal) &&
+    isAvailable('embedding', multimodalProviderProbe);
+  if (!isAvailable('embedding', providerProbe) && !willTryMultimodal) {
     // v0.43 — fuse the relational arm with keyword so typed-edge answers
     // survive on the no-embedding-provider path (the relational win is most
     // valuable exactly when vector is unavailable). The title arm fuses here
     // too — an exact-title lookup on a keyless install is precisely where
     // chunk-grain keyword FTS alone fails (D1).
+    // issue #160: stamp unverified stubs BEFORE fusion so the compiled-truth
+    // boost skips them (flag survives fusion's result spread).
+    await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...relationalList]);
     let noEmbedResults = keywordResults;
     if (relationalList.length > 0 || titleResults.length > 0) {
       const fk = opts?.rrfK ?? RRF_K;
       const noEmbedLists = [{ list: keywordResults, k: fk }];
       if (titleResults.length > 0) noEmbedLists.push({ list: titleResults, k: fk });
       if (relationalList.length > 0) noEmbedLists.push({ list: relationalList, k: fk });
-      noEmbedResults = rrfFusionWeighted(noEmbedLists, detailResolved !== 'high');
+      noEmbedResults = rrfFusionWeighted(noEmbedLists, shouldBoostCompiledTruth(detailResolved));
     }
     if (noEmbedResults.length > 0) {
       await runPostFusionStages(engine, noEmbedResults, postFusionOpts);
@@ -1233,7 +1353,10 @@ export async function hybridSearch(
   if (unifiedRouting) {
     try {
       const { isAvailable: aiIsAvailable, embedQueryMultimodal } = await import('../ai/gateway.ts');
-      if (!aiIsAvailable('embedding')) {
+      // Probe the MULTIMODAL provider, not the global default — on a
+      // multimodal-only install the global default (text) is absent but the
+      // multimodal provider is configured, and unified routing embeds via it.
+      if (!aiIsAvailable('embedding', multimodalProviderProbe)) {
         throw new Error('gateway not configured for embedding — unified multimodal would also fail');
       }
       const unifiedEmbedding = await embedQueryMultimodal(query);
@@ -1268,7 +1391,10 @@ export async function hybridSearch(
     // OR the embed throws, log a structured warning and fall through to text.
     try {
       const { isAvailable: aiIsAvailable, embedQueryMultimodal } = await import('../ai/gateway.ts');
-      if (!aiIsAvailable('embedding')) {
+      // Probe the MULTIMODAL provider, not the global default — the image side
+      // embeds via the multimodal model, which may be configured even when the
+      // text/global-default embedding provider is absent (multimodal-only).
+      if (!aiIsAvailable('embedding', multimodalProviderProbe)) {
         throw new Error('gateway not configured for embedding — multimodal would also fail');
       }
       const imageEmbedding = await embedQueryMultimodal(query);
@@ -1342,13 +1468,16 @@ export async function hybridSearch(
     // v0.43: fuse the relational arm with keyword via RRF so typed-edge
     // answers survive even when vector is unavailable. The title arm fuses
     // here too (same rationale as the no-embedding-provider path — D1).
+    // issue #160: stamp unverified stubs BEFORE fusion (see the
+    // no-embedding-provider path for rationale).
+    await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...relationalList]);
     let fallbackResults = keywordResults;
     if (relationalList.length > 0 || titleResults.length > 0) {
       const fk = opts?.rrfK ?? RRF_K;
       const fallbackLists = [{ list: keywordResults, k: fk }];
       if (titleResults.length > 0) fallbackLists.push({ list: titleResults, k: fk });
       if (relationalList.length > 0) fallbackLists.push({ list: relationalList, k: fk });
-      fallbackResults = rrfFusionWeighted(fallbackLists, detail !== 'high');
+      fallbackResults = rrfFusionWeighted(fallbackLists, shouldBoostCompiledTruth(detail));
     }
     if (fallbackResults.length > 0) {
       await runPostFusionStages(engine, fallbackResults, postFusionOpts);
@@ -1431,7 +1560,11 @@ export async function hybridSearch(
     allLists.push({ list: relationalList, k: baseRrfK });
   }
 
-  let fused = rrfFusionWeighted(allLists, detail !== 'high');
+  // issue #160: stamp unverified auto-extracted stubs across ALL candidate
+  // arms BEFORE fusion so the compiled-truth authority boost skips them.
+  await stampUnverifiedExtractions(engine, allLists.flatMap((l) => l.list));
+
+  let fused = rrfFusionWeighted(allLists, shouldBoostCompiledTruth(detail));
 
   // Cosine re-scoring before dedup so semantically better chunks survive.
   // v0.36 (D9): hydrate from the active embedding column so rescore happens
@@ -1734,12 +1867,19 @@ export async function hybridSearchCached(
     opts?.adaptiveReturn,
     cfgCached as unknown as Record<string, unknown> | null,
   );
+  // #3442: date-filtered requests skip the cache — since/until are not part
+  // of knobsHash, so a filtered result set could be served to an unfiltered
+  // lookup (and vice versa). Relative forms ('60d') also resolve to a
+  // now-relative timestamp, which a persisted cache row can't express.
+  const dateFiltered =
+    Boolean(opts?.since ?? opts?.afterDate) || Boolean(opts?.until ?? opts?.beforeDate);
   const skipCache =
     !cache.isEnabled() ||
     (opts?.walkDepth ?? 0) > 0 ||
     Boolean(opts?.nearSymbol) ||
     isNonDefaultColumn ||
-    adaptiveReturnOn;
+    adaptiveReturnOn ||
+    dateFiltered;
 
   let cacheStatus: 'hit' | 'miss' | 'disabled' = skipCache ? 'disabled' : 'miss';
   let cacheSimilarity: number | undefined;
@@ -1997,7 +2137,9 @@ export function rrfFusionWeighted(
   if (maxScore > 0) {
     for (const e of entries) {
       e.score = e.score / maxScore;
-      const boost = applyBoost && e.result.chunk_source === 'compiled_truth' ? COMPILED_TRUTH_BOOST : 1.0;
+      // issue #160: unverified auto-extracted stubs (stamped pre-fusion by
+      // stampUnverifiedExtractions) never get the compiled-truth authority boost.
+      const boost = applyBoost && e.result.chunk_source === 'compiled_truth' && e.result.unverified !== true ? COMPILED_TRUTH_BOOST : 1.0;
       e.score *= boost;
     }
   }
@@ -2040,8 +2182,9 @@ export function rrfFusion(lists: SearchResult[][], k: number, applyBoost = true)
       const rawScore = e.score;
       e.score = e.score / maxScore;
 
-      // Apply compiled truth boost after normalization (skip for detail=high)
-      const boost = applyBoost && e.result.chunk_source === 'compiled_truth' ? COMPILED_TRUTH_BOOST : 1.0;
+      // Apply compiled truth boost after normalization (skip for detail=high;
+      // skip for unverified auto-extracted stubs — issue #160)
+      const boost = applyBoost && e.result.chunk_source === 'compiled_truth' && e.result.unverified !== true ? COMPILED_TRUTH_BOOST : 1.0;
       e.score *= boost;
 
       if (DEBUG) {
