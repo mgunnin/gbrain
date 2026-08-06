@@ -2,6 +2,80 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.73.2] - 2026-08-05
+
+**A write that deduplication redirects onto an existing page is now checked against the write scope of whoever asked for it.** When the same content arrives under a new slug, gbrain recognises it and points the write at the page that already holds it. That redirected target is now tested against the caller's own scope — under whichever mechanism confines that caller. One of the two mechanisms was consulted at that point; both are now.
+
+Nothing changes for local CLI use, or for clients that hold unrestricted write access — neither was ever scope-confined. A confined caller whose write dedups onto a page **inside** its own scope keeps working exactly as before; that redirect is a feature and it is preserved, with a regression test to keep it that way. A confined caller whose write dedups onto a page **outside** its scope now gets `permission_denied`, with the remedy in the message: drop the `id:` frontmatter field, or change the content, to write a new page under your own prefix. The denial does not name the page the write resolved to.
+
+Recommended for any brain served over HTTP to scope-restricted clients.
+
+### To take advantage of v0.42.73.2
+
+```bash
+gbrain upgrade
+```
+
+Nothing to configure. Existing clients keep their scopes unchanged, and no re-registration is needed.
+
+### For contributors
+
+Reported privately by an external security researcher, who supplied a fix and a regression test with it. The version that shipped composes the two existing scope-matching rules into a single predicate rather than restating either one, so the check at the door and the check after a redirect cannot drift apart; the audit the report prompted closed the same gap on one further caller path.
+
+## [0.42.73.1] - 2026-08-05
+
+**Removes the PR gate that v0.42.73.0 added, and reverts the v0.42.72.1 contribution-policy change it enforced.** The gate cannot function on this repository, and it caused a real incident before that was understood.
+
+The gate needed two things this repository does not grant it: an `ANTHROPIC_API_KEY` Actions secret for its verdict, and read-write workflow permissions to post a comment or set a label. Without them it can only skip. Worse, on its first live runs a read-only token turned every API call into a 403, the code treated that as a crash, and the check went red on an outside contributor's pull request four times with no comment explaining why. That was fixed in v0.42.73.0, but a check that runs on every pull request and can never reach a verdict does not earn its place in the repository.
+
+The v0.42.72.1 contribution policy is also withdrawn: the human-written intent paragraph and gbrain-in-use screenshot are no longer required on issues and pull requests. `CONTRIBUTING.md`, both issue templates, and the pull-request template return to their pre-2026-08-02 state, and issues and PRs are reviewed on their content by maintainers, as before.
+
+The code is preserved in git history at v0.42.73.0 and can be restored if the repository ever grants those permissions. If it is restored, the mechanical half — the intent and screenshot check, the version-first title rule, the red flags — should render to the Actions job summary instead of a comment, because that needs no token permission and no API key.
+
+### To take advantage of v0.42.73.1
+
+```bash
+gbrain upgrade
+```
+
+Nothing to change. Everything else v0.42.73.0 shipped — the five contributed correctness fixes, `slug_filter`, and the four dependency pins that cleared six CVEs — is unaffected and stays.
+
+## [0.42.73.0] - 2026-08-04
+
+**Every incoming pull request now gets a verdict before anyone reads it — and five contributed fixes for silent wrong answers.**
+
+**The PR gate.** Open a pull request against gbrain and an automated check now posts a single verdict comment within a minute: **merge-lane**, **close-lane**, or **needs-maintainer**, with its reasons and a checklist of what a human reviewer should verify for that specific diff. It also checks mechanically that the description carries the human-written intent paragraph and the screenshot of gbrain in use that `CONTRIBUTING.md` requires, and that the title leads with its version.
+
+It is deliberately **advisory** — a triage signal and a reviewer checklist, not an authorization boundary. A green verdict is not permission to merge; a maintainer still decides. Pull-request code is never checked out or executed: the verdict comes from the description and the diff read through the API. Maintainer, bot, and draft pull requests are exempt from the intent-and-screenshot floor only (release automation cannot screenshot itself); they still receive the full verdict. Where the rubric can be argued with, the decision is taken away from it: a merge-lane recommendation is downgraded automatically when a diff adds a dependency, a new provider recipe, or new config keys, edits workflows, deletes a test, exceeds 40 files or 400 net source lines, or changes `src/` without touching a single test.
+
+**Your import output parses again.** `gbrain import <dir> --json` printed five informational lines to stdout ahead of the JSON payload, so anything parsing that output read zero imports while its own bookkeeping recorded the files as ingested — and the next run skipped them permanently. Those lines now go to stderr under `--json`; human output is byte-for-byte unchanged.
+
+**`sources harden --dry-run` no longer changes anything.** It reset the helper's executable bit before reaching the dry-run check, so a documented preview quietly mutated permissions.
+
+**Telemetry records the model that actually ran.** Two nightly-cycle phases wrote a hardcoded or unrelated model name into their verdict cache, evidence signature, and spend metering while the gateway ran whatever chat model you configured. On any brain with a non-default model, the recorded history was fiction.
+
+**`gbrain integrity` stops contradicting itself.** Dead-link findings were counted in the "Review queue" total but written to a different file, so `integrity review` disagreed with `integrity auto`'s own summary. They now get their own line.
+
+**Retype rules can address API-ingested pages.** Mapping rules could only filter on a file path, which is empty for every page written through `put_page` — so no rule could target that whole class. A new `slug_filter` filters on the slug instead, and combines with the path filter when both are given.
+
+Also: the `integrity` source comment no longer documents a `--dry-run` subcommand form that exits with an error.
+
+### To take advantage of v0.42.73.0
+
+```bash
+gbrain upgrade
+gbrain import <dir> --json | jq .    # now parses
+gbrain integrity auto                # dead links reported separately
+```
+
+Nothing to configure for the gate — it runs on pull requests to this repository. If you maintain a fork and want it, the workflow needs an `ANTHROPIC_API_KEY` secret; without one it skips loudly rather than blocking anyone.
+
+### For contributors
+
+The gate went through six rounds against two independent blind reviewers, each judging cold. The findings that changed the design most were not exploits but false positives: a code fence that swallowed the rest of a description, an explanation written as bullet points scoring zero words, a word floor stricter than the published policy, and a comment telling contributors to reopen a pull request that was never closed. Those four descriptions are now permanent regression fixtures — a gate that insults a first-time contributor is worse than no gate. Two properties are deliberate and documented rather than fixed: the mechanical floor is a floor (a determined author clears it in seconds), and a bare URL in a cited reason still autolinks.
+
+Contributed by @YiconZiwei (#2655), @time-attack (#3764, #3759, #3726, #3751, #3739, and the gate groundwork in #3573/#3698).
+
 ## [0.42.72.1] - 2026-08-02
 
 **Every issue and pull request now needs a human-written paragraph and a screenshot of gbrain actually being used.**
