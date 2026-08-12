@@ -1,30 +1,35 @@
 # Deploy GBrain Remote MCP Server
 
-> **v0.26.0+:** `gbrain serve --http` ships full OAuth 2.1 (client credentials,
-> auth code + PKCE, refresh rotation, optional DCR), an embedded React admin
-> dashboard at `/admin`, scoped operations, and a live SSE activity feed.
-> Pre-v0.26 legacy bearer tokens still work — `verifyAccessToken` falls back
-> to the `access_tokens` table and grandfathers tokens to `read+write+admin`.
-> Postgres-only for the legacy fallback (the `access_tokens` table is Postgres-only);
-> OAuth tables work on both PGLite and Postgres. See [SECURITY.md](../../SECURITY.md)
-> for env vars and tunable defaults.
+> `gbrain serve --http` ships full OAuth 2.1 (client credentials, auth code +
+> PKCE, refresh rotation, optional DCR), an embedded React admin dashboard at
+> `/admin`, scoped operations, and a live SSE activity feed. Legacy bearer
+> tokens still work — `verifyAccessToken` falls back to the `access_tokens`
+> table and grandfathers tokens to `read+write+admin`. Both the legacy fallback
+> and the OAuth tables work on PGLite and Postgres (both engine schemas carry
+> `access_tokens`). See [SECURITY.md](../../SECURITY.md) for env vars and
+> tunable defaults.
 
 Access your brain from any device, any AI client. GBrain ships two transports:
-`gbrain serve` (stdio) for local agents, and `gbrain serve --http` (v0.26.0+)
-for remote clients over OAuth 2.1.
+`gbrain serve` (stdio) for local agents, and `gbrain serve --http` for remote
+clients over OAuth 2.1.
 
 ## Three Paths
 
 ### Local stdio (zero setup)
 
 ```bash
-gbrain serve
+gbrain serve                  # full operation catalog (default)
+gbrain serve --surface verbs  # just the 5 memory verbs (quickstart surface)
 ```
 
 Works with Claude Code, Cursor, Windsurf, and any MCP client that supports stdio.
 No server, no tunnel, no token needed. Works on both PGLite and Postgres engines.
+`--surface verbs` exposes exactly the five-verb memory protocol (`recall`,
+`remember`, `entity`, `synthesize`, `forget` —
+[MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) instead of the full catalog;
+omit the flag (default `full`) for every operation.
 
-### Remote over OAuth 2.1 (recommended, v0.26.0+)
+### Remote over OAuth 2.1 (recommended)
 
 ```bash
 gbrain serve --http --port 3131
@@ -45,28 +50,27 @@ Supported clients:
 - **Perplexity** — OAuth 2.1 client credentials grant.
 - **Claude Code, Cursor, Windsurf** — can use OAuth or legacy bearer.
 
-See the [OAuth 2.1 setup](#oauth-21-setup-v100) section below.
+See the [OAuth 2.1 setup](#oauth-21-setup) section below.
 
-### Remote with legacy bearer tokens (pre-v0.26 deployments) — Postgres only
+### Remote with legacy bearer tokens (simplest)
 
 ```
 Your AI client (Claude Desktop, Perplexity, etc.)
   → ngrok tunnel (https://YOUR-DOMAIN.ngrok.app)
   → gbrain serve --http  (built-in transport with bearer auth)
-  → Postgres (pooler connection or self-hosted)
+  → Postgres or PGLite
 ```
 
 This requires:
-1. A Postgres-backed brain (the `access_tokens` table only exists on Postgres;
-   running `gbrain serve --http` against a PGLite install fails fast at startup)
-2. A machine running `gbrain serve --http`
-3. A public tunnel (ngrok, Tailscale, or cloud host)
-4. A bearer token created via `gbrain auth create <name>`
+1. A machine running `gbrain serve --http` (works on both PGLite and Postgres
+   brains)
+2. A public tunnel (ngrok, Tailscale, or cloud host)
+3. A bearer token created via `gbrain auth create <name>`
 
-Pre-v1.0 tokens are grandfathered as `read+write+admin` scopes when you upgrade
-to the HTTP server, so no migration is required.
+Existing bearer tokens are grandfathered as `read+write+admin` scopes on the
+OAuth-capable HTTP server, so no migration is required.
 
-## OAuth 2.1 Setup (v0.26.0+)
+## OAuth 2.1 Setup
 
 ### 1. Start the HTTP server
 
@@ -92,8 +96,8 @@ Save this token. Open `http://localhost:3131/admin` and paste it to access the
 dashboard. The dashboard shows live activity, registered clients, request logs,
 and per-client config export.
 
-> **v0.26.9+:** `mcp_request_log.params` and the live SSE activity feed default
-> to a redacted summary `{redacted, kind, declared_keys, unknown_key_count, approx_bytes}`.
+> `mcp_request_log.params` and the live SSE activity feed default to a redacted
+> summary `{redacted, kind, declared_keys, unknown_key_count, approx_bytes}`.
 > Declared param keys are kept (intersected against the operation's spec); unknown
 > keys are counted but never named, and byte sizes round up to 1KB so size-probe
 > attacks can't binary-search secret content. Operators on a personal laptop who
@@ -124,9 +128,9 @@ gbrain auth register-client perplexity \
   --scopes "read write"
 ```
 
-**v0.34 — source-scoped clients.** Multi-source brains can scope a client's
-write authority to one source and its read scope to a curated set with the
-new `--source` and `--federated-read` flags:
+**Source-scoped clients.** Multi-source brains can scope a client's write
+authority to one source and its read scope to a curated set with the
+`--source` and `--federated-read` flags:
 
 ```bash
 gbrain auth register-client dept-x-agent \
@@ -138,9 +142,12 @@ gbrain auth register-client dept-x-agent \
 
 `--source` controls the write authority — `put_page` / `add_link` / etc only
 land in `dept-x`. `--federated-read` controls the read axis independently;
-queries return rows from any of the listed sources. Omit both flags for the
-v0.33-compatible super-client shape. Pre-v0.34 clients are backfilled to
-`source_id='default'` on `gbrain upgrade`.
+queries return rows from any of the listed sources. Omit both flags for an
+unscoped super-client. Clients registered before source scoping existed are
+backfilled to `source_id='default'` on `gbrain upgrade`. Within a source,
+slug-level write fencing is also available: `--bound-slug-prefixes p1/,p2/`
+rejects slug-mutating writes outside the listed prefixes (update later with
+`gbrain auth rescope-client <id> --bound-slug-prefixes <p1,p2|none>`).
 
 Host-repo wrappers can register programmatically:
 
@@ -158,7 +165,7 @@ start the server with `--enable-dcr`. DCR is off by default.
 
 ### 3. Expose the server
 
-**v0.34 — bind explicitly.** `gbrain serve --http` defaults to `127.0.0.1`.
+**Bind explicitly.** `gbrain serve --http` defaults to `127.0.0.1`.
 To accept connections from the ngrok tunnel (or any non-loopback source),
 restart with `--bind`:
 
@@ -182,10 +189,10 @@ router exposes the spec-compliant discovery endpoint at
 
 ### 4. Scopes and localOnly
 
-Every operation is tagged `read | write | admin`. Four operations are
-`localOnly` and rejected over HTTP regardless of scope: `sync_brain`,
-`file_upload`, `file_list`, `file_url`. Remote agents cannot reach local
-filesystem surface area.
+Every operation is tagged `read | write | admin`. Operations flagged
+`localOnly: true` in `src/core/operations.ts` (10 today — `sync_brain` and
+the `file_*` ops among them) are rejected over HTTP regardless of scope.
+Remote agents cannot reach local filesystem surface area.
 
 | Scope | What it allows |
 |-------|---------------|
@@ -193,10 +200,13 @@ filesystem surface area.
 | `write` | `put_page`, `delete_page`, `add_link`, `add_timeline_entry` |
 | `admin` | Client management, token revocation, sweep, local-only ops |
 
+Write ops can additionally be fenced per client with `--bound-slug-prefixes`
+(see [Register OAuth clients](#2-register-oauth-clients) above).
+
 ## Legacy Bearer Token Setup
 
-Keep using pre-v0.26 bearer tokens if you aren't ready to migrate. They
-grandfather to `read+write+admin` scopes on the HTTP server.
+Bearer tokens are the simple path when you don't need per-client scoping.
+They grandfather to `read+write+admin` scopes on the HTTP server.
 
 ### 1. Set up the tunnel
 
@@ -243,15 +253,20 @@ gbrain auth test \
 
 ## Operations
 
-All 30 GBrain operations are available remotely, including `sync_brain` and
-`file_upload` (no timeout limits with self-hosted server).
+GBrain's full operation catalog (100+ operations in `src/core/operations.ts`)
+is available remotely, with no timeout limits on a self-hosted server. The
+only exceptions are the operations flagged `localOnly: true` — `sync_brain`
+and the `file_*` ops among them — which are rejected over HTTP regardless of
+scope (see [Scopes and localOnly](#4-scopes-and-localonly) above).
 
-**Security note on `file_upload`:** remote MCP callers are confined to the working
-directory where `gbrain serve` was launched. Symlinks, `..` traversal, and absolute
-paths outside cwd are rejected. Page slugs and filenames are allowlist-validated
-(alphanumeric + hyphens; no control chars, RTL overrides, or backslashes). Local
-CLI callers (`gbrain files upload ...`) keep unrestricted filesystem access since
-the user owns the machine.
+**Security note on file access:** the `file_*` operations being localOnly is
+the first line of defense; as defense-in-depth, `file_upload` also confines
+any caller that isn't verifiably the trusted local CLI to the working
+directory where `gbrain serve` was launched. Symlinks, `..` traversal, and
+absolute paths outside cwd are rejected, and page slugs and filenames are
+allowlist-validated (alphanumeric + hyphens; no control chars, RTL overrides,
+or backslashes). Local CLI callers (`gbrain files upload ...`) keep
+unrestricted filesystem access since the user owns the machine.
 
 ## Deployment Options
 
@@ -321,8 +336,8 @@ Remote servers must be added via Settings > Integrations, NOT
 | put_page | 100-500ms | Write + trigger search_vector update |
 | get_stats | < 100ms | Aggregate query |
 
-**Note:** `gbrain serve --http` shipped in v0.26.0 with OAuth 2.1 + admin
-dashboard baked into the binary. The custom HTTP wrapper pattern (see
+**Note:** `gbrain serve --http` has OAuth 2.1 + the admin dashboard baked
+into the binary. The custom HTTP wrapper pattern (see
 [voice recipe](../../recipes/twilio-voice-brain.md)) is still supported for
 teams that need bespoke middleware, but for most remote deployments the
 built-in server is the recommended path.

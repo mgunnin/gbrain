@@ -2,6 +2,13 @@
 
 This is the dispatcher. Skills are the implementation. **Read the skill file before acting.** If two skills could match, read both. They are designed to chain (e.g., ingest then enrich for each entity).
 
+**Routing contract:** each skill's frontmatter `triggers:` array is the
+authoritative routing signal — harnesses match inbound messages against it
+(see `skills/_AGENT_README.md`). This file is the human-readable dispatch
+map of the same routing: one place to scan every skill and its trigger
+phrases. If a row here and a skill's frontmatter disagree, the frontmatter
+wins; fix the row.
+
 ## Always-on (every message)
 
 | Trigger | Skill |
@@ -61,6 +68,7 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | Save or load reports | `skills/reports/SKILL.md` |
 | "Create a skill", "improve this skill" | `skills/skill-creator/SKILL.md` |
 | "Skillify this", "is this a skill?", "make this proper" | `skills/skillify/SKILL.md` |
+| "optimize this skill", "tune the skill against the benchmark", "run skillopt", "make the skill better" | `skills/skill-optimizer/SKILL.md` |
 | "Compress my resolver", "AGENTS.md too large", "RESOLVER.md too big", "functional area dispatcher", "shrink routing table" | `skills/functional-area-resolver/SKILL.md` |
 | "Is gbrain healthy?", morning health check, skillpack-check | `skills/skillpack-check/SKILL.md` |
 | "harvest this skill into gbrain", "publish this skill to gbrain", "lift this skill upstream", "share this skill with other gbrain clients", "promote my skill to gbrain" | `skills/skillpack-harvest/SKILL.md` |
@@ -76,7 +84,8 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 | Trigger | Skill |
 |---------|-------|
 | "Set up GBrain", first boot | `skills/setup/SKILL.md` |
-| "Now what?", "fill my brain", "cold start", "bootstrap", "import my data", "what should I import first" | `skills/cold-start/SKILL.md` |
+| "Now what?", "fill my brain", "cold start", "bootstrap my data", "import my data", "what should I import first" | `skills/cold-start/SKILL.md` |
+| "Install gbrain into this agent/harness", "agent workspace bootstrap", "gbrain bootstrap", "wire gbrain hooks", "set up the maintenance sweep" | Run `gbrain bootstrap` (paste-in harness install: hooks + sweep + config). See `docs/guides/bootstrap.md` |
 | "Migrate from Obsidian/Notion/Logseq" | `skills/migrate/SKILL.md` |
 | Brain health check, maintenance run | `skills/maintain/SKILL.md` |
 | "Extract links", "build link graph", "populate timeline" | `skills/maintain/SKILL.md` (extraction sections) |
@@ -133,4 +142,4 @@ These apply to ALL brain-writing skills:
 | "make pdf from brain", "brain pdf", "convert brain page to pdf", "publish this page as pdf", "export brain page" | `skills/brain-pdf/SKILL.md` |
 | "voice note", "ingest this voice memo", "transcribe and file", "voice note ingest", "save this audio note" | `skills/voice-note-ingest/SKILL.md` |
 | "add a page type", "add a type to my schema", "schema author", "schema mutate", "schema pack add", "my brain has untyped pages", "propose new types from my corpus", "backfill page types", "evolve my schema", "researcher type", "make X an expert type" (dispatcher for: gbrain schema active/list/show/validate/graph/lint/stats/explain/use/downgrade/reload/init/fork/edit/diff/add-type/remove-type/update-type/add-alias/remove-alias/add-prefix/remove-prefix/add-link-type/remove-link-type/set-extractable/set-expert-routing/detect/suggest/review-candidates/review-orphans/sync) | `skills/schema-author/SKILL.md` |
-| "unify my types", "migrate to gbrain-base-v2", "94 types to 14", "apply canonical taxonomy", "clean up my page types", "pack upgrade", "shrink type proliferation", "consolidate page types", "retype pages to canonical" (dispatcher for: gbrain onboard --check, gbrain onboard --check --explain, gbrain jobs submit unify-types, gbrain pages restore) | `skills/schema-unify/SKILL.md` |
+| "unify my types", "migrate to gbrain-base-v2", "94 types to 14", "apply canonical taxonomy", "clean up my page types", "pack upgrade", "shrink type proliferation", "consolidate page types", "retype pages to canonical" (dispatcher for: gbrain onboard --check, gbrain onboard --check --explain, gbrain jobs submit unify-types, gbrain restore) | `skills/schema-unify/SKILL.md` |

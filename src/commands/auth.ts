@@ -388,7 +388,36 @@ export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
         i += 2;
         break;
       }
-      case '--scopes': out.scopes = requireValue(); i += 2; break;
+      case '--scopes': {
+        // v0.42.x: accept comma-separated input (`--scopes read,write,admin`)
+        // in addition to the space-separated OAuth wire form
+        // (`--scopes "read write admin"`). init.ts's own registration hint
+        // (line ~730) recommends the comma form, but the parser previously
+        // only split on whitespace, so a comma-joined string fell through
+        // as a single unrecognized token and registerClientManual's
+        // assertAllowedScopes rejected it as `Unknown scope
+        // "read,write,admin"` — self-contradicting the hint. Normalizing
+        // here (rather than in the shared parseScopeString) keeps that
+        // function's OAuth-wire-format (RFC 6749 space-delimited) contract
+        // intact for DCR/refresh/request-scope parsing, which stays
+        // comma-agnostic on purpose.
+        const v = requireValue();
+        const normalized = v.split(/[\s,]+/).filter(Boolean).join(' ');
+        // Zero-token input (`--scopes ","`, `--scopes ",,,"`, `--scopes "  "`,
+        // `--scopes ""`) collapses to an empty string under the split above.
+        // parseScopeString('') returns [] downstream, and
+        // assertAllowedScopes([]) passes vacuously on an empty list — so
+        // without this guard, registerClientManual would silently register
+        // a client with no usable scopes instead of reporting malformed
+        // input. Reject here, at the parser boundary, with a clear message
+        // rather than relying on whatever downstream error the raw string
+        // happens to produce.
+        if (!normalized) {
+          throw new Error(`--scopes requires at least one scope (got ${JSON.stringify(v)})`);
+        }
+        out.scopes = normalized;
+        i += 2; break;
+      }
       case '--source': out.sourceId = requireValue(); i += 2; break;
       case '--federated-read': {
         const v = requireValue();

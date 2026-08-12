@@ -280,6 +280,38 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
     expect(result.pages_processed).toBe(0);
   });
 
+  test('dry-run --stale emits no page progress, since it processes no pages', async () => {
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+    const stale = [
+      { slug: 'a', chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      { slug: 'b', chunk_index: 0, chunk_text: 'b', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 2 },
+      { slug: 'c', chunk_index: 0, chunk_text: 'c', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 3 },
+    ];
+    const engine = mockEngine({
+      countStaleChunks: async () => stale.length,
+      listStaleChunks: async () => stale,
+      listPages: async () => [{ slug: 'a' }, { slug: 'b' }, { slug: 'c' }],
+      getChunks: async () => [],
+    });
+
+    const calls: Array<[number, number]> = [];
+    const result = await runEmbedCore(engine, {
+      stale: true,
+      dryRun: true,
+      onProgress: (done, total) => { calls.push([done, total]); },
+    });
+
+    // The CLI latches its `embed.pages` total from the first callback, so a
+    // synthetic (1, 1) here made the progress stream announce one page while
+    // the summary named every stale chunk. Consistent with pages_processed
+    // above: a dry run enumerates no pages, so it reports no page progress.
+    // docs/progress-events.md permits omitting a total that is not known up
+    // front; it does not permit asserting a wrong one.
+    expect(calls).toEqual([]);
+    expect(result.pages_processed).toBe(0);
+    expect(result.would_embed).toBe(3);
+  });
+
   test('dry-run --stale correctly identifies stale chunks (SQL-side path)', async () => {
     const { runEmbedCore } = await import('../src/commands/embed.ts');
     // SQL-side stale: only the 3 chunks where embedding IS NULL come back,

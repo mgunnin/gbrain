@@ -4,15 +4,27 @@
 > tutorial walks both paths (local-from-nothing and connect-to-an-existing-brain)
 > end to end, plus the brain-first protocol that makes it worth it. This page is
 > the connection reference.
+>
+> Want the **full agent** — identity, per-turn context, schedules, and a private
+> repo as its durable body — not just a memory? That's `gbrain bootstrap`:
+> see the paste block in the README and [docs/guides/bootstrap.md](../guides/bootstrap.md).
+> Open a new empty folder (bootstrap creates the private repo for you), or make an
+> empty private repo under your own account and open the clone — bootstrap adopts it.
 
 ## Option 1: Local (recommended, zero server needed)
 
 ```bash
-claude mcp add gbrain -- gbrain serve
+claude mcp add gbrain -- gbrain serve --surface verbs
 ```
 
 That's it. Claude Code spawns `gbrain serve` as a stdio subprocess. No server, no
 tunnel, no token needed. Works with both PGLite and Supabase engines.
+
+`--surface verbs` exposes the five-verb memory protocol (`recall`, `remember`,
+`entity`, `synthesize`, `forget` — [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)),
+the surface built for agents and quickstarts. Drop the flag for the full
+operation catalog (`get_page`, `put_page`, `search`, graph ops, …) — `full` is
+the default and what existing installs already run.
 
 ## Option 2: Remote, one command (fastest from a bearer token)
 
@@ -79,9 +91,12 @@ You should see results from your GBrain knowledge base.
 > **`list_skills` returns nothing?** Skill discovery is gated by `mcp.publish_skills`
 > on the host. New brains from `gbrain init` default it ON; brains upgraded from an
 > older release stay OFF until you opt in. Enable it on the host with
-> `gbrain config set mcp.publish_skills true`. The core tools (search, query,
-> get_page, put_page, think, find_experts) work regardless. Note: `capture` is a
+> `gbrain config set mcp.publish_skills true`. Skill discovery and the core tools
+> named here (search, query, get_page, put_page, think, find_experts) are
+> full-surface — on `--surface verbs` the agent sees only the five memory verbs,
+> and `list_skills` isn't on the surface at all. Note: `capture` is a
 > CLI-only command, not an MCP tool — the agent writes over MCP with `put_page`.
+> Why brains differ on the default: [tutorial A1](../tutorials/connect-coding-agent.md#a1-on-the-host-serve-over-http).
 
 ## Remove
 

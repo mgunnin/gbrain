@@ -127,7 +127,7 @@
     {
       "name": "soul-audit",
       "path": "soul-audit/SKILL.md",
-      "description": "6-phase interactive interview generating SOUL.md, USER.md, ACCESS_POLICY.md, HEARTBEAT.md."
+      "description": "Re-run/deepen the identity interview via the shared bootstrap answer bank (interview --set/--show/--confirm), then re-render SOUL.md/USER.md/ACCESS_POLICY.md/HEARTBEAT.md with render --only."
     },
     {
       "name": "webhook-transforms",

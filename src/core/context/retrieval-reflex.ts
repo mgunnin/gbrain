@@ -106,7 +106,7 @@ export interface ResolvePointersOpts {
   sourceIds?: string[];
 }
 
-interface PageRow {
+export interface PageRow {
   slug: string;
   source_id: string;
   title: string;
@@ -290,8 +290,11 @@ function displayForRow(row: PageRow, displayByNorm: Map<string, string>): string
  * otherwise strip takes/private-fact fences from the body (the same boundary
  * get_page applies to untrusted readers) and take the first sentence. Never
  * returns raw compiled_truth.
+ *
+ * Exported for the MEMORY_VERBS v1 entity card (verbs/entity-card.ts) — the
+ * card's `summary` field runs through THIS boundary, not a parallel one.
  */
-function safeSynopsis(row: PageRow): string {
+export function safeSynopsis(row: PageRow): string {
   const fmSummary = row.frontmatter?.summary;
   if (typeof fmSummary === 'string' && fmSummary.trim()) {
     return clip(collapse(fmSummary), SYNOPSIS_MAX);
@@ -349,6 +352,16 @@ export function renderPointerBlock(pointers: ReflexPointer[]): string {
  * precision toward zero (corrupting the exact stats users tune
  * min_confidence with).
  */
+/**
+ * Canonical rationale template for a delivered reflex pointer — shared by the
+ * ambient-channel logger below AND the hook lane's delivery logger
+ * (volunteer-events.ts:logTurnContextDeliveryFireAndForget) so the two
+ * channels' rationale strings can never drift.
+ */
+export function reflexPointerRationale(p: ReflexPointer): string {
+  return `${p.arm} match "${p.display}"`;
+}
+
 export function logDeliveredReflexPointers(engine: BrainEngine, pointers: ReflexPointer[]): void {
   if (!pointers.length) return;
   void import('./volunteer-events.ts')
@@ -356,7 +369,7 @@ export function logDeliveredReflexPointers(engine: BrainEngine, pointers: Reflex
       logVolunteerEventsFireAndForget(
         engine,
         volunteerEventRowsFrom(
-          pointers.map((p) => ({ ...p, rationale: `${p.arm} match "${p.display}"` })),
+          pointers.map((p) => ({ ...p, rationale: reflexPointerRationale(p) })),
           { channel: 'reflex' },
         ),
       );

@@ -206,8 +206,24 @@ export function formatCodeBreakdown(
   return summary.map(s => `  ${s.code}: ${s.count}`).join('\n');
 }
 
+/**
+ * Where `sync-failures.jsonl` lives. Defaults to the gbrain home.
+ *
+ * `GBRAIN_SYNC_FAILURES_DIR` exists for the same reason `GBRAIN_AUDIT_DIR` does
+ * (#2823): the test suite exercises import/sync failure paths with deliberately
+ * broken fixtures, and without an override those fixture rows append into the
+ * operator's REAL ledger — the one `gbrain doctor` reads and warns on until it
+ * is cleaned up. A stray `srcE / notes/bad.md SLUG_MISMATCH` row in a live
+ * brain came from exactly this.
+ *
+ * A dedicated var rather than leaning on `GBRAIN_HOME`: pointing GBRAIN_HOME at
+ * a scratch dir for the whole suite also makes `loadConfig()` return null for
+ * every test that reads the real config, which is a far wider blast radius than
+ * this problem needs (and `test/gbrain-home-isolation.test.ts` asserts the
+ * unset-fallback behavior directly).
+ */
 function _failuresDir(): string {
-  return _gbrainPath();
+  return process.env.GBRAIN_SYNC_FAILURES_DIR || _gbrainPath();
 }
 
 export function syncFailuresPath(): string {

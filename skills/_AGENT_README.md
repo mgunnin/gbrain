@@ -43,8 +43,12 @@ array. Substring match is the baseline. Semantic similarity (embedding or
 keyword expansion) is fine on top. When a trigger matches strongly, invoke the
 skill — read its SKILL.md body in full and follow the workflow described there.
 
-**Do NOT** look for a managed-block table inside `RESOLVER.md` or `AGENTS.md`.
-That pattern was retired in gbrain v0.36. Routing lives in frontmatter now.
+**The routing contract:** frontmatter `triggers:` are authoritative.
+`skills/RESOLVER.md` is the human-readable dispatch map of the same routing —
+useful for scanning every skill and its trigger phrases in one place, and it
+carries the disambiguation rules for overlapping matches. If the two disagree,
+frontmatter wins. (There is no machine-managed block inside `RESOLVER.md` or
+`AGENTS.md`; that pattern was retired.)
 
 ## When the user invokes a skill
 
@@ -105,7 +109,8 @@ accidental or you want to fully reset to gbrain's current bundle.
 
 ## Removing a scaffolded skill
 
-There is no `uninstall` command in v0.36. The files are yours.
+There is no `uninstall` command (`gbrain skillpack uninstall` exits with an
+error pointing here). The files are yours.
 
 ```bash
 rm -rf skills/<slug>

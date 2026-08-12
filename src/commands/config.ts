@@ -204,6 +204,42 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     const coverageOverride =
       args.includes('--coverage-override') || args.includes('--yes');
 
+    // Validate sources.default at set time. This key is read by
+    // source-resolver.ts tier 5 on EVERY unqualified call, and tier 5 calls
+    // assertSourceExists — so a syntactically valid but non-existent id set
+    // here would make every later unqualified command throw, far from the
+    // typo that caused it. `gbrain sources default <id>` already validates;
+    // config set is the lower-level door to the same key and must not be a
+    // way around that check.
+    if (key === 'sources.default') {
+      const { isValidSourceId } = await import('../core/source-id.ts');
+      if (!isValidSourceId(value)) {
+        console.error(
+          `[config] sources.default must be 1-32 lowercase alphanumerics with ` +
+          `optional interior hyphens (got '${value}').\n` +
+          `[config]   gbrain sources default <id>   # preferred — validates and reports`,
+        );
+        process.exit(1);
+      }
+      // No .catch() here: a connection failure or SQL regression must NOT be
+      // reported as "source is not registered". fetchSource already absorbs
+      // the one expected legacy-column case; anything else is a real error and
+      // should surface as itself.
+      const { fetchSource } = await import('../core/sources-load.ts');
+      const src = await fetchSource(engine, value);
+      if (!src) {
+        // NOTE: keep flag literals out of this message. The generated flag
+        // registry (#2185) scans command sources for flag tokens, so naming a
+        // flag in prose would silently grant it to `gbrain config`.
+        console.error(
+          `[config] source "${value}" is not registered; refusing to set sources.default.\n` +
+          `[config]   gbrain sources list      # see registered sources\n` +
+          `[config]   gbrain sources add       # register one first`,
+        );
+        process.exit(1);
+      }
+    }
+
     // v0.42.42.0 (#2139): validate spend.posture at set time so a typo
     // ('tokenMax', 'max') doesn't silently fall back to gated.
     if (key === 'spend.posture') {

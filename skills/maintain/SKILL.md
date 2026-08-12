@@ -195,6 +195,13 @@ Verify autopilot is running:
 ```bash
 gbrain autopilot --status
 ```
+The exit code is trustworthy for gating: 0 fresh (or nothing installed),
+1 needs attention (stale heartbeat, never ran, or paused by a migration),
+2 the daemon disabled itself (its repo path vanished). `--json` emits the
+full report (`state`, `heartbeat_age_seconds`, `paused_reason`,
+`disabled_reason`). Status reads only the filesystem, so it works even
+when the database is down.
+
 If not running, install it:
 ```bash
 gbrain autopilot --install --repo ~/brain

@@ -26,6 +26,10 @@ import { buildVisibilityClause } from './search/sql-ranking.ts';
 import { bumpLastRetrievedAt } from './last-retrieved.ts';
 import { isSearchMode } from './search/mode.ts';
 import { stampEvidence } from './search/evidence.ts';
+import { packToBudget, estimateTokens, resultTokens } from './search/token-budget.ts';
+import { isAvailable } from './ai/gateway.ts';
+import { verbOperations, MEMORY_VERBS_VERSION } from './verbs.ts';
+export { MEMORY_VERBS_VERSION };
 import type { SearchResult } from './types.ts';
 import { CJK_SLUG_CHARS, PAGE_SLUG_SEG } from './cjk.ts';
 import { ALL_SOURCES } from './source-id.ts';
@@ -72,10 +76,27 @@ export type ErrorCode =
   | 'rate_limited'      // v0.31: gateway rate-limit upstream
   | 'extraction_failed' // v0.31: facts extractor failed (refusal, parse, abort)
   | 'fact_not_found'    // v0.31: forget_fact / recall on unknown id
+  // MEMORY_VERBS v1 protocol codes (frozen — docs/protocol/MEMORY_VERBS_v1.md).
+  // Coarse on purpose: codes are for branching (configure/retry vs caller bug
+  // vs server bug); the freeform `detail` field carries specifics.
+  | 'not_found'            // verb-level: unknown fact id (forget)
+  | 'scope_denied'         // verb-level: OAuth scope / trust-boundary refusal
+  | 'provenance_required'  // remember: provenance missing or empty
+  | 'unavailable'          // a required dependency cannot serve (no API key, gateway down, model refusal)
+  | 'budget_unsatisfiable' // RESERVED in v1 — schema-listed, never returned
   // eslint-disable-next-line @typescript-eslint/ban-types
   | (string & {});      // OPEN union for forward-compat (eE7 / D13)
 
 export class OperationError extends Error {
+  /**
+   * MEMORY_VERBS v1: verb handlers set `protocolVersion` (=1) and may set
+   * `detail` (freeform specifics, e.g. which dependency failed). Both are
+   * additive — non-verb ops never set them and their envelopes are unchanged
+   * (undefined keys drop out of JSON.stringify).
+   */
+  public detail?: string;
+  public protocolVersion?: number;
+
   constructor(
     public code: ErrorCode,
     message: string,
@@ -92,8 +113,27 @@ export class OperationError extends Error {
       message: this.message,
       suggestion: this.suggestion,
       docs: this.docs,
+      detail: this.detail,
+      protocol_version: this.protocolVersion,
     };
   }
+}
+
+/**
+ * MEMORY_VERBS v1 error constructor. Every verb error carries a populated
+ * `suggestion` (problem + cause + fix — agents read it and self-correct;
+ * conformance asserts non-empty) and `protocol_version: 1`.
+ */
+export function verbError(
+  code: ErrorCode,
+  message: string,
+  suggestion: string,
+  detail?: string,
+): OperationError {
+  const e = new OperationError(code, message, suggestion);
+  e.protocolVersion = MEMORY_VERBS_VERSION;
+  if (detail !== undefined) e.detail = detail;
+  return e;
 }
 
 // --- Upload validators (Fix 1 / B5 / H5 / M4) ---
@@ -342,7 +382,8 @@ export function normalizeSlugPrefix(prefix: string): string {
 
 /**
  * Write ops a slug-bound client may call: every op that routes through
- * `enforceClientSlugFence`, plus `think` (scope `write`, but remote callers
+ * `enforceClientSlugFence`, plus `think` (scope `read` for remote callers;
+ * it stays on this list because it is `mutating` locally, but remote callers
  * cannot persist — `save`/`take` are forced false for `remote !== false`).
  *
  * This list is an ALLOW-list on purpose. The fence used to be enforced op
@@ -479,6 +520,22 @@ export interface AuthInfo {
    * case (back-compat).
    */
   allowedSources?: string[];
+  /**
+   * Per-token allow-list for the holder field on `takes`, populated at
+   * token-verification time from `access_tokens.permissions.takes_holders`
+   * for legacy bearer tokens (via `parseTakesHoldersAllowList` in
+   * `src/core/legacy-token-scope.ts`). The HTTP transport threads this into
+   * `OperationContext.takesHoldersAllowList` (documented below).
+   *
+   * `[]` is an explicit deny-all grant and is PRESERVED (never collapsed).
+   * `undefined` means the token row carries no array grant — OAuth clients
+   * have no per-client storage yet (see TODOS.md) — and consumers apply the
+   * fail-closed `['world']` default at the dispatch site.
+   *
+   * Rides the same `as CoreAuthInfo as SdkAuthInfo` cast as `sourceId` /
+   * `allowedSources` above.
+   */
+  takesHoldersAllowList?: string[];
   /**
    * v0.42.72.0: slug-prefix WRITE binding from
    * `oauth_clients.bound_slug_prefixes`, threaded at token-verification
@@ -632,6 +689,14 @@ export interface OperationContext {
    * satisfied even on single-source brains.
    */
   sourceId: string;
+  /**
+   * CX2-11 — opaque per-session identity, set from MCP `_meta.session_id`
+   * (clamped to 256 chars at the dispatch boundary). Cache/telemetry identity
+   * ONLY — never an auth or trust surface. The hot-memory meta hook keys its
+   * cache on (sourceId, sessionId, allowlist-hash); before this typed field
+   * existed every caller collapsed onto the null-session cache key.
+   */
+  sessionId?: string;
   /**
    * #2561 / #3242 — federated read scope for UNQUALIFIED reads.
    *
@@ -927,6 +992,22 @@ export interface Operation {
    */
   scope?: 'read' | 'write' | 'admin' | 'sources_admin' | 'users_admin';
   localOnly?: boolean;
+  /**
+   * MEMORY_VERBS v1: marks the five frozen protocol verbs (recall, remember,
+   * entity, synthesize, forget). `gbrain serve --surface verbs` exposes
+   * EXACTLY the ops with `verb: true`; `full` (default) exposes everything.
+   */
+  verb?: boolean;
+  /**
+   * MCP ToolAnnotations passthrough (SDK 1.29+). Emitted by buildToolDefs
+   * ONLY when set — existing tools keep byte-identical definitions.
+   */
+  annotations?: {
+    title?: string;
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+  };
   cliHints?: {
     name?: string;
     /**
@@ -2260,7 +2341,7 @@ const takes_calibration: Operation = {
 const think: Operation = {
   name: 'think',
   description: 'Multi-hop synthesis across pages + takes + graph. Pulls relevant evidence and produces a cited answer with conflict + gap analysis.',
-  scope: 'write',
+  scope: 'read',
   params: {
     question: { type: 'string', required: true, description: 'The question to think about' },
     anchor: { type: 'string', description: 'Pull the entity subgraph around this slug' },
@@ -2271,6 +2352,8 @@ const think: Operation = {
     since: { type: 'string', description: 'Start of temporal window (YYYY-MM-DD or YYYY-MM)' },
     until: { type: 'string', description: 'End of temporal window' },
   },
+  // Local CLI can persist with save/take; remote/MCP callers are forced
+  // read-only below before runThink/persistSynthesis sees those flags.
   mutating: true,
   handler: async (ctx, p) => {
     const remote = ctx.remote ?? true;
@@ -2300,7 +2383,7 @@ const think: Operation = {
       until: p.until ? String(p.until) : undefined,
       takesHoldersAllowList: ctx.takesHoldersAllowList,
       ...thinkScope,
-      remote: ctx.remote === true,
+      remote: ctx.remote !== false, // fail-closed: anything not strictly false is untrusted (CLAUDE.md invariant)
     });
 
     // Persist if --save was passed locally
@@ -2943,7 +3026,12 @@ const run_doctor: Operation = {
   params: {},
   handler: async (ctx) => {
     const { doctorReportRemote } = await import('../commands/doctor.ts');
-    return doctorReportRemote(ctx.engine);
+    // Source isolation (cross-model P1): a source-bound caller's report must
+    // not aggregate other sources' activity. Scope-aware checks (currently
+    // volunteer_channels) filter on these ids; unscoped ctx = brain-wide.
+    const scope = sourceScopeOpts(ctx);
+    const sourceIds = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : undefined);
+    return doctorReportRemote(ctx.engine, { sourceIds });
   },
   scope: 'admin',
   localOnly: false,
@@ -3085,6 +3173,9 @@ const get_chunks: Operation = {
     slug: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
+    // #2555: route through the canonical scope ladder (federated array >
+    // scalar floor > nothing) instead of the pre-#2200 scalar-only pattern —
+    // a federated grant could read the page via get_page but got [] here.
     return ctx.engine.getChunks(p.slug as string, sourceScopeOpts(ctx));
   },
   scope: 'read',
@@ -3280,9 +3371,9 @@ const file_url: Operation = {
 
 const submit_job: Operation = {
   name: 'submit_job',
-  description: 'Submit a background job to the Minions queue. Built-in types: sync, embed, lint, import, extract, backlinks, autopilot-cycle. The `shell` type is CLI-only and rejected over MCP.',
+  description: 'Submit a background job to the Minions queue. Built-in types are registered by registerBuiltinHandlers (src/commands/jobs.ts) — e.g. sync, embed, lint, import, extract, backlinks, autopilot-cycle, subagent, and more; submitting an unknown name with --follow prints the full list. The `shell` type is CLI-only and rejected over MCP.',
   params: {
-    name: { type: 'string', required: true, description: 'Job type (sync, embed, lint, import, extract, backlinks, autopilot-cycle; shell is CLI-only)' },
+    name: { type: 'string', required: true, description: 'Job type (e.g. sync, embed, lint, import, extract, backlinks, autopilot-cycle; shell is CLI-only). Full registry: registerBuiltinHandlers in src/commands/jobs.ts.' },
     data: { type: 'object', description: 'Job payload (JSON)' },
     queue: { type: 'string', description: 'Queue name (default: "default")' },
     priority: { type: 'number', description: 'Priority (0 = highest, default: 0)' },
@@ -3919,12 +4010,12 @@ const volunteer_context: Operation = {
     // volunteer-events sink (drained at exit). Never fails the op.
     if (pages.length) {
       try {
-        const { logVolunteerEventsFireAndForget, volunteerEventRowsFrom } = await import('./context/volunteer-events.ts');
+        const { logVolunteerEventsFireAndForget, volunteerEventRowsFrom, SESSION_ID_MAX_LEN } = await import('./context/volunteer-events.ts');
         // Trust-boundary clamps (remote MCP callers): cap session_id length so
         // a read-scoped token can't bank unbounded TEXT per request, and only
         // log integer turns — a non-integer would throw inside the single
         // multi-row INSERT and silently drop the whole batch.
-        const sessionId = typeof p.session_id === 'string' ? p.session_id.slice(0, 256) : null;
+        const sessionId = typeof p.session_id === 'string' ? p.session_id.slice(0, SESSION_ID_MAX_LEN) : null;
         const turn =
           typeof p.turn === 'number' && Number.isInteger(p.turn) && Math.abs(p.turn) <= 2_147_483_647
             ? p.turn
@@ -4137,7 +4228,7 @@ const find_trajectory: Operation = {
     const points = await ctx.engine.findTrajectory({
       entitySlug: p.entity_slug,
       ...scope,
-      remote: ctx.remote === true,
+      remote: ctx.remote !== false, // fail-closed: anything not strictly false is untrusted (CLAUDE.md invariant)
       metric,
       kind,
       since,
@@ -4435,7 +4526,7 @@ const sources_status: Operation = {
 const extract_facts: Operation = {
   name: 'extract_facts',
   description:
-    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls Haiku to extract structured claims, runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. Skips extraction when the turn is dream-generated content (anti-loop).',
+    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls Haiku to extract structured claims, runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
   params: {
     turn_text: { type: 'string', required: true, description: 'The user message or page body to extract facts from. Sanitized via INJECTION_PATTERNS before the LLM call.' },
     session_id: { type: 'string', description: 'Opaque session id (e.g. topic-id from MCP _meta.session_id, or CLI --session). Stored on each fact for the recall --session filter. Not an auth surface.' },
@@ -4467,7 +4558,11 @@ const extract_facts: Operation = {
     }
 
     const sourceId = ctx.sourceId ?? 'default';
-    const visibility: 'private' | 'world' = p.visibility === 'world' ? 'world' : 'private';
+    // [ENG-8] Explicit caller value wins; UNSET resolves through the shared
+    // facts.default_visibility helper (the old ternary coerced unset →
+    // 'private' before any config default could run). Garbage stays 'private'.
+    const { resolveVisibilityParam } = await import('./facts/visibility.ts');
+    const visibility: 'private' | 'world' = await resolveVisibilityParam(ctx.engine, p.visibility);
 
     const r = await runFactsPipeline(p.turn_text as string, {
       engine: ctx.engine,
@@ -4491,18 +4586,22 @@ const extract_facts: Operation = {
 const recall: Operation = {
   name: 'recall',
   description:
-    'v0.31: query per-source hot memory (facts table). Filters by entity / since / session. Remote callers see only visibility=world facts. Returns most-recent first. v0.32 adds optional include_pending to return pending_consolidation_count alongside facts in one round trip.',
+    'MEMORY VERB (v1): retrieve saved facts/snippets — the protocol read verb. Filters hot-memory facts by entity / since / session_id; pass `query` to ALSO run hybrid search over pages (results[] arm); pass `budget_tokens` for server-side packing (response reports budget_used + dropped_count — never trims client-side). Remote callers see visibility=world facts only. Routing: for ONE known person/company/project card use `entity` (zero LLM); for broad questions needing reasoning use `synthesize` (expensive). Branch on structured fields (status/kind/evidence), never on prose. Every response carries protocol_version.',
   params: {
     entity: { type: 'string', description: 'Entity slug (canonical). Returns facts about this entity newest first.' },
-    since: { type: 'string', description: 'ISO datetime or duration shorthand (e.g. "8 hours ago"). Returns facts created since.' },
+    query: { type: 'string', description: 'MEMORY_VERBS v1: free-text retrieval over pages (hybrid search arm). Response adds results[] (slug, title, chunk, evidence, create_safety, provenance). Combinable with entity (both arms run). Degrades to keyword-only search when no embedding provider is configured (search_degraded notes it; never an error).' },
+    budget_tokens: { type: 'number', description: 'MEMORY_VERBS v1: server-side token budget (char/4 estimate). Facts pack first, then results. Response adds budget_tokens, budget_used, dropped_count.' },
+    since: { type: 'string', description: 'ISO 8601 datetime or duration shorthand (e.g. "8 hours ago"). Filters the FACTS arm only.' },
     session_id: { type: 'string', description: 'Source session id (e.g. topic-A). Returns facts captured in that session.' },
     include_expired: { type: 'boolean', description: 'When true, include expired_at IS NOT NULL rows. Default false.' },
     supersessions: { type: 'boolean', description: 'When true, return only the supersession audit log (expired_at + superseded_by both set).' },
-    limit: { type: 'number', description: 'Max rows to return. Default 50, cap 100.' },
+    limit: { type: 'number', description: 'Per-arm cap: max fact rows AND max search results. Default 50, cap 100.' },
     grep: { type: 'string', description: 'Substring filter on fact text (case-insensitive). Applied client-side after recall.' },
     include_pending: { type: 'boolean', description: 'v0.32: when true, response includes pending_consolidation_count (facts not yet promoted to takes by the dream-cycle consolidate phase). One round trip; backward-compatible (field omitted when false).' },
   },
   scope: 'read',
+  verb: true,
+  annotations: { title: 'recall (memory read)', readOnlyHint: true },
   handler: async (ctx, p) => {
     const sourceId = ctx.sourceId ?? 'default';
     const limit = typeof p.limit === 'number' ? p.limit : 50;
@@ -4573,8 +4672,58 @@ const recall: Operation = {
       }
     }
 
+    // ── MEMORY_VERBS v1 — query arm (G1B superset). Hybrid search over pages
+    // when `query` is present; degrades to keyword-only with a note (never an
+    // error) when no embedding provider is configured [F-B].
+    const queryText = typeof p.query === 'string' && p.query.trim().length > 0 ? p.query.trim() : null;
+    const budgetTokens =
+      typeof p.budget_tokens === 'number' && Number.isFinite(p.budget_tokens) && p.budget_tokens > 0
+        ? Math.floor(p.budget_tokens)
+        : null;
+
+    let searchResults: SearchResult[] = [];
+    let searchDegraded: string | undefined;
+    if (queryText) {
+      const searchScope = sourceScopeOpts(ctx);
+      if (!isAvailable('embedding')) {
+        const raw = await ctx.engine.searchKeyword(queryText, { limit, ...searchScope });
+        searchResults = dedupResults(raw);
+        stampEvidenceSafe(searchResults);
+        await stampContentFlags(ctx.engine, searchResults);
+        searchDegraded = 'keyword_only_no_embedding_provider';
+      } else {
+        searchResults = await hybridSearchCached(ctx.engine, queryText, {
+          limit,
+          expansion: false,
+          ...searchScope,
+        });
+      }
+      bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
+    }
+
+    // ── MEMORY_VERBS v1 — server-side budget packing. Facts pack first (cheap,
+    // high-precision one-liners, per-arm limit-capped so starvation is bounded),
+    // then search results take the remainder. packToBudget treats budget<=0 as
+    // a no-op, so an exhausted remainder must drop explicitly.
+    let packedFacts = rows;
+    let packedResults = searchResults;
+    let budgetUsed: number | undefined;
+    let droppedCount: number | undefined;
+    if (budgetTokens !== null) {
+      const factsPack = packToBudget(rows, r => estimateTokens(r.fact), budgetTokens);
+      packedFacts = factsPack.items;
+      const remaining = budgetTokens - factsPack.meta.used;
+      const resultsPack =
+        remaining > 0
+          ? packToBudget(searchResults, resultTokens, remaining)
+          : { items: [] as SearchResult[], meta: { budget: 0, used: 0, dropped: searchResults.length, kept: 0 } };
+      packedResults = resultsPack.items;
+      budgetUsed = factsPack.meta.used + resultsPack.meta.used;
+      droppedCount = factsPack.meta.dropped + resultsPack.meta.dropped;
+    }
+
     return {
-      facts: rows.map(r => ({
+      facts: packedFacts.map(r => ({
         id: r.id,
         fact: r.fact,
         kind: r.kind,
@@ -4594,9 +4743,33 @@ const recall: Operation = {
         source_session: r.source_session,
         confidence: r.confidence,
         created_at: r.created_at.toISOString(),
+        // MEMORY_VERBS v1 additive fields (G1B). `fact_id` is the opaque
+        // STRING id the `forget` verb accepts (legacy numeric `id` stays for
+        // pre-v1 consumers — legacy fields are frozen byte-equal). `provenance`
+        // is the protocol name for the stored source attribution.
+        fact_id: String(r.id),
+        provenance: r.source,
       })),
-      total: rows.length,
+      total: packedFacts.length,
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
+      // MEMORY_VERBS v1 envelope (G1B superset — additive on every response).
+      protocol_version: MEMORY_VERBS_VERSION,
+      ...(queryText
+        ? {
+            results: packedResults.map(r => ({
+              slug: r.slug,
+              title: r.title,
+              chunk: r.chunk_text,
+              evidence: r.evidence,
+              create_safety: r.create_safety,
+              provenance: r.slug,
+            })),
+            ...(searchDegraded ? { search_degraded: searchDegraded } : {}),
+          }
+        : {}),
+      ...(budgetTokens !== null
+        ? { budget_tokens: budgetTokens, budget_used: budgetUsed, dropped_count: droppedCount }
+        : {}),
     };
   },
 };
@@ -4655,6 +4828,65 @@ function parseSinceParam(raw: unknown): Date | null {
     return new Date(Date.now() - ms);
   }
   return null;
+}
+
+/**
+ * MEMORY_VERBS v1 — parse the `remember` verb's `ttl` param into a
+ * `valid_until` Date. Sibling of parseSinceParam, pointed FORWARD.
+ *
+ * Accepted forms (frozen in docs/protocol/MEMORY_VERBS_v1.md):
+ *   - relative duration shorthand: '30d', '12h', '45m', '90s' (also
+ *     spelled-out: '30 days', '12 hours') → now + duration
+ *   - absolute ISO 8601 date or datetime: '2026-07-12', '2026-07-12T00:00:00Z'
+ *
+ * Explicitly REJECTED with a self-correcting suggestion: ISO-8601 duration
+ * syntax ('P30D', 'PT12H') — agents that read "ISO 8601" as durations get a
+ * fix, not a mystery. Returns null for null/undefined/empty (= never expires).
+ * Throws verbError('invalid_params') on anything unparseable.
+ */
+export function parseTtlParam(raw: unknown): Date | null {
+  if (raw == null) return null;
+  if (typeof raw !== 'string') {
+    throw verbError(
+      'invalid_params',
+      `ttl must be a string, got ${typeof raw}.`,
+      'Pass a duration like "30d" or "12h", or an absolute ISO 8601 timestamp like "2026-07-12T00:00:00Z".',
+    );
+  }
+  const s = raw.trim();
+  if (!s) return null;
+
+  // ISO-8601 DURATION syntax is a documented trap — reject with the fix.
+  if (/^P(T|\d)/i.test(s) && /^P(?:\d+[YMWD])*(?:T(?:\d+[HMS])+)?$/i.test(s)) {
+    throw verbError(
+      'invalid_params',
+      `ttl "${s}" looks like an ISO-8601 duration, which is not accepted.`,
+      `Use the shorthand form instead (e.g. "${s.replace(/^PT?/i, '').toLowerCase()}" style: "30d", "12h"), or an absolute ISO 8601 expiry timestamp.`,
+    );
+  }
+
+  // Relative duration shorthand → now + duration.
+  const dur = s.match(/^(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hr|hours?|d|days?)$/i);
+  if (dur) {
+    const n = parseInt(dur[1], 10);
+    const unit = dur[2].toLowerCase();
+    const ms =
+      unit.startsWith('s') ? n * 1000 :
+      unit.startsWith('m') ? n * 60 * 1000 :
+      unit.startsWith('h') ? n * 60 * 60 * 1000 :
+      n * 24 * 60 * 60 * 1000;
+    return new Date(Date.now() + ms);
+  }
+
+  // Absolute ISO 8601 date or datetime.
+  const iso = Date.parse(s);
+  if (Number.isFinite(iso)) return new Date(iso);
+
+  throw verbError(
+    'invalid_params',
+    `Cannot parse ttl "${s}".`,
+    'Pass a duration like "30d" or "12h", or an absolute ISO 8601 timestamp like "2026-07-12T00:00:00Z". Omit ttl for a fact that never expires.',
+  );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -5803,6 +6035,9 @@ const ontology_propose: Operation = {
     visibility: { type: 'string', enum: ['private', 'world'], description: 'Default private.' },
   },
   handler: async (ctx, p) => {
+    // [ENG-8] Same unset-vs-explicit ladder as extract_facts: explicit
+    // caller visibility wins; unset resolves facts.default_visibility.
+    const { resolveVisibilityParam } = await import('./facts/visibility.ts');
     return ctx.engine.mergeOntologyFact({
       entitySlug: String(p.entity),
       dimension: String(p.dimension),
@@ -5811,7 +6046,7 @@ const ontology_propose: Operation = {
       source: typeof p.source === 'string' && p.source ? p.source : 'manual',
       validFrom: typeof p.valid_from === 'string' ? p.valid_from : undefined,
       validTo: typeof p.valid_to === 'string' ? p.valid_to : undefined,
-      visibility: p.visibility === 'world' ? 'world' : 'private',
+      visibility: await resolveVisibilityParam(ctx.engine, p.visibility),
       sourceId: ctx.sourceId,
     });
   },
@@ -6137,6 +6372,10 @@ const extraction_review: Operation = {
 };
 
 export const operations: Operation[] = [
+  // MEMORY_VERBS v1 (Cathedral 1) — remember/entity/synthesize/forget live in
+  // verbs.ts; the fifth verb is the extended `recall` op below. Spread first
+  // so `--surface verbs` agents see them at the top of the tool list.
+  ...verbOperations,
   // Page CRUD
   get_page, put_page, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)

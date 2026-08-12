@@ -21,12 +21,37 @@ import { effectiveConfidence } from './decay.ts';
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_TOP_K = 10;
 
+/**
+ * Hard bound on cache entries. The key folds caller-controlled
+ * `_meta.session_id`, so without a bound a remote caller could grow the map
+ * without limit by minting fresh session ids per call. On overflow the entry
+ * with the OLDEST expiry is evicted (it dies soonest anyway; with a uniform
+ * TTL this is insertion order).
+ */
+export const HOT_MEMORY_CACHE_MAX_ENTRIES = 1000;
+
 interface CacheEntry {
   expiresAt: number;
   payload: Record<string, unknown> | undefined;
 }
 
 const _cache = new Map<string, CacheEntry>();
+
+/** Bounded set: evict the oldest-expiry entry when inserting at capacity. */
+function cacheSet(key: string, entry: CacheEntry): void {
+  if (!_cache.has(key) && _cache.size >= HOT_MEMORY_CACHE_MAX_ENTRIES) {
+    let oldestKey: string | null = null;
+    let oldestExpiry = Infinity;
+    for (const [k, v] of _cache) {
+      if (v.expiresAt < oldestExpiry) {
+        oldestExpiry = v.expiresAt;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey !== null) _cache.delete(oldestKey);
+  }
+  _cache.set(key, entry);
+}
 
 /**
  * Build the `_meta.brain_hot_memory` payload for an MCP tool-call response.
@@ -47,7 +72,13 @@ export async function getBrainHotMemoryMeta(
   if (name === 'recall' || name === 'extract_facts' || name === 'forget_fact') return undefined;
 
   const sourceId = ctx.sourceId ?? 'default';
-  const sessionId = (ctx as { source_session?: string }).source_session
+  // CX2-11: session identity is the TYPED OperationContext.sessionId field,
+  // set from MCP `_meta.session_id` at the dispatch boundary. The old ad-hoc
+  // `source_session` read is kept as a fallback for legacy embedders, but no
+  // shipped transport ever set it — without the typed field every caller
+  // collapsed onto the null-session cache key.
+  const sessionId = ctx.sessionId
+    ?? (ctx as { source_session?: string }).source_session
     ?? null;
   const allowListHash = hashAllowList(ctx.takesHoldersAllowList);
   const cacheKey = `${sourceId}::${sessionId ?? '_'}::${allowListHash}`;
@@ -57,8 +88,12 @@ export async function getBrainHotMemoryMeta(
 
   // Cache hit?
   const cached = _cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.payload;
+  if (cached) {
+    if (cached.expiresAt > Date.now()) return cached.payload;
+    // Expired: evict BEFORE the rebuild. If the rebuild below throws (the
+    // caller's try/catch absorbs it), the dead entry must not linger — with
+    // remote-influencable keys, lingering corpses defeat the size bound.
+    _cache.delete(cacheKey);
   }
 
   // Build a fresh payload. Visibility tier: remote → world-only;
@@ -78,7 +113,7 @@ export async function getBrainHotMemoryMeta(
     });
   }
   if (rows.length === 0) {
-    _cache.set(cacheKey, { expiresAt: Date.now() + ttl, payload: undefined });
+    cacheSet(cacheKey, { expiresAt: Date.now() + ttl, payload: undefined });
     return undefined;
   }
 
@@ -104,7 +139,7 @@ export async function getBrainHotMemoryMeta(
       })),
     },
   };
-  _cache.set(cacheKey, { expiresAt: Date.now() + ttl, payload });
+  cacheSet(cacheKey, { expiresAt: Date.now() + ttl, payload });
   return payload;
 }
 
@@ -124,9 +159,28 @@ export function __resetHotMemoryCacheForTests(): void {
   _cache.clear();
 }
 
-/** Stable hash of the (sorted) allow-list. Mirrors the auth contract. */
+/** Test helper: direct cache access (expiry mutation + size/eviction pins). */
+export function __hotMemoryCacheForTests(): Map<string, { expiresAt: number; payload: Record<string, unknown> | undefined }> {
+  return _cache;
+}
+
+/**
+ * Stable hash of the (sorted) allow-list. Mirrors the auth contract.
+ *
+ * The allow-list affects cache IDENTITY only — the payload itself is filtered
+ * by fact visibility (see the `visibility` tier above), never by the takes
+ * allow-list. Keeping `[]` (explicit deny-all grant) distinct from undefined
+ * (no grant) is insurance so a future allowlist-dependent payload is born
+ * safe, not a claim that `[]` suppresses hot memory today.
+ *
+ * Encoding is collision-free: undefined maps to a token no JSON array can
+ * produce, and every concrete list serializes via JSON.stringify. A bare
+ * `sorted.join('|')` would have collided `['a|b']` with `['a','b']`, and bare
+ * sentinels would have collided `['(empty)']` with `[]` — so a holder value
+ * that happened to equal a sentinel could not share a cache bucket it
+ * shouldn't.
+ */
 function hashAllowList(list: string[] | undefined): string {
-  if (!list || list.length === 0) return '_';
-  const sorted = [...list].sort();
-  return sorted.join('|');
+  if (!list) return 'none';
+  return JSON.stringify([...list].sort());
 }

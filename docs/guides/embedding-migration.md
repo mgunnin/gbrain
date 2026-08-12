@@ -7,8 +7,8 @@ sunsetting provider (for example ZeroEntropy's hosted API, which shuts down
 but it is provider-agnostic: any configured `provider:model` works as a
 target.
 
-Also reachable as `gbrain retrieval-upgrade` (the name `doctor` and the
-README reference).
+Also reachable as `gbrain retrieval-upgrade` — the alias that `gbrain doctor`
+repair hints and the README point at.
 
 ## Quick start
 

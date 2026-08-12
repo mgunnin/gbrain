@@ -5271,6 +5271,14 @@ export interface SyncStatusReportSource {
   local_path: string | null;
   sync_enabled: boolean;
   last_sync_at: string | null;
+  /** Raw wall-clock hours since the last successful sync — the honest human
+   * number. Distinct from staleness_hours, which is threshold-relative. */
+  hours_since_last_sync: number | null;
+  /** Threshold-relative lag driving staleness_class. For a source whose
+   * content is OLDER than its last sync this is the ceiling-ramped value
+   * (see lagFromContentMs), which deliberately under-reads raw wall-clock so
+   * the warn tier fires before the fail tier — display hours_since_last_sync
+   * when a human asks "how long since we synced". */
   staleness_hours: number | null;
   staleness_class: 'fresh' | 'stale' | 'severe' | 'unknown';
   last_commit: string | null;
@@ -5446,6 +5454,9 @@ export async function buildSyncStatusReport(
       now,
     );
     const stalenessHours = lagSeconds === null ? null : lagSeconds / 3600;
+    const hoursSinceLastSync = lastSyncMs !== null && Number.isFinite(lastSyncMs)
+      ? Math.round(((now - lastSyncMs) / 3600_000) * 10) / 10
+      : null;
     let stalenessClass: 'fresh' | 'stale' | 'severe' | 'unknown' = 'unknown';
     if (stalenessHours !== null) {
       if (stalenessHours < 24) stalenessClass = 'fresh';
@@ -5464,6 +5475,7 @@ export async function buildSyncStatusReport(
       local_path: src.local_path,
       sync_enabled: cfgEntry.syncEnabled !== false,
       last_sync_at: lastSyncIso,
+      hours_since_last_sync: hoursSinceLastSync,
       staleness_hours: stalenessHours === null ? null : Math.round(stalenessHours * 10) / 10,
       staleness_class: stalenessClass,
       last_commit: row.last_commit,

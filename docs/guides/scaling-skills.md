@@ -127,9 +127,9 @@ you can use as a reference shape. The skillpack story for distributing
 your own resolvers across machines is covered in
 [skillpacks as scaffolding](skillpacks-as-scaffolding.md).
 
-## The compact list format (v0.41.7.0)
+## The compact list format
 
-GBrain's resolver parser used to require markdown tables:
+GBrain's resolver parser originally required markdown tables:
 
 ```markdown
 | Trigger | Skill |
@@ -146,14 +146,14 @@ format that scales better:
 - **flight-tracker**: track my flight | flight status | when does my flight land
 ```
 
-Before v0.41.7.0, `gbrain doctor` only spoke the table dialect. On a
-306-skill compact-format resolver, the doctor reported every skill as
-unreachable: **238 FAIL errors on every doctor run**. The parser was
-silently treating the compact dialect as zero skills.
+When `gbrain doctor` only spoke the table dialect, a 306-skill
+compact-format resolver reported every skill as unreachable: **238 FAIL
+errors on every doctor run**. The parser was silently treating the compact
+dialect as zero skills.
 
-v0.41.7.0 ships dual-format support. The same `parseResolverEntries`
-function reads both table rows and list rows in the same file, with the
-v0.31.7 multi-resolver merge (skillpack `skills/RESOLVER.md` + workspace
+Today the parser supports both. The same `parseResolverEntries`
+function reads table rows and list rows in the same file, with the
+multi-resolver merge (skillpack `skills/RESOLVER.md` + workspace
 `../AGENTS.md`) folding everything into one unified view. Run `gbrain doctor`
 and the 238 FAILs collapse to 0.
 
@@ -267,8 +267,7 @@ I initially converted my resolver from a clean list format to a table
 format because the validator only spoke tables. That was wrong. When a
 tool fails against valid data, the right move is to fix the tool, not
 reshape the data. The list format was correct, compact, readable, easy
-to maintain. The parser needed to support both shapes. v0.41.7.0 is
-that fix.
+to maintain. The parser needed to support both shapes — and now it does.
 
 The same principle applies everywhere in agent systems. Your SKILL.md is
 the source of truth. Your AGENTS.md is the source of truth. Your resolver

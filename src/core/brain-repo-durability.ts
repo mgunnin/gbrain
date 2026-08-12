@@ -28,7 +28,7 @@
  */
 
 import {
-  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, appendFileSync,
+  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, renameSync,
 } from 'fs';
 import { join, dirname, relative, isAbsolute } from 'path';
 import { execFileSync, execSync } from 'child_process';
@@ -38,6 +38,7 @@ import {
 } from './git-remote.ts';
 import { findResolverFile, RESOLVER_FILENAMES } from './resolver-filenames.ts';
 import { redactSecretsInText } from './minions/handlers/shell-redact.ts';
+import { ensureGbrainHome, resolveGbrainHome } from './gbrain-home.ts';
 // Static import → bundled into the --compile binary so the taxonomy never drifts
 // and needs no runtime skills/ directory.
 import filingRulesDoc from '../../skills/_brain-filing-rules.json';
@@ -92,8 +93,12 @@ const AGENTS_END = '<!-- END gbrain-brain-durability -->';
 const HELPER_REL = 'scripts/brain-commit-push.sh';
 const CRED_MANAGED_KEY = 'gbrain.durability.managedcredential';
 
+/** CX2-8: resolves through the single gbrain-home choke point (config.ts
+ *  semantics — GBRAIN_HOME is a PARENT dir, `.gbrain` is appended). The
+ *  bash templates below use the matching `${GBRAIN_HOME:-$HOME}/.gbrain`
+ *  spelling so the shell and TS sides agree on where brain-push.log lives. */
 function gbrainHome(): string {
-  return process.env.GBRAIN_HOME || join(process.env.HOME || '', '.gbrain');
+  return resolveGbrainHome();
 }
 
 /** Resolve the gbrain CLI path for the cron wrapper (inlined to avoid a
@@ -124,14 +129,39 @@ function pushLogPath(): string {
   return join(gbrainHome(), 'brain-push.log');
 }
 
+/** Rotate the push log at 1MB (keep one predecessor as `.1`). */
+const PUSH_LOG_MAX_BYTES = 1024 * 1024;
+
+/**
+ * S3#10: keep `brain-push.log` 0600 and bounded. The bash hook/helper append
+ * to it forever; without maintenance it grows unbounded and (pre-fix) was
+ * created with the umask default. Called by every harden run (never in
+ * dry-run — a preview must not mutate, #3736). Best-effort: log maintenance
+ * can never fail a harden. Exported for tests.
+ */
+export function maintainPushLog(): void {
+  try {
+    const p = pushLogPath();
+    if (!existsSync(p)) return;
+    try { chmodSync(p, 0o600); } catch { /* */ }
+    if (statSync(p).size > PUSH_LOG_MAX_BYTES) {
+      renameSync(p, `${p}.1`); // overwrite any previous rotation
+      writeFileSync(p, '', { mode: 0o600 });
+    }
+  } catch { /* best-effort */ }
+}
+
 // ── Shared bash push-retry template (DRY at the TS source — D7) ──────────────
 // Rendered into BOTH the (committed) helper and the (local, untracked) hook so
 // there is one source of truth without the hook executing repo-controlled code.
 const PUSH_RETRY = `# --- gbrain durability push-retry (generated; one source of truth) ---
 brain_push() {
   _branch="$1"
-  _log="\${GBRAIN_HOME:-$HOME/.gbrain}/brain-push.log"
+  # CX2-8: GBRAIN_HOME is a PARENT dir (matches config.ts semantics — .gbrain appended)
+  _log="\${GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log"
   mkdir -p "$(dirname "$_log")" 2>/dev/null || true
+  # S3#10: the push log may capture remote errors — never group/other readable.
+  [ -e "$_log" ] || { : >"$_log" 2>/dev/null && chmod 600 "$_log" 2>/dev/null; } || true
   _gd="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
   # Serialize concurrent pushes (commit bursts) so they coalesce instead of a
   # rebase-retry herd. No-op if flock is unavailable.
@@ -161,7 +191,7 @@ set -euo pipefail
 
 _branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 if [ "$_branch" = "HEAD" ]; then
-  echo "$(date -u +%FT%TZ) [push] detached HEAD; skip" >> "\${GBRAIN_HOME:-$HOME/.gbrain}/brain-push.log" 2>/dev/null || true
+  echo "$(date -u +%FT%TZ) [push] detached HEAD; skip" >> "\${GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log" 2>/dev/null || true
   exit 0
 fi
 
@@ -207,7 +237,7 @@ if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
 git commit -m "$_msg"
 
 if brain_push "$_branch"; then exit 0; fi
-echo "PUSH FAILED — commit is local-only, NEEDS ATTENTION (see ${'$'}{GBRAIN_HOME:-$HOME/.gbrain}/brain-push.log)" >&2
+echo "PUSH FAILED — commit is local-only, NEEDS ATTENTION (see ${'$'}{GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log)" >&2
 exit 4
 `;
 }
@@ -462,8 +492,7 @@ function wireRepoCredential(repoPath: string, pat: string, dryRun: boolean): { s
   }
   if (dryRun) return { status: 'fixed', detail: 'would wire repo-scoped credential (dry-run)' };
 
-  mkdirSync(dirname(store), { recursive: true, mode: 0o700 });
-  try { chmodSync(gbrainHome(), 0o700); } catch { /* */ }
+  ensureGbrainHome(); // S3#10/CX2-8: single choke point — creates + chmods 0700
   let body = existsSync(store) ? readFileSync(store, 'utf-8') : '';
   if (!body.split('\n').some(l => l === line)) {
     if (body.length && !body.endsWith('\n')) body += '\n';
@@ -622,6 +651,22 @@ function isGitRepo(repoPath: string): boolean {
   return existsSync(join(repoPath, '.git'));
 }
 
+/**
+ * CX2-3: resolve the repo ROOT for any directory inside it (the sync.ts
+ * `discoverGitRoot` precedent). A workspace layout registers `repo/brain` as
+ * the source dir while the enclosing repo owns `.git` — hardening must
+ * assert/operate on the PARENT repo, not fail on the subdir's missing `.git`.
+ */
+function resolveRepoRoot(path: string): string {
+  try {
+    return execFileSync('git', ['-C', path, 'rev-parse', '--show-toplevel'], {
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+    }).toString().trim();
+  } catch {
+    throw new Error(`not a git repo: ${path}`);
+  }
+}
+
 function currentBranch(repoPath: string): string {
   try {
     return execFileSync('git', ['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'], {
@@ -652,7 +697,7 @@ function pullDetail(o: PullOutcome): { status: StepStatus; detail: string } {
  * already-hardened repo produces all ok/skipped and NO new commit.
  */
 export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityReport> {
-  const { repoPath, sourceId } = opts;
+  const { sourceId } = opts;
   const dryRun = !!opts.dryRun;
   const installCron = opts.installCron !== false;
   const verify = opts.verify !== false;
@@ -660,7 +705,10 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
   const redact = opts.pat ? (s: string) => redactSecretsInText(s, new Map([['github_pat', opts.pat!]])) : (s: string) => s;
   const log = (l: string) => opts.logger?.(redact(l));
 
-  if (!isGitRepo(repoPath)) throw new Error(`not a git repo: ${repoPath}`);
+  // CX2-3: throws `not a git repo: <path>` when the dir isn't inside one;
+  // otherwise every subsequent step operates on the enclosing repo's root.
+  const repoPath = resolveRepoRoot(opts.repoPath);
+  if (!dryRun) maintainPushLog(); // S3#10 — 0600 + 1MB rotation
 
   const branch = opts.branch || detectDefaultBranch(repoPath);
   const steps: DurabilityStep[] = [];

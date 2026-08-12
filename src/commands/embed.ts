@@ -492,7 +492,46 @@ export function parsePaceArgs(
   return { ...(perCallMode !== undefined && { perCallMode }), ...(perCall && { perCall }) };
 }
 
+/**
+ * Keyless brains: does this invocation qualify for the stale-mode CLEAN
+ * refusal (zero-failure result → exit 0)? The documented always-current chain
+ * for external agent schedulers is `gbrain sync ... && gbrain embed --stale`
+ * (docs/guides/live-sync.md, INSTALL_FOR_AGENTS.md Step 7) — a hard exit 1
+ * here broke that chain on every brain installed keyless (init's no-embedding
+ * mode), which docs/operations/headless-install.md calls a first-class
+ * supported end state whose embed paths "refuse cleanly". Same class as
+ * sync's resolveNoEmbed sentinel (sync.ts), same remedy. Deliberately NARROW:
+ * only the stale spelling (the chain's). An explicit slug, a slugs list, or
+ * the all flag is an explicit request for something impossible on a keyless
+ * brain and keeps exiting 1 via EmbeddingDisabledError. Note the slugs-list
+ * exclusion mirrors the dispatch precedence below: a slugs flag wins over
+ * stale, so a combined invocation is an explicit-slugs run, not a stale run.
+ */
+export function isKeylessStaleRefusal(args: string[], embeddingDisabled: boolean | undefined): boolean {
+  return args.includes('--stale')
+    && !args.includes('--all')
+    && !args.includes('--slugs')
+    && !args.includes('--dry-run')
+    && embeddingDisabled === true;
+}
+
 export async function runEmbed(engine: BrainEngine, args: string[]): Promise<EmbedResult | undefined> {
+  // Keyless clean refusal — see isKeylessStaleRefusal. Checked BEFORE the
+  // background block so we never queue a job that can only fail. stderr only;
+  // stdout stays empty like every other embed outcome (embed has no JSON
+  // result surface — do not invent one here).
+  if (isKeylessStaleRefusal(args, loadConfig()?.embedding_disabled)) {
+    process.stderr.write(
+      '[embed] Embeddings are disabled on this brain (keyless install). '
+      + 'Nothing to backfill; keyword search keeps working. '
+      + 'Enable later: set embedding_model via gbrain config, then re-run gbrain init with the force flag.\n',
+    );
+    return {
+      embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0,
+      pages_processed: 0, failures: 0, failure_samples: [], dryRun: false,
+    };
+  }
+
   // v0.36+ T7: --background submits via Minion queue, returns job_id to
   // stdout, exits. Same semantics in TTY and cron (D9).
   if (args.includes('--background')) {
@@ -1057,7 +1096,11 @@ async function embedAllStale(
   if (dryRun) {
     result.would_embed += staleCount;
     result.total_chunks += staleCount;
-    if (onProgress) onProgress(1, 1, 0);
+    // No progress event: a dry run reads a count and processes zero pages, so
+    // there is no page total to report. The previous synthetic onProgress(1,1,0)
+    // made `embed.pages` claim total:1 next to a summary naming a much larger
+    // stale count. docs/progress-events.md allows omitting `total` when it is
+    // not known up front; it does not allow asserting a wrong one.
     if (!staleOpts?.quiet) slog(`[dry-run] Would embed ${staleCount} stale chunks`);
     return;
   }

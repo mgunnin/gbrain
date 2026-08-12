@@ -27,7 +27,7 @@ import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
-import { parseLegacyTokenScope } from './legacy-token-scope.ts';
+import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions } from './legacy-token-scope.ts';
 
 /**
  * A slug-prefix write binding is only meaningful if every entry actually
@@ -795,19 +795,15 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         UPDATE access_tokens SET last_used_at = now() WHERE token_hash = ${tokenHash}
       `;
       const name = legacyRows[0].name as string;
-      const permissionsRaw = legacyRows[0].permissions;
-      let permissions: unknown = permissionsRaw;
-      if (typeof permissionsRaw === 'string') {
-        try {
-          permissions = JSON.parse(permissionsRaw);
-        } catch {
-          permissions = undefined;
-        }
-      }
-      const sourceGrant = permissions && typeof permissions === 'object'
-        ? (permissions as Record<string, unknown>).source_id
-        : undefined;
-      const { sourceId, allowedSources } = parseLegacyTokenScope(sourceGrant);
+      const permissions = coerceLegacyPermissions(legacyRows[0].permissions);
+      const { sourceId, allowedSources } = parseLegacyTokenScope(permissions?.source_id);
+      // #2529: thread the stored takes-holders grant, mirroring the legacy
+      // HTTP transport's validateToken (both decode via coerceLegacyPermissions
+      // + parseTakesHoldersAllowList so they cannot drift). Undefined (no array
+      // grant, or the pre-v29 no-permissions-column fallback above) → the /mcp
+      // dispatch site defaults to the fail-closed ['world']. An explicit []
+      // grant is preserved as deny-all.
+      const takesHoldersAllowList = parseTakesHoldersAllowList(permissions?.takes_holders);
       return {
         token,
         clientId: name,
@@ -819,6 +815,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // allowedSources for federated reads, matching legacy HTTP transport.
         sourceId,
         allowedSources,
+        takesHoldersAllowList,
       } as CoreAuthInfo as SdkAuthInfo;
     }
 

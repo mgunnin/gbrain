@@ -99,8 +99,31 @@ const CODE_EXTENSIONS = new Set<string>([
  * Input format (tab-separated):
  *   A       path/to/new-file.md
  *   M       path/to/modified-file.md
+ *   T       path/to/retyped-file.md      (file <-> symlink; content changed)
  *   D       path/to/deleted-file.md
  *   R100    old/path.md     new/path.md
+ *
+ * Status coverage, against the options gbrain actually passes (name-status with
+ * `-M` only, see `sync-delta.ts` — note NO `-C` copy detection):
+ *   A/M/D/R — the everyday statuses.
+ *   T       — TYPECHANGE. Reachable in normal operation: replacing a file with
+ *             a symlink (or vice versa) emits `T`, and it was silently dropped,
+ *             so the change never reached the index until something else
+ *             touched the path. Treated as `modified`: the path still exists and
+ *             its blob changed, which is exactly what re-import handles. (When a
+ *             file becomes a symlink, import-file SKIPS symlinks by design —
+ *             the exfil guard — so the old regular-file content stays indexed;
+ *             routing the typechange to delete-then-skip is a filed follow-up.)
+ *   C       — COPY. Unreachable without `-C`, handled defensively.
+ *   U       — UNMERGED. Only in a conflicted worktree, which sync does not run
+ *             against; handled defensively so a conflicted tree degrades to
+ *             "re-import this path" rather than silently skipping it.
+ *
+ * NOTE for future editors: git option names appear here WITHOUT the leading
+ * double-dash on purpose. The CLI flag-registry generator string-scans module
+ * source including comments, so a bare double-dash token in prose registers as
+ * a real, accepted CLI flag on every command that imports this file. Pinned by
+ * `test/cli-flag-validation.test.ts`.
  */
 export function buildSyncManifest(gitDiffOutput: string): SyncManifest {
   const manifest: SyncManifest = {
@@ -120,20 +143,27 @@ export function buildSyncManifest(gitDiffOutput: string): SyncManifest {
     if (parts.length < 2) continue;
 
     const action = parts[0];
-    const path = parts[parts.length === 3 ? 2 : 1]; // For renames, new path is 3rd column
 
     if (action === 'A') {
-      manifest.added.push(path);
-    } else if (action === 'M') {
-      manifest.modified.push(path);
+      manifest.added.push(parts[1]);
+    } else if (action === 'M' || action === 'T' || action === 'U') {
+      // T (typechange) and U (unmerged) both mean "this path exists and its
+      // content is not what we imported" — the same remedy as M.
+      manifest.modified.push(parts[1]);
     } else if (action === 'D') {
       manifest.deleted.push(parts[1]);
-    } else if (action.startsWith('R')) {
-      // Rename: R100\told-path\tnew-path
+    } else if (action.startsWith('R') || action.startsWith('C')) {
+      // Rename/copy: R100\told-path\tnew-path. Copy is unreachable without -C,
+      // but if the flags ever change, the destination must still be imported.
       const oldPath = parts[1];
       const newPath = parts[2];
       if (oldPath && newPath) {
-        manifest.renamed.push({ from: oldPath, to: newPath });
+        if (action.startsWith('C')) {
+          // A copy leaves the source in place — only the destination is new.
+          manifest.added.push(newPath);
+        } else {
+          manifest.renamed.push({ from: oldPath, to: newPath });
+        }
       }
     }
   }

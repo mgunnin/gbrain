@@ -33,6 +33,32 @@ describe('buildSyncManifest', () => {
     expect(manifest.renamed).toEqual([{ from: 'people/old.md', to: 'people/new.md' }]);
   });
 
+  test('T (typechange) counts as modified — was silently dropped', () => {
+    // file <-> symlink. Reachable with the flags gbrain actually passes
+    // (`--name-status -M`). Dropping it meant the change never reached the
+    // index until some later commit happened to touch the same path.
+    const manifest = buildSyncManifest(`T\tpeople/now-a-symlink.md`);
+    expect(manifest.modified).toEqual(['people/now-a-symlink.md']);
+    expect(manifest.added).toEqual([]);
+    expect(manifest.deleted).toEqual([]);
+  });
+
+  test('U (unmerged) degrades to modified rather than vanishing', () => {
+    // Only reachable in a conflicted worktree, which sync does not run against.
+    // Defensive: re-import beats silently skipping.
+    expect(buildSyncManifest(`U\tpeople/conflicted.md`).modified).toEqual(['people/conflicted.md']);
+  });
+
+  test('C (copy) imports the destination — unreachable today, defensive', () => {
+    // Requires -C/--find-copies, which gbrain does not pass. If the flags ever
+    // change, the copy destination is a NEW path that must be imported, and the
+    // source is untouched — so it is an add, not a rename.
+    const manifest = buildSyncManifest(`C100\tpeople/src.md\tpeople/copy.md`);
+    expect(manifest.added).toEqual(['people/copy.md']);
+    expect(manifest.renamed).toEqual([]);
+    expect(manifest.deleted).toEqual([]);
+  });
+
   test('handles empty diff', () => {
     const manifest = buildSyncManifest('');
     expect(manifest.added).toEqual([]);

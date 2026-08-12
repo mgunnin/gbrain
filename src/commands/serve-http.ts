@@ -30,8 +30,10 @@ import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
+import { normalizeSourceInput, normalizeFederatedReadInput } from '../core/source-id.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
+import { filterOpsForSurface } from '../mcp/surface.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildError, serializeError } from '../core/errors.ts';
@@ -474,6 +476,12 @@ interface ServeHttpOptions {
    * tracking the regenerated value through other means.
    */
   suppressBootstrapToken?: boolean;
+  /**
+   * MEMORY_VERBS v1: tool-surface mode. 'verbs' = exactly the five protocol
+   * verbs; 'full' (default) = every non-localOnly operation. Enforced on the
+   * tool list AND in dispatch (fail-closed).
+   */
+  surface?: 'verbs' | 'full';
   /**
    * #2624: force-print the generated admin bootstrap token even on a
    * non-TTY (containerized) start. By default the raw token is only printed
@@ -1652,7 +1660,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       //     and other malformed inputs
       // normalizeScopesInput handles all four valid shapes (string, string[],
       // missing, empty) and rejects the rest with a structured 400.
-      const { name, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
+      const { name, source, federatedRead, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
       const rawScopes = (req.body as Record<string, unknown>).scopes ?? (req.body as Record<string, unknown>).scope;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
       let scopeString: string;
@@ -1684,8 +1692,27 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         });
         return;
       }
+      // v0.41.x: honor optional `source` (write source_id) and `federatedRead`
+      // (read source set) from the request body, mirroring the CLI's
+      // `--source` / `--federated-read` flags. Omitting both preserves the
+      // historical behavior (source_id='default', federated_read=[source_id]).
+      // Pre-fix this endpoint hardcoded 'default'/undefined, so an admin SPA or
+      // a proxy could never mint a client bound to a non-default brain source
+      // over HTTP — only the CLI could. Validated here for a structured 400.
+      let sourceId: string;
+      let federatedReadIds: string[] | undefined;
+      try {
+        sourceId = normalizeSourceInput(source);
+        federatedReadIds = normalizeFederatedReadInput(federatedRead);
+      } catch (e) {
+        res.status(400).json({
+          error: 'invalid_source',
+          message: e instanceof Error ? e.message : String(e),
+        });
+        return;
+      }
       const result = await oauthProvider.registerClientManual(
-        name, grants, scopeString, uris, 'default', undefined, validatedAuthMethod,
+        name, grants, scopeString, uris, sourceId, federatedReadIds, validatedAuthMethod,
       );
       // Set per-client TTL if specified
       if (tokenTtl && Number(tokenTtl) > 0) {
@@ -1839,7 +1866,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // MCP tool calls (bearer auth + scope enforcement)
   // ---------------------------------------------------------------------------
-  const mcpOperations = operations.filter(op => !op.localOnly);
+  // MEMORY_VERBS v1: surface filter applies AFTER the localOnly filter; the
+  // same set feeds dispatch as allowedOps so hidden ops are uncallable, not
+  // just unlisted [c2].
+  const surface = options.surface ?? 'full';
+  const mcpOperations = filterOpsForSurface(operations.filter(op => !op.localOnly), surface);
+  const surfaceAllowedOps: ReadonlySet<string> | undefined =
+    surface === 'full' ? undefined : new Set(mcpOperations.map(o => o.name));
 
   // v0.36.x #1076: MCP Streamable HTTP spec — GET /mcp opens an optional SSE
   // backchannel for server-initiated messages. gbrain's transport is stateless
@@ -1902,6 +1935,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             ),
             required: Object.entries(op.params).filter(([, v]) => v.required).map(([k]) => k),
           },
+          // MEMORY_VERBS v1: ToolAnnotations emitted only when the op defines
+          // them — existing tools stay byte-identical (mirrors buildToolDefs).
+          ...(op.annotations ? { annotations: op.annotations } : {}),
         })),
       };
     });
@@ -2004,8 +2040,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // injection via the metaHook. HTTP-specific concerns (mcp_request_log
       // persistence + SSE broadcast) stay here; the dispatcher returns the
       // ToolResult and we read isError + _meta to pick the right branch.
-      const tokenAllowList = (authInfo as AuthInfo & { takesHoldersAllowList?: string[] }).takesHoldersAllowList
-        ?? ['world'];
+      // #2529: takesHoldersAllowList is a typed AuthInfo field populated by
+      // verifyAccessToken from access_tokens.permissions.takes_holders for
+      // legacy bearer tokens ([] preserved as deny-all). The fail-closed
+      // ['world'] default covers OAuth-client tokens (no per-client storage
+      // yet — see TODOS.md) and pre-v29 brains (no permissions column →
+      // isUndefinedColumnError fallback in verifyAccessToken).
+      const tokenAllowList = authInfo.takesHoldersAllowList ?? ['world'];
       // v0.34.1 (#861, D13): AuthInfo.sourceId is now a real typed field
       // populated from oauth_clients.source_id (migration v60 backfilled
       // NULL → 'default'). Pre-fix this site cast through AuthInfo and
@@ -2022,6 +2063,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           takesHoldersAllowList: tokenAllowList,
           sourceId: tokenSourceId,
           metaHook: getBrainHotMemoryMeta,
+          // MEMORY_VERBS v1: fail-closed surface enforcement + usage attribution.
+          ...(surfaceAllowedOps ? { allowedOps: surfaceAllowedOps } : {}),
+          surface,
           // v0.31 follow-up fix: thread auth so the whoami op (and any
           // future scope-aware handlers) can introspect the caller. The
           // original D12/eE1 refactor moved dispatch into dispatchToolCall

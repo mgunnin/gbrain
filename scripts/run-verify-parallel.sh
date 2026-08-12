@@ -45,6 +45,7 @@ CHECKS=(
   "check:no-tracked-symlinks"
   "check:test-isolation"
   "check:wasm"
+  "check:pglite-embedded"
   "check:admin-build"
   "check:admin-scope-drift"
   "check:cli-exec"
@@ -67,6 +68,8 @@ CHECKS=(
   "check:batch-audit-site"
   "check:engine-dynamic-import"
   "check:worker-lock-renewal-shape"
+  "check:bootstrap-tag"
+  "check:bootstrap-templates"
   "typecheck"
 )
 

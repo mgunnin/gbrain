@@ -2,8 +2,17 @@
  * v0.32.3 search-lite telemetry rollup writer.
  *
  * Architecture decision (D2 in the plan, [CDX-19]): per-process in-memory
- * bucket, flushed periodically (60s OR 100 calls, whichever first) AND on
- * process exit via beforeExit/SIGINT/SIGTERM with a 2-second timeout cap.
+ * bucket, flushed on a best-effort basis (60s timer, or FLUSH_THRESHOLD_CALLS
+ * records — the latter is a trigger, not a guarantee: a threshold-crossing
+ * record that arrives while a flush is in flight coalesces onto it and does
+ * not drain the new bucket, so a buffer can exceed the threshold). There is
+ * deliberately NO flush on process exit — `ensureExitHook` below documents why
+ * the beforeExit/SIGINT/SIGTERM drain was removed. Consequence: anything still
+ * buffered when the process exits is lost, and so is a snapshot handed to an
+ * in-flight `flush()` that has not committed yet (`flush` clears `buckets`
+ * before awaiting the write). Long-running processes (HTTP MCP server,
+ * autopilot, jobs work) are covered by the timer; a short-lived CLI invocation
+ * usually exits before either trigger fires, so its calls are simply dropped.
  * The search hot path NEVER waits on this write — `record()` is sync and
  * the flush is fire-and-forget.
  *
@@ -19,8 +28,10 @@
  * Per-process bucketing means stdio MCP, HTTP MCP, and CLI processes each
  * maintain their own buffers. Stats are directional, not exact — acceptable
  * because the consumer is the operator (or an agent running `gbrain search
- * tune`), not a financial ledger. The "lose last bucket on hard crash"
- * downside is documented in the methodology doc.
+ * tune`), not a financial ledger. Note the loss is not limited to hard
+ * crashes: with no exit drain, an ordinary exit loses whatever has not been
+ * committed. Weigh that when reading counts from a process class that exits
+ * often.
  */
 
 import type { BrainEngine } from '../engine.ts';
@@ -54,9 +65,10 @@ const FLUSH_THRESHOLD_CALLS = 100;
 
 /**
  * Per-process telemetry singleton. Each gbrain process (CLI, stdio MCP,
- * HTTP MCP) gets one instance. The flush timer and exit hooks are
- * installed lazily on the first `record()` call so importing this module
- * has no side effects.
+ * HTTP MCP) gets one instance. The flush timer is installed lazily by the
+ * first `setEngine()` call, not by `record()`, so importing this module has
+ * no side effects and a caller can wire an engine without recording. No exit
+ * hooks are installed — see `ensureExitHook`.
  */
 class TelemetryWriter {
   private buckets = new Map<string, Bucket>();
@@ -132,9 +144,12 @@ class TelemetryWriter {
 
   /**
    * Drain the bucket map to the database. Idempotent; concurrent flushes
-   * are coalesced via flushInFlight. The bucket map is swapped atomically
-   * before the SQL write so new `record()` calls during flush land in a
-   * fresh map.
+   * are coalesced via flushInFlight — a caller arriving mid-flush awaits the
+   * running write and does NOT get its own drain, so whatever it buffered
+   * waits for the next trigger. The bucket map is swapped atomically before
+   * the SQL write so new `record()` calls during flush land in a fresh map;
+   * that swap is also why an uncommitted snapshot is unrecoverable if the
+   * process exits mid-write.
    */
   async flush(): Promise<void> {
     if (this.flushInFlight) return this.flushInFlight;
@@ -186,7 +201,11 @@ class TelemetryWriter {
     return this.flushInFlight;
   }
 
-  /** Stop the timer and uninstall exit hooks. Called from tests / shutdown. */
+  /**
+   * Stop the timer and drop the buffer. Test-only in practice: the sole
+   * caller is `_resetTelemetryWriterForTest`. Nothing in production shuts
+   * the writer down — processes exit and the buffer goes with them.
+   */
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
@@ -240,9 +259,9 @@ class TelemetryWriter {
     // exit immediately, not block on a DB write that may never complete.
   }
 
-  // Test-only: previously inspected by tests. Retained as a no-op so the
-  // test harness's _resetTelemetryWriterForTest doesn't need to know about
-  // the exit-hook decision.
+  // Test-only, and currently unreferenced: no test calls it and
+  // `_resetTelemetryWriterForTest` uses `stop()`. Despite the name it is not
+  // a no-op and is not wired to any exit path — it just forces a flush.
   flushOnExitForTest(): Promise<void> {
     return this.flush().catch(() => { /* swallow */ });
   }

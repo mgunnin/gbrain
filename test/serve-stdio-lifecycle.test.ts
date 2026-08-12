@@ -129,6 +129,12 @@ function makeHarness(opts: {
     clearInterval: timers.clearInterval,
     probeWatchdog: () => probeWatchdogResult,
     mcpStdio: opts.mcpStdio,
+    // [ENG-5] The idle maintenance sweep registers its own (default-on)
+    // interval through the same deps.setInterval seam, which would inflate
+    // this harness's timers.active() watchdog assertions. This file tests
+    // the stdio lifecycle, not the sweep — test/sweep.test.ts owns the
+    // sweep-timer wiring coverage — so opt out here.
+    sweepEnabled: false,
   };
 
   return {
