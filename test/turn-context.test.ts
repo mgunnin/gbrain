@@ -7,6 +7,11 @@
  * in the module under test).
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import {
+  resetGateway,
+  __setChatTransportForTests,
+  __setEmbedTransportForTests,
+} from '../src/core/ai/gateway.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   assembleTurnContext,
@@ -33,6 +38,15 @@ import {
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
+  // This file's corpus writes fire embed attempts iff the module-global
+  // gateway looks configured AND keyed. A shard-mate can leave it configured
+  // with a fake test key — the preload's beforeEach only restores when the
+  // gateway is UNCONFIGURED, so that state persists and put_page 401s against
+  // real OpenAI (the shard-8 flake). Reset back to the preload baseline
+  // (real process.env → keyless degrade on CI) regardless of shard-mates.
+  resetGateway();
+  __setChatTransportForTests(null);
+  __setEmbedTransportForTests(null);
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();

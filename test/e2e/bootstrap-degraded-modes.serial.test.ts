@@ -261,3 +261,49 @@ describe('bootstrap degraded modes (decline-everything + keyless, serial e2e)', 
     expect(report.phases.find((p) => p.id === 'verify')!.state).toBe('done');
   }, 300_000);
 });
+
+// ── cloud-sandbox simulation [D-cloud] ──────────────────────────────────────
+//
+// CLAUDE_CODE_REMOTE=true is the official cloud signal. This block pins the
+// three cloud behaviors end-to-end through the real dispatcher: the status
+// report names the environment, verify's execution_env check states the
+// degradations, and repo creation refuses fast with the attach flow.
+
+describe('cloud-sandbox simulation (CLAUDE_CODE_REMOTE=true)', () => {
+  const K = 'CLAUDE_CODE_REMOTE';
+  let saved: string | undefined;
+  beforeAll(() => {
+    saved = process.env[K];
+    process.env[K] = 'true';
+  });
+  afterAll(() => {
+    if (saved === undefined) delete process.env[K];
+    else process.env[K] = saved;
+  });
+
+  test('status --json reports execution_environment: cloud-sandbox', async () => {
+    const report = await statusReport(ws, { gbrainHomeDir: home });
+    expect(report.execution_environment).toBe('cloud-sandbox');
+  });
+
+  test('repo phase refuses creation with the attach flow (no half-created unpushable repo)', async () => {
+    // Fake runner: gh + auth fine, no origin — the CREATE path would begin.
+    const runner: ExecRunner = async (argv) => {
+      const joined = argv.join(' ');
+      if (joined.includes('gh --version') || joined.includes('auth status')) return { code: 0, stdout: 'ok', stderr: '' };
+      if (joined.includes('remote get-url origin')) return { code: 2, stdout: '', stderr: 'error: No such remote' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const origErr = console.error;
+    let err = '';
+    console.error = (...a: unknown[]) => { err += a.map(String).join(' ') + '\n'; };
+    try {
+      const code = await runBootstrap(['repo', '--workspace', ws], { runner });
+      expect(code).toBe(2);
+      expect(err).toContain('cloud sandbox');
+      expect(err).toContain('gbrain bootstrap attach');
+    } finally {
+      console.error = origErr;
+    }
+  }, 60_000);
+});

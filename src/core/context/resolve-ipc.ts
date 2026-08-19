@@ -57,6 +57,18 @@ const CLIENT_TIMEOUT_MS = 250;
 export const TURN_CONTEXT_CLIENT_TIMEOUT_MS = 600;
 /** Server-side self-budget for turn_context assembly (< client timeout). */
 export const TURN_CONTEXT_SERVER_BUDGET_MS = 400;
+/**
+ * v0.45.7 ambient recall — context_pack budgets. Packs build entity CARDS
+ * (heavier than turn_context's three arms), and their consumer is the
+ * session-start hook (1.5s self-deadline, 5s harness timeout), so they get a
+ * wider budget. The server passes its budget into the assembler as a
+ * wall-clock deadline, so overrun returns a PARTIAL pack (degradedReason
+ * 'deadline'), never an empty hard failure (eng 4A).
+ */
+export const CONTEXT_PACK_CLIENT_TIMEOUT_MS = 1000;
+/** Assembler deadline. Backstop = +200; client 1000 leaves a real transport
+ * margin (adversarial review: 800+200 == client timeout was zero margin). */
+export const CONTEXT_PACK_SERVER_BUDGET_MS = 600;
 const MAX_MSG_BYTES = 256 * 1024;
 
 /** Marker the client returns when no server is reachable (vs. a real null result). */
@@ -78,6 +90,11 @@ export interface ResolveRequest {
   sourceId?: string;
   /** v0.43 (#2095, codex D7): suppression mode — 'slug-only' under windowing. */
   suppression?: 'slug-and-title' | 'slug-only';
+  /**
+   * v0.46.15: lexical-arms kill switch. Either side may disable: a client
+   * `false` wins; otherwise the server applies its own file-config gate.
+   */
+  lexicalArms?: boolean;
 }
 
 export interface TurnContextRequest {
@@ -106,7 +123,53 @@ export interface TurnContextRequest {
   channel?: string;
 }
 
-export type IpcRequest = ResolveRequest | TurnContextRequest;
+/**
+ * v0.45.7 ambient recall — boundary context pack over IPC. Two modes:
+ *   - assembly (default): the server resolves standing entities (request
+ *     `entities` + window extraction + the session row's banked set), assembles
+ *     a pack (cards + open threads + hot facts + since-delta vs the session
+ *     cursor), advances the cursor, and returns the injectable block.
+ *   - bankOnly: PreCompact banking — extract entities from `window`, merge
+ *     them into the session row's standing set, return an empty block. The
+ *     post-compaction SessionStart (source=compact) then serves a warm pack.
+ * Same secret + source-binding posture as turn_context. World-only ALWAYS
+ * (the push path never widens — include_private is a pull-verb affordance).
+ */
+export interface ContextPackRequest {
+  kind: 'context_pack';
+  protocol: 2;
+  secret: string;
+  sessionId?: string;
+  sourceId?: string;
+  /** Explicit standing entities (names/slugs); merged with the session row's banked set. */
+  entities?: string[];
+  /** Recent turns for entity extraction (compact banking / cold-start fallback). */
+  window?: WindowTurn[];
+  maxBytes?: number;
+  /** Trigger discriminator ('session-start:<source>' | 'compact-bank').
+   * RESERVED: carried on the wire for future server-side telemetry; no
+   * server-side consumer yet (the hook-side heartbeat is the current
+   * observability channel). */
+  trigger?: string;
+  /** PreCompact banking mode: persist entities, skip assembly. */
+  bankOnly?: boolean;
+  /**
+   * Cathedral 5 (additive, bankOnly companion): BASENAME of a corpus segment
+   * this hook just banked — serve schedules a prompt checkpoint harvest of it
+   * (fire-and-forget; the ack never waits on the LLM). Version-skew tolerant
+   * BY DESIGN: an old serve destructures known fields and ignores this one
+   * (today's behavior); the sweep backstop still extracts the segment.
+   */
+  flushCorpusFile?: string;
+  /**
+   * Cathedral 5 (additive, read-only): return the session's checkpoint
+   * manifest links — no assembly, no cursor advance, no banking. Used by the
+   * OpenClaw assemble poll.
+   */
+  manifestOnly?: boolean;
+}
+
+export type IpcRequest = ResolveRequest | TurnContextRequest | ContextPackRequest;
 
 export interface ResolveResponse {
   ok: boolean;
@@ -123,13 +186,24 @@ export interface TurnContextResponse {
   error?: string;
 }
 
+export interface ContextPackResponse {
+  ok: boolean;
+  /** Always 2 on a v2 server (stale-serve detector, same as turn_context [A9]). */
+  protocol: 2;
+  block?: TurnContextResult | null;
+  degradedReason?: string;
+  error?: string;
+}
+
 export type ResolveHandler = (req: ResolveRequest) => Promise<PointerBlock | null>;
 export type TurnContextHandler = (req: TurnContextRequest) => Promise<TurnContextResult | null>;
+export type ContextPackHandler = (req: ContextPackRequest) => Promise<TurnContextResult | null>;
 
 /** Handler MAP replacing the single closure [ENG-3]. */
 export interface IpcHandlers {
   resolve: ResolveHandler;
   turn_context?: TurnContextHandler;
+  context_pack?: ContextPackHandler;
 }
 
 export interface IpcServerOpts {
@@ -303,6 +377,50 @@ export async function requestTurnContext(
   return resp as TurnContextResponse;
 }
 
+/** Client-facing context_pack request shape (kind/protocol filled in by the helper). */
+export type ContextPackClientRequest = Omit<ContextPackRequest, 'kind' | 'protocol'>;
+
+export type ContextPackIpcResult =
+  | ContextPackResponse
+  | TurnContextStaleServe
+  | typeof IPC_UNAVAILABLE;
+
+/**
+ * v0.45.7 client: request a boundary context pack (or a PreCompact entity bank)
+ * from a running serve. Same fail-soft ladder as requestTurnContext: transport
+ * trouble → IPC_UNAVAILABLE; missing protocol echo → stale_serve; otherwise
+ * the server's typed response. Never throws. Window trims oldest-first under
+ * the message cap [G11].
+ */
+export async function requestContextPack(
+  socketPath: string,
+  req: ContextPackClientRequest,
+  opts: { timeoutMs?: number } = {},
+): Promise<ContextPackIpcResult> {
+  const full: ContextPackRequest = {
+    kind: 'context_pack',
+    protocol: 2,
+    ...req,
+    ...(req.window ? { window: [...req.window] } : {}),
+  };
+  let line = JSON.stringify(full);
+  while (
+    Buffer.byteLength(line, 'utf8') + 1 > MAX_MSG_BYTES &&
+    Array.isArray(full.window) &&
+    full.window.length > 0
+  ) {
+    full.window.shift();
+    line = JSON.stringify(full);
+  }
+  if (Buffer.byteLength(line, 'utf8') + 1 > MAX_MSG_BYTES) return IPC_UNAVAILABLE;
+
+  const resp = await roundTrip(socketPath, line, opts.timeoutMs ?? CONTEXT_PACK_CLIENT_TIMEOUT_MS);
+  if (resp === IPC_UNAVAILABLE) return IPC_UNAVAILABLE;
+  if (!resp || typeof resp !== 'object') return IPC_UNAVAILABLE;
+  if ((resp as { protocol?: unknown }).protocol !== 2) return { degraded: 'stale_serve' };
+  return resp as ContextPackResponse;
+}
+
 /** One request line out, one response line back. Fail-soft to IPC_UNAVAILABLE. */
 function roundTrip(
   socketPath: string,
@@ -438,6 +556,10 @@ export async function startResolveIpcServer(
             if (tcResp.ok && tcResp.block && tcResp.block.text) {
               deliveredTurnContext = { result: tcResp.block, req };
             }
+          } else if (kind === 'context_pack') {
+            resp = JSON.stringify(
+              await handleContextPack(parsed as ContextPackRequest, handlers, opts),
+            );
           } else {
             resp = JSON.stringify({ ok: false, error: `unknown_kind:${String(kind)}` });
           }
@@ -495,6 +617,50 @@ async function handleTurnContext(
       t.unref?.();
     });
     const result = await Promise.race([handlers.turn_context(req), budget]);
+    if (result === '__budget__') {
+      return { ok: true, protocol: 2, block: null, degradedReason: 'server_budget' };
+    }
+    return {
+      ok: true,
+      protocol: 2,
+      block: result,
+      ...(result?.degradedReason ? { degradedReason: result.degradedReason } : {}),
+    };
+  } catch (e) {
+    return { ok: false, protocol: 2, error: (e as Error).message };
+  }
+}
+
+/**
+ * context_pack server path — same ladder as turn_context (auth [S3#6] →
+ * source binding [CX2-10] → budgeted work), with a WIDER budget (cards) and
+ * partial-pack semantics: the registered handler passes the budget into the
+ * assembler as a wall-clock deadline, so the race below is only the backstop
+ * for a hung handler, not the primary degrade mechanism (eng 4A).
+ */
+async function handleContextPack(
+  req: ContextPackRequest,
+  handlers: IpcHandlers,
+  opts: IpcServerOpts,
+): Promise<ContextPackResponse> {
+  if (!handlers.context_pack) {
+    return { ok: false, protocol: 2, error: 'unsupported_kind' };
+  }
+  if (req.protocol !== 2) {
+    return { ok: false, protocol: 2, error: 'unsupported_protocol' };
+  }
+  if (!opts.secret || !secretMatches(req.secret, opts.secret)) {
+    return { ok: false, protocol: 2, error: 'unauthorized' };
+  }
+  if (req.sourceId && opts.boundSourceId && req.sourceId !== opts.boundSourceId) {
+    return { ok: false, protocol: 2, error: 'source_mismatch' };
+  }
+  try {
+    const budget = new Promise<'__budget__'>((r) => {
+      const t = setTimeout(() => r('__budget__'), CONTEXT_PACK_SERVER_BUDGET_MS + 200);
+      t.unref?.();
+    });
+    const result = await Promise.race([handlers.context_pack(req), budget]);
     if (result === '__budget__') {
       return { ok: true, protocol: 2, block: null, degradedReason: 'server_budget' };
     }

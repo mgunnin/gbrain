@@ -1,14 +1,24 @@
 /**
- * Synthesize phase (v0.23) — conversation-to-brain pipeline.
+ * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
+ * pipeline. Cheap-model triage gates frontier-model synthesis:
  *
- * Reads transcripts from the configured corpus dir, runs a cheap Haiku
- * "is this worth processing?" verdict (cached in `dream_verdicts`), then
- * fans out one Sonnet subagent per worth-processing transcript with the
- * trusted-workspace `allowed_slug_prefixes` list. After children resolve,
- * the orchestrator queries `subagent_tool_executions` for the put_page
- * slugs each child wrote (codex finding #2: NOT a time-windowed pages
- * query — picks up unrelated writes), reverse-renders each new page from
- * DB to disk, and writes a deterministic summary index.
+ *   discoverTranscripts ──► runTriagePass (bounded pool, dream.triage.max_ms
+ *     │                     time budget for cache MISSES; hits are free)
+ *     │                       ├─ HIT: score!=null && triage_version==current
+ *     │                       │       && model matches ──► reuse
+ *     │                       ├─ MISS ──► judgeSignificance (utility model,
+ *     │                       │   head/middle/tail sample within max_chars)
+ *     │                       │   {score 0-1, content_type, segments, entities}
+ *     │                       │     reliable ──► putDreamVerdict (upsert)
+ *     │                       │     degenerate ──► report only, NEVER cached
+ *     │                       └─ budget exhausted ──► deferred (next run continues)
+ *     ▼
+ *   gate: score >= dream.triage.threshold  (read-time — retune = zero re-judge)
+ *     ▼
+ *   buildSynthesisPrompt + TRIAGE MAP block ──► one subagent per passing
+ *   transcript chunk (max_turns = dream.synthesize.max_turns), drained inline
+ *   in a private per-run queue ──► put_page slug collection ──► provenance
+ *   stamp ──► reverse-write ──► summary index.
  *
  * Hard guarantees:
  *   - Subagent never gets fs-write access. Orchestrator holds the dual-write.
@@ -18,12 +28,16 @@
  *   - Cooldown via `dream.synthesize.last_completion_ts` config key —
  *     written ONLY on success (codex finding #5 deferral: no auto git commit
  *     in v1).
- *   - Idempotency via `dream:synth:<file_path>:<content_hash>` job key.
+ *   - Idempotency via `dream:synth-v2:<source>:filename:<basename>:<hash16>`
+ *     job keys (byte-stable — pinned by test/e2e/dream-synthesize-chunking).
  *   - Edited transcripts produce slugs with content-hash suffix → no overwrite.
+ *   - Degenerate triage verdicts (truncated / refusal / unparseable /
+ *     score out of [0,1]) are never cached — the next cycle re-judges.
  *
  * NOT in v1:
  *   - git auto-commit / push (deferred to v1.1, codex finding #5).
- *   - Daily token budget cap (cooldown bounds spend at v1 scale).
+ *   - Borderline-band mid-tier routing + scheduled reject sample-audit
+ *     (manual `gbrain dream retriage --audit-rejects` is the v1 control).
  */
 
 import type Anthropic from '@anthropic-ai/sdk';
@@ -31,16 +45,24 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
-import { normalizeModelId } from '../model-id.ts';
+import { normalizeModelId, splitProviderModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
 import { basename, join, dirname, isAbsolute, resolve } from 'node:path';
-import type { BrainEngine } from '../engine.ts';
+import { parseLlmJson } from '../llm-json.ts';
+import type { BrainEngine, DreamVerdict, TriageSegment } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
 import { MinionQueue } from '../minions/queue.ts';
+import { clampSubagentBudgets, CYCLE_DEADLINE_RESERVE_MS, MIN_PATTERNS_SUBAGENT_BUDGET_MS } from './patterns.ts';
+import { isQueueQuotaExceededError } from '../minions/admission.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
-import { makeSubagentHandler } from '../minions/handlers/subagent.ts';
-import type { MinionJobInput, MinionJobContext, MinionHandler, SubagentHandlerData } from '../minions/types.ts';
-import { discoverTranscripts, type DiscoveredTranscript } from './transcript-discovery.ts';
+import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
+import { runSubagentsInline, runDrainRenewalTick, percentile, INLINE_LOCK_MS } from './inline-drain.ts';
+import { buildManifestContext, buildLinkManifest, type ManifestContext } from './link-manifest.ts';
+
+// Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7);
+// patterns.ts and the __testing surface import from here unchanged.
+export { runSubagentsInline, runDrainRenewalTick };
+import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
 import { validateSourceId } from '../utils.ts';
@@ -62,6 +84,10 @@ const SUMMARY_SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`, '
  * resolver returns for known Anthropic aliases.
  */
 const MODEL_CONTEXT_TOKENS: Record<string, number> = {
+  'claude-fable-5': 1_000_000,
+  'claude-opus-5': 1_000_000,
+  'claude-sonnet-5': 1_000_000,
+  'claude-opus-4-8': 1_000_000,
   'claude-opus-4-7': 1_000_000,
   'claude-opus-4-6': 1_000_000,
   'claude-sonnet-4-6': 200_000,
@@ -70,7 +96,7 @@ const MODEL_CONTEXT_TOKENS: Record<string, number> = {
 };
 
 /** Token-to-char ratio. 3.5 matches PR #748; conservative for English text. */
-const CHARS_PER_TOKEN = 3.5;
+export const CHARS_PER_TOKEN = 3.5;
 /** Reserve 10% of context window for system prompt + tool defs + output. */
 const HEADROOM_RATIO = 0.9;
 /** Floor on user-overridable max_prompt_tokens (matches PR #748 minimum). */
@@ -81,6 +107,37 @@ const DEFAULT_MAX_CHUNKS = 24;
 const UNKNOWN_MODEL_BUDGET_TOKENS = 180_000;
 const DEFAULT_SUBAGENT_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_SUBAGENT_WAIT_TIMEOUT_MS = 35 * 60 * 1000;
+
+// ── Triage-v1 constants (#4152) ───────────────────────────────────────
+
+/**
+ * Triage prompt-schema version. Bump when the judge prompt or output schema
+ * changes in a way that makes old scores incomparable — cached rows with a
+ * different version are treated as misses and re-judged (cheap, utility tier).
+ */
+export const TRIAGE_VERSION = 1;
+/**
+ * Fixed constant used ONLY to derive the stored `worth_processing` boolean at
+ * write time (back-compat for boolean-era readers). The RUNTIME gate is
+ * `score >= dream.triage.threshold`, evaluated at fan-out — never baked into
+ * the cache, so retuning the threshold re-gates instantly with zero re-judging.
+ */
+export const DEFAULT_TRIAGE_THRESHOLD = 0.5;
+/** Sample-window default: head 50% / middle 20% / tail 30% within this many chars. */
+const DEFAULT_TRIAGE_MAX_CHARS = 24_000;
+/** 2048, not 200/1024: segments+entities JSON needs room after any reasoning-token burn. */
+const DEFAULT_TRIAGE_MAX_TOKENS = 2048;
+/** Wall-clock budget for cache-miss judging per pass; bounds a cold corpus inside the 30-min job clock. */
+const DEFAULT_TRIAGE_MAX_MS = 300_000;
+const DEFAULT_TRIAGE_CONCURRENCY = 4;
+/**
+ * Default subagent turn budget. 16 (down from the pre-#4152 hardcoded 30) is
+ * a cost/speed policy call: the transcript rides in the initial prompt and the
+ * TRIAGE MAP hands the subagent candidate segments, so turns go to targeted
+ * search + page writes. Restore via `dream.synthesize.max_turns=30` if written
+ * page counts drop; `details.synthesis.avg_turns` telemetry shows cap pressure.
+ */
+const DEFAULT_MAX_TURNS = 16;
 
 /**
  * Compute per-chunk character budget for the resolved model + config override.
@@ -95,14 +152,21 @@ const DEFAULT_SUBAGENT_WAIT_TIMEOUT_MS = 35 * 60 * 1000;
  * accumulation is out of scope for v0.30.2 (terminal-error classification
  * catches turn-N blowups; per-turn budget guard is a v0.31+ follow-up).
  */
-function computeChunkCharBudget(
+export function computeChunkCharBudget(
   model: string,
   configMaxPromptTokens: number | null,
 ): number {
   if (configMaxPromptTokens !== null) {
     return Math.floor(configMaxPromptTokens * CHARS_PER_TOKEN);
   }
-  const ctx = MODEL_CONTEXT_TOKENS[model];
+  // Lookup keyed on the bare model name (after prefix strip), mirroring
+  // ANTHROPIC_OUTPUT_CAPS in brainstorm/judges.ts: resolveModel returns
+  // provider-prefixed strings when TIER_DEFAULTS / config values carry a
+  // prefix (the current tier defaults all do), so a raw keyed lookup sent
+  // every tier-resolved brain to the unknown-model fallback — a 5x budget
+  // cut on 1M-context models.
+  const bare = splitProviderModelId(model).model || model;
+  const ctx = MODEL_CONTEXT_TOKENS[bare];
   if (ctx === undefined) {
     warnUnknownModelOnce(model);
     return Math.floor(UNKNOWN_MODEL_BUDGET_TOKENS * CHARS_PER_TOKEN);
@@ -241,6 +305,13 @@ export interface SynthesizePhaseOpts {
   date?: string;
   from?: string;
   to?: string;
+  /** #4168 sibling: absolute wall-clock deadline (epoch ms) of the enclosing
+   *  minion job. When set, child-subagent timeout_ms/wait are clamped via the
+   *  clampSubagentBudgets template so a child submitted late in the cycle
+   *  cannot outlive the parent's kill switch; under the minimum budget the
+   *  phase skips honestly instead of submitting a guaranteed-timeout child.
+   *  Null/unset (`gbrain dream` CLI) keeps the configured defaults. */
+  deadlineAtMs?: number | null;
   /**
    * Disable the self-consumption guard. Wired from the
    * `--unsafe-bypass-dream-guard` CLI flag. NOT auto-applied for `--input`
@@ -263,121 +334,6 @@ export interface SynthesizePhaseOpts {
    * run without a corpus). Never reads or writes config.
    */
   once?: boolean;
-}
-
-const INLINE_PGLITE_LOCK_MS = 30_000;
-
-/**
- * PGLite cannot be served by a separate Minions worker process: the embedded
- * data-dir holds an exclusive file lock, so subagent children enqueued by the
- * synth parent would sit in 'waiting' until waitForCompletion times out.
- * Drive the same claim → run → complete/fail loop a worker would perform,
- * inline, against this phase's private child queue.
- *
- * `yieldDuringPhase` is ticked on a 60s interval while a child runs so the
- * 5-min cycle lock TTL keeps refreshing during long (up to 30-min) children.
- */
-export async function runPgliteSubagentsInline(
-  engine: BrainEngine,
-  queue: MinionQueue,
-  queueName: string,
-  yieldDuringPhase?: () => Promise<void>,
-  handler: MinionHandler = makeSubagentHandler({ engine }),
-): Promise<void> {
-  if (engine.kind !== 'pglite') return;
-
-  while (true) {
-    // Housekeeping a worker would normally perform, so child rows can reach
-    // terminal states (delayed retries promoted, timeouts dead-lettered)
-    // before the synth parent enters waitForCompletion polling.
-    await queue.promoteDelayed();
-    await queue.handleStalled();
-    await queue.handleTimeouts();
-    await queue.handleWallClockTimeouts(INLINE_PGLITE_LOCK_MS);
-
-    const lockToken = randomUUID();
-    const job = await queue.claim(lockToken, INLINE_PGLITE_LOCK_MS, queueName, ['subagent']);
-    if (!job) return;
-
-    const abort = new AbortController();
-    const shutdown = new AbortController();
-    const context: MinionJobContext = {
-      id: job.id,
-      name: job.name,
-      data: job.data,
-      attempts_made: job.attempts_made,
-      signal: abort.signal,
-      deadlineAtMs: job.timeout_at != null ? job.timeout_at.getTime() : null,
-      shutdownSignal: shutdown.signal,
-      updateProgress: async (progress: unknown) => {
-        await queue.updateProgress(job.id, lockToken, progress);
-      },
-      updateTokens: async (tokens) => {
-        await queue.updateTokens(job.id, lockToken, tokens);
-      },
-      log: async (message) => {
-        const value = typeof message === 'string' ? message : JSON.stringify(message);
-        await engine.executeRaw(
-          `UPDATE minion_jobs SET stacktrace = COALESCE(stacktrace, '[]'::jsonb) || to_jsonb($1::text),
-            updated_at = now()
-           WHERE id = $2 AND status = 'active' AND lock_token = $3`,
-          [value, job.id, lockToken],
-        );
-      },
-      isActive: async () => {
-        const rows = await engine.executeRaw<{ id: number }>(
-          `SELECT id FROM minion_jobs WHERE id = $1 AND status = 'active' AND lock_token = $2`,
-          [job.id, lockToken],
-        );
-        return rows.length > 0;
-      },
-      readInbox: async () => queue.readInbox(job.id, lockToken),
-    };
-
-    // Per-job deadline enforcement (worker.ts parity). While the drain loop
-    // awaits the handler, the handleTimeouts sweep above can't run, so nothing
-    // else can stop a child that blows past timeout_ms — the handler only
-    // stops when ctx.signal fires. Derive the delay from the claim-time
-    // timeout_at stamp so timer, DB sweeper, and deadlineAtMs agree.
-    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-    if (job.timeout_ms != null) {
-      const delayMs = job.timeout_at != null
-        ? Math.max(0, job.timeout_at.getTime() - Date.now())
-        : job.timeout_ms;
-      timeoutTimer = setTimeout(() => {
-        if (!abort.signal.aborted) abort.abort(new Error('timeout'));
-      }, delayMs);
-    }
-
-    // Cycle-lock keepalive while the child runs (best-effort, never throws).
-    const keepalive = yieldDuringPhase
-      ? setInterval(() => { yieldDuringPhase().catch(() => { /* best-effort */ }); }, 60_000)
-      : null;
-    try {
-      const result = await handler(context);
-      await queue.completeJob(
-        job.id,
-        lockToken,
-        result != null ? (typeof result === 'object' ? result as Record<string, unknown> : { value: result }) : undefined,
-      );
-    } catch (e) {
-      // Timeout is terminal (handleTimeouts parity: stall → retry,
-      // timeout → dead), never a delayed retry.
-      const timedOut = abort.signal.aborted;
-      const errorText = timedOut ? 'timeout exceeded' : (e instanceof Error ? e.message : String(e));
-      const attemptsExhausted = job.attempts_made + 1 >= job.max_attempts;
-      await queue.failJob(
-        job.id,
-        lockToken,
-        errorText,
-        timedOut || attemptsExhausted ? 'dead' : 'delayed',
-        0,
-      );
-    } finally {
-      if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (keepalive) clearInterval(keepalive);
-    }
-  }
 }
 
 export async function runPhaseSynthesize(
@@ -404,6 +360,24 @@ export async function runPhaseSynthesize(
   }
   try {
     const config = await loadSynthConfig(engine);
+
+    // #4168 sibling: clamp the child-subagent budgets to the REAL remaining
+    // job time (patterns.ts clampSubagentBudgets template). Pre-fix,
+    // DEFAULT_SUBAGENT_TIMEOUT_MS (30min) was submitted raw as the child's
+    // timeout_ms even when the parent cycle had two minutes left — the same
+    // deadline-equals-kill-switch collision propose_takes had, one process
+    // boundary further out.
+    const clamped = clampSubagentBudgets(
+      { subagentTimeoutMs: config.subagentTimeoutMs, subagentWaitTimeoutMs: config.subagentWaitTimeoutMs },
+      opts.deadlineAtMs,
+      Date.now(),
+    );
+    if (clamped === null) {
+      return skipped('insufficient_cycle_budget',
+        'remaining cycle budget too small to submit a synthesize child that could finish; next cycle retries with a fresh budget');
+    }
+    config.subagentTimeoutMs = clamped.timeoutMs;
+    config.subagentWaitTimeoutMs = clamped.waitTimeoutMs;
 
     // Allow ad-hoc --input to run even when config is disabled.
     if (!opts.inputFile && !config.corpusDir) {
@@ -462,65 +436,60 @@ export async function runPhaseSynthesize(
       return ok('no transcripts to process', { transcripts_processed: 0, pages_written: 0 });
     }
 
-    // Significance verdicts (cached in dream_verdicts; Haiku on miss).
-    const worthProcessing: DiscoveredTranscript[] = [];
-    const verdicts: Array<{ filePath: string; worth: boolean; reasons: string[]; cached: boolean }> = [];
+    // Scored triage (#4152): cached in dream_verdicts, judged on miss by the
+    // utility-tier model through a bounded pool with a wall-clock miss budget.
     // Provider-aware judge client routes through gateway.chat, so any
     // configured provider works (Anthropic, DeepSeek, OpenRouter, Voyage,
-    // Ollama, llama-server, etc.). Returns null when the resolved verdict
-    // model has no reachable provider (legacy "no API key" branch preserved
-    // as the cheap pre-flight check).
-    const judge = makeJudgeClient(config.verdictModel);
-    for (const t of transcripts) {
-      const cached = await engine.getDreamVerdict(t.filePath, t.contentHash);
-      if (cached) {
-        verdicts.push({ filePath: t.filePath, worth: cached.worth_processing, reasons: cached.reasons, cached: true });
-        if (cached.worth_processing) worthProcessing.push(t);
-        continue;
-      }
-      if (!judge) {
-        // No configured provider for the verdict model — can't judge.
-        // Skip with explicit reason; don't crash phase.
-        verdicts.push({
-          filePath: t.filePath,
-          worth: false,
-          reasons: [`no configured provider for verdict model: ${config.verdictModel}`],
-          cached: false,
-        });
-        continue;
-      }
-      try {
-        const verdict = await judgeSignificance(judge, t, config.verdictModel);
-        await engine.putDreamVerdict(t.filePath, t.contentHash, verdict);
-        verdicts.push({ filePath: t.filePath, worth: verdict.worth_processing, reasons: verdict.reasons, cached: false });
-        if (verdict.worth_processing) worthProcessing.push(t);
-      } catch (e) {
-        // AIConfigError at chat time = provider auth/config went bad mid-run
-        // (revoked key, recipe misconfig surfacing at first real call). Skip
-        // this transcript with the gateway error message so the user sees the
-        // shape of the problem in `gbrain dream --phase synthesize --dry-run`.
-        if (e instanceof AIConfigError) {
-          verdicts.push({
-            filePath: t.filePath,
-            worth: false,
-            reasons: [`gateway error: ${e.message}`],
-            cached: false,
-          });
-          continue;
-        }
-        throw e;
-      }
-    }
+    // Ollama, llama-server, etc.); an unreachable provider degrades
+    // per-transcript inside the pass.
+    const pass = await runTriagePass(engine, transcripts, {
+      model: config.triage.model,
+      maxChars: config.triage.maxChars,
+      maxTokens: config.triage.maxTokens,
+      threshold: config.triage.threshold,
+      concurrency: config.triage.concurrency,
+      maxMs: config.triage.maxMs,
+    }, opts.yieldDuringPhase);
+    const verdicts = pass.reports;
 
-    // Dry-run stops here: significance filter ran (Haiku verdicts cached),
-    // but no Sonnet synthesis. Codex finding #8: --dry-run does NOT mean
-    // "zero LLM calls"; it means "skip Sonnet."
+    // Read-time gate: retuning dream.triage.threshold re-gates instantly with
+    // zero re-judging (scores persist; the dial is applied here).
+    const worthProcessing = transcripts.filter(t => {
+      const v = pass.byPath.get(t.filePath);
+      return v !== undefined && v.score !== null && v.score >= config.triage.threshold;
+    });
+
+    // Count semantics (outside-voice CX7): below_threshold counts ONLY files
+    // with a real score under the gate; degraded = no usable score and not
+    // deferred/unreliable (no reachable provider, mid-run gateway error). A
+    // provider outage must never read as mass rejection.
+    const degradedCount = pass.reports.filter(
+      r => r.score === null && !r.deferred && !r.unreliable,
+    ).length;
+    const triageDetails = {
+      threshold: config.triage.threshold,
+      judged: pass.judged,
+      cache_hits: pass.cacheHits,
+      unreliable: pass.unreliable,
+      deferred: pass.deferred,
+      degraded: degradedCount,
+      below_threshold: pass.reports.filter(r => r.score !== null && !r.worth).length,
+    };
+    // 3A: a time-boxed cold pass must never read as mass rejection.
+    const deferralSuffix = pass.deferred > 0
+      ? ` (${pass.deferred} not yet triaged — time budget; re-run or use dream retriage)`
+      : '';
+
+    // Dry-run stops here: the triage pass ran (scores cached), but no
+    // synthesis. Codex finding #8: --dry-run does NOT mean "zero LLM calls";
+    // it means "skip the synthesis model."
     if (opts.dryRun) {
-      return ok(`dry-run: ${worthProcessing.length} of ${transcripts.length} transcripts would synthesize`, {
+      return ok(`dry-run: ${worthProcessing.length} of ${transcripts.length} transcripts would synthesize${deferralSuffix}`, {
         transcripts_discovered: transcripts.length,
         transcripts_processed: 0,
         pages_written: 0,
         verdicts,
+        triage: triageDetails,
         dryRun: true,
       });
     }
@@ -529,11 +498,19 @@ export async function runPhaseSynthesize(
       // Even with verdicts, the cooldown timestamp is updated only on a
       // real successful run — not on "nothing worth processing." Lets a
       // re-run pick up if a new transcript lands later.
-      return ok('all transcripts skipped by significance filter', {
+      // Honest zero-pass headline: an all-degraded run (provider outage) is
+      // NOT "everything was below threshold" (outside-voice CX7).
+      const zeroPassMsg = triageDetails.below_threshold > 0
+        ? `all transcripts below triage threshold (${triageDetails.below_threshold} below, ${triageDetails.degraded + pass.unreliable} degraded)${deferralSuffix}`
+        : degradedCount + pass.unreliable > 0
+          ? `triage degraded: no usable verdicts (${degradedCount + pass.unreliable} degraded/unreliable — check the triage provider)${deferralSuffix}`
+          : `no transcripts passed triage${deferralSuffix}`;
+      return ok(zeroPassMsg, {
         transcripts_discovered: transcripts.length,
         transcripts_processed: 0,
         pages_written: 0,
         verdicts,
+        triage: triageDetails,
       });
     }
 
@@ -545,13 +522,27 @@ export async function runPhaseSynthesize(
         'skills/_brain-filing-rules.json missing dream_synthesize_paths.globs'));
     }
 
+    // #4216: pre-retrieval manifest context — one slug snapshot + basename
+    // index per phase, reused across every transcript's LINK CANDIDATES
+    // block. Scoped to the cycle's write source so manifest reads see the
+    // same universe the oneshot validator probes. Best-effort: a failure
+    // here degrades to the manifest-less prompt.
+    const cycleSourceId = opts.sourceId ?? 'default';
+    let manifestCtx: ManifestContext | null = null;
+    if (config.linkManifest) {
+      try {
+        manifestCtx = await buildManifestContext(engine, cycleSourceId);
+      } catch (e) {
+        process.stderr.write(`[dream] manifest context build failed (continuing without manifests): ${e instanceof Error ? e.message : String(e)}\n`);
+      }
+    }
+
     const queue = new MinionQueue(engine);
-    // PGLite children drain inline (no separate worker can open the embedded
-    // data-dir), so give them a private per-run queue: the inline drain must
-    // never claim unrelated 'default'-queue jobs a Postgres worker owns.
-    const childQueueName = engine.kind === 'pglite'
-      ? `dream-inline-${Date.now()}-${randomUUID().slice(0, 8)}`
-      : 'default';
+    // #2050: children drain inline on BOTH engines (see runSubagentsInline),
+    // so give them a private per-run queue: the inline drain must never claim
+    // unrelated 'default'-queue jobs, and a 'default'-queue worker must never
+    // claim a child this parent is about to run itself.
+    const childQueueName = `dream-inline-${Date.now()}-${randomUUID().slice(0, 8)}`;
     const childIds: number[] = [];
     /** Map child job_id → chunk metadata for D6 orchestrator-side slug rewrite. */
     const chunkInfo = new Map<number, { idx: number; hash6: string }>();
@@ -563,10 +554,47 @@ export async function runPhaseSynthesize(
     const maxCharsPerChunk = computeChunkCharBudget(config.model, config.maxPromptTokens);
     const successfulLegacyKeys = await loadSuccessfulLegacySynthesisKeys(
       engine,
-      opts.sourceId ?? 'default',
+      cycleSourceId,
     );
 
+    // Per-source daily submission cap (D2D: default 0 = disabled; opt-in
+    // backstop via dream.synthesize.max_submissions_per_source_per_day).
+    // Bypassed for explicit --input/--date/--from/--to runs, same rule as the
+    // cooldown. Fail-open: if the count query throws (pool reap mid-phase),
+    // warn and skip the cap for this run — backstop availability must never
+    // cost phase availability (db-pacer posture).
+    const dailyCap = config.maxSubmissionsPerSourcePerDay;
+    let capActive = dailyCap > 0 && !explicitTarget;
+    let submittedToday = 0;
+    if (capActive) {
+      try {
+        submittedToday = await countRecentSynthSubmissions(engine, cycleSourceId);
+      } catch (e) {
+        capActive = false;
+        process.stderr.write(
+          `[dream] daily-cap count query failed (${e instanceof Error ? e.message : String(e)}); ` +
+          `skipping the cap for this run\n`,
+        );
+      }
+    }
+
+    // Admission-quota latch: once a submit is rejected, every later transcript
+    // this run would be rejected too — record one skip per remaining file
+    // without hammering the queue.
+    let quotaHit = false;
+    // #4168 red-team: transcripts deferred because the parent job budget ran
+    // out mid-fan-out (distinct from the quota latch: deferral is budget-time,
+    // quota is admission-space; both stop further submits this run).
+    const budgetExhaustedDeferrals: string[] = [];
     for (const t of worthProcessing) {
+      if (quotaHit) {
+        skipReports.push({ filePath: t.filePath, reason: 'admission_quota: submission stopped this run' });
+        continue;
+      }
+      if (budgetExhaustedDeferrals.length > 0) {
+        budgetExhaustedDeferrals.push(basename(t.filePath));
+        continue; // budget gone — defer the rest, don't submit more children
+      }
       const hash16 = t.contentHash.slice(0, 16);
       const hash6 = t.contentHash.slice(0, 6);
 
@@ -608,6 +636,42 @@ export async function runPhaseSynthesize(
         continue;
       }
 
+      // Daily cap: skip the WHOLE file when its chunk set would cross the cap
+      // — never submit a partial chunk set. Idempotency keys make the retry
+      // free on a later cycle. Structured-review P2: the cap bounds NEW
+      // spend, not re-submission — a file whose keys already exist (a prior
+      // capped-out run died mid-drain) coalesces/self-heals at zero new cost
+      // and must not be stranded for the rest of the 24h window.
+      if (capActive && submittedToday + chunks.length > dailyCap) {
+        const fileKeys = chunks.length > 1
+          ? chunks.map((_, i) =>
+              `dream:synth-v2:${encodeURIComponent(opts.sourceId ?? 'default')}` +
+              `:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}:c${i}of${chunks.length}`)
+          : [`dream:synth-v2:${encodeURIComponent(opts.sourceId ?? 'default')}` +
+              `:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}`];
+        let existingKeys = 0;
+        try {
+          // Only COALESCIBLE rows count as "already exists": queue.add clears
+          // the keys of cancelled/dead rows and inserts fresh PAID jobs, so
+          // those must not be credited as zero-cost (structured-review r2 P2).
+          const rows = await engine.executeRaw<{ n: number }>(
+            `SELECT COUNT(*)::int AS n FROM minion_jobs
+              WHERE idempotency_key = ANY($1::text[])
+                AND status NOT IN ('cancelled', 'dead')`,
+            [fileKeys],
+          );
+          existingKeys = rows[0]?.n ?? 0;
+        } catch { /* fail-open like the cap count itself: treat as no existing keys */ }
+        const newKeysNeeded = chunks.length - existingKeys;
+        if (newKeysNeeded > 0 && submittedToday + newKeysNeeded > dailyCap) {
+          skipReports.push({
+            filePath: t.filePath,
+            reason: `daily_cap_reached: ${submittedToday}/${dailyCap}`,
+          });
+          continue;
+        }
+      }
+
       const isChunked = chunks.length > 1;
       // queue.add subagent validator (classifyCapabilities → resolveRecipe)
       // requires `provider:model`. resolveModel can return a bare id when
@@ -619,12 +683,42 @@ export async function runPhaseSynthesize(
         : config.model.toLowerCase().startsWith('claude-')
           ? `anthropic:${config.model}`
           : config.model;
+      const triageVerdict = pass.byPath.get(t.filePath);
+      // #4216: per-transcript LINK CANDIDATES manifest (zero-embed; entities/
+      // segment notes come from the cached triage verdict).
+      let manifestBlock = '';
+      if (manifestCtx) {
+        const manifest = await buildLinkManifest(
+          engine, manifestCtx, triageVerdict, t.basename,
+          { outputRoot: config.outputRoot, sourceId: cycleSourceId },
+        );
+        manifestBlock = manifest.block;
+      }
+      // Fresh (non-coalesced) chunk submissions for THIS transcript — rolled
+      // back if a later chunk hits the admission quota, so a transcript never
+      // half-synthesizes while its skip report claims it was skipped
+      // (adversarial finding). Coalesced rows are another run's bookkeeping
+      // and must not be cancelled.
+      const transcriptFreshIds: number[] = [];
       for (let i = 0; i < chunks.length; i++) {
         const childData: SubagentHandlerData = {
-          prompt: buildSynthesisPrompt(t, chunks[i], i, chunks.length, priorContradictionsBlock, config.outputRoot),
+          prompt: buildSynthesisPrompt(
+            t, chunks[i], i, chunks.length, priorContradictionsBlock, config.outputRoot,
+            buildTriageMapBlock(triageVerdict, chunks[i], chunks.length),
+            manifestBlock,
+            allowedSlugPrefixes,
+          ),
           model: subagentModel,
-          max_turns: 30,
+          max_turns: config.maxTurns,
           allowed_slug_prefixes: allowedSlugPrefixes,
+          // #4216: execution mode + the structural slug-suffix contract
+          // (CDX-9) + #4217 write requirement — a synthesis child whose every
+          // write failed must dead-letter, not report completed.
+          mode: config.mode,
+          oneshot_slug_suffix: chunks.length > 1
+            ? `${t.contentHash.slice(0, 6)}-c${i}`
+            : t.contentHash.slice(0, 6),
+          require_writes: true,
           // #1586: scope every child tool call to the cycle's resolved source
           // so put_page writes land there instead of the hardcoded 'default'.
           ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
@@ -638,19 +732,87 @@ export async function runPhaseSynthesize(
         const idempotency_key = isChunked
           ? `${synthesisKey}:c${i}of${chunks.length}`
           : synthesisKey;
+        // #4168 red-team: the phase is a FAN-OUT and children drain
+        // sequentially with claim-time-anchored kill switches, so a single
+        // phase-start clamp only bounds the FIRST child. Re-clamp against the
+        // live clock per submit; when the remaining parent budget drops under
+        // the minimum, stop submitting — deferred transcripts retry next
+        // cycle (partial > guaranteed-timeout children).
+        const perChild = clampSubagentBudgets(
+          { subagentTimeoutMs: config.subagentTimeoutMs, subagentWaitTimeoutMs: config.subagentWaitTimeoutMs },
+          opts.deadlineAtMs,
+          Date.now(),
+        );
+        if (perChild === null) {
+          budgetExhaustedDeferrals.push(basename(t.filePath));
+          break;
+        }
         const submitOpts: Partial<MinionJobInput> = {
           max_stalled: 3,
           on_child_fail: 'continue',
           idempotency_key,
-          timeout_ms: config.subagentTimeoutMs,
+          timeout_ms: perChild.timeoutMs,
           queue: childQueueName,
         };
-        const child = await queue.add(
-          'subagent',
-          childData as unknown as Record<string, unknown>,
-          submitOpts,
-          { allowProtectedSubmit: true },
-        );
+        let child: Awaited<ReturnType<typeof queue.add>>;
+        try {
+          child = await queue.add(
+            'subagent',
+            childData as unknown as Record<string, unknown>,
+            submitOpts,
+            { allowProtectedSubmit: true },
+          );
+        } catch (e) {
+          // Admission quota (minions.quota_max_waiting.subagent, config-only):
+          // a rejected submit is a recorded phase skip, never a phase crash —
+          // same posture as daily_cap_reached. The quota won't clear mid-run,
+          // so stop submitting for this run entirely. Roll back this
+          // transcript's already-submitted fresh chunks first: draining a
+          // partial chunk set would write partial pages for a transcript the
+          // skip report says was skipped.
+          if (isQueueQuotaExceededError(e)) {
+            for (const id of transcriptFreshIds) {
+              try { await queue.cancelJob(id); } catch { /* best-effort rollback */ }
+              const idx = childIds.indexOf(id);
+              if (idx >= 0) childIds.splice(idx, 1);
+              jobRawSource.delete(id);
+              chunkInfo.delete(id);
+            }
+            skipReports.push({ filePath: t.filePath, reason: `admission_quota: ${e.message}` });
+            quotaHit = true;
+            break;
+          }
+          throw e;
+        }
+        // Self-heal (#4152 C1): an idempotency-coalesced row still `waiting`
+        // in a FOREIGN dream-inline-* queue was stranded by a previously
+        // killed/timed-out run — no worker will ever claim it, and waiting on
+        // it burns the full subagentWaitTimeoutMs. Cancel (releases the key
+        // slot per queue.add's dead/cancelled rule) and re-add into THIS
+        // run's live queue. CX1 guard: only queues older than the liveness
+        // grace are provably dead — a young foreign queue may belong to a
+        // concurrently running cycle whose drain will claim the row.
+        const foreignQueueAge = child.coalesced === true
+          && child.status === 'waiting'
+          && typeof child.queue === 'string'
+          && child.queue !== childQueueName
+          ? dreamInlineQueueAgeMs(child.queue)
+          : null;
+        if (foreignQueueAge !== null && foreignQueueAge > DREAM_INLINE_LIVE_GRACE_MS) {
+          const cancelled = await queue.cancelJob(child.id);
+          if (cancelled) {
+            child = await queue.add(
+              'subagent',
+              childData as unknown as Record<string, unknown>,
+              submitOpts,
+              { allowProtectedSubmit: true },
+            );
+          }
+        }
+        if (child.coalesced !== true) {
+          submittedToday++;
+          transcriptFreshIds.push(child.id);
+        }
         childIds.push(child.id);
         jobRawSource.set(child.id, t.filePath);
         if (isChunked) {
@@ -659,22 +821,90 @@ export async function runPhaseSynthesize(
       }
     }
 
-    // PGLite cannot run a separate Minions worker because the embedded DB
-    // holds an exclusive file lock. Drain this phase's private child queue
-    // inline so the parent observes terminal child states instead of polling
-    // waiters until subagentWaitTimeoutMs expires. No-op on Postgres.
-    await runPgliteSubagentsInline(engine, queue, childQueueName, opts.yieldDuringPhase);
+    // CX8: nothing was submitted (every passing file skipped — daily cap,
+    // legacy completion, or chunk-cap). Return WITHOUT stamping the cooldown:
+    // a run that did no synthesis must not suppress the retry window that
+    // would pick these files up.
+    if (childIds.length === 0) {
+      return ok(`no synthesis submitted (${skipReports.length} passing file(s) skipped)${deferralSuffix}`, {
+        transcripts_discovered: transcripts.length,
+        transcripts_processed: 0,
+        pages_written: 0,
+        children_submitted: 0,
+        skips: skipReports,
+        verdicts,
+        triage: triageDetails,
+      });
+    }
+
+    // Drain this phase's private child queue inline so the parent observes
+    // terminal child states instead of polling waiters until
+    // subagentWaitTimeoutMs expires. Runs on BOTH engines — on Postgres the
+    // parent job otherwise deadlocks a fully-occupied worker (#2050).
+    // #4194: bounded concurrency on Postgres; PGLite is FORCED serial (the
+    // embedded engine is single-process/exclusive — concurrent loops would
+    // contend on one WASM instance for zero gain).
+    let effectiveConcurrency = Math.min(config.inlineConcurrency, childIds.length);
+    if (engine.kind === 'pglite' && effectiveConcurrency > 1) {
+      process.stderr.write(
+        `[dream] dream.synthesize.inline_concurrency=${config.inlineConcurrency} ignored on PGLite (exclusive engine); draining serially.\n`,
+      );
+      effectiveConcurrency = 1;
+    }
+    const drainStartedAt = Date.now();
+    await runSubagentsInline(
+      engine, queue, childQueueName, opts.yieldDuringPhase,
+      undefined, undefined, effectiveConcurrency, opts.deadlineAtMs ?? null,
+    );
+    // Captured HERE: everything after this line (waiters, collection,
+    // provenance, reverse-writes, backfill) is post-drain phase work and must
+    // not inflate the #4194 drain observability number.
+    const drainMs = Date.now() - drainStartedAt;
+
+    // #4168 adversarial: children the deadline-gated drain never claimed
+    // would strand in this per-run private queue forever (no worker claims
+    // it). Cancel them and defer their transcripts to the next cycle.
+    if (opts.deadlineAtMs != null) {
+      const stillWaiting = await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM minion_jobs WHERE queue = $1 AND status IN ('waiting', 'delayed')`,
+        [childQueueName],
+      );
+      for (const row of stillWaiting) {
+        const cancelled = await queue.cancelJob(row.id);
+        if (cancelled) {
+          const src = jobRawSource.get(row.id);
+          if (src) budgetExhaustedDeferrals.push(basename(src));
+        }
+      }
+    }
 
     // Wait for every child to reach a terminal state. Tick yieldDuringPhase
     // every 5 min so the cycle lock TTL refreshes.
-    const childOutcomes: Array<{ jobId: number; status: string }> = [];
+    const childOutcomes: Array<{ jobId: number; status: string; turns?: number; synth_mode_used?: string; fallback_reason?: string }> = [];
     for (const jobId of childIds) {
       try {
+        // #4168 red-team: bound each wait by the REMAINING parent budget
+        // (never negative-or-zero — floor at 1s so the fast path still
+        // observes an already-terminal child), not just the per-child config.
+        const remainingParentMs = opts.deadlineAtMs != null
+          ? Math.max(1000, opts.deadlineAtMs - CYCLE_DEADLINE_RESERVE_MS - Date.now())
+          : config.subagentWaitTimeoutMs;
         const job = await waitForCompletion(queue, jobId, {
-          timeoutMs: config.subagentWaitTimeoutMs,
+          timeoutMs: Math.min(config.subagentWaitTimeoutMs, remainingParentMs),
           pollMs: 5 * 1000,
         });
-        childOutcomes.push({ jobId, status: job.status });
+        // Turn telemetry: surfaces max_turns cap pressure in details.synthesis
+        // so the 30→16 default can be re-litigated on data. #4216 adds the
+        // execution-path markers so operators see oneshot vs fallback mix.
+        const jr = job.result as { turns_count?: unknown; synth_mode_used?: unknown; fallback_reason?: unknown } | null | undefined;
+        const turns = jr?.turns_count;
+        childOutcomes.push({
+          jobId,
+          status: job.status,
+          ...(typeof turns === 'number' && Number.isFinite(turns) ? { turns } : {}),
+          ...(typeof jr?.synth_mode_used === 'string' ? { synth_mode_used: jr.synth_mode_used } : {}),
+          ...(typeof jr?.fallback_reason === 'string' ? { fallback_reason: jr.fallback_reason } : {}),
+        });
       } catch (e) {
         if (e instanceof TimeoutError) {
           childOutcomes.push({ jobId, status: 'timeout' });
@@ -695,8 +925,8 @@ export async function runPhaseSynthesize(
     // even if Sonnet drops the chunk suffix.
     // v0.32.8: refs carry source_id so reverseWriteRefs picks the correct
     // (source, slug) row. #1586: refs are stamped with the cycle's resolved
-    // source (children write there via SubagentHandlerData.source_id).
-    const cycleSourceId = opts.sourceId ?? 'default';
+    // source (children write there via SubagentHandlerData.source_id;
+    // cycleSourceId is hoisted above the fan-out for the daily cap).
     const writtenRefs = await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource);
 
     const summaryDate = opts.date ?? today();
@@ -719,12 +949,135 @@ export async function runPhaseSynthesize(
       await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, writtenSlugs, childOutcomes, cycleSourceId);
     }
 
-    // Write completion timestamp ON SUCCESS only.
-    await engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
+    // CDX-8: deferred-embed closure. Oneshot children write chunks with
+    // `embedding IS NULL`; the global `embed` phase only runs on SOME
+    // invocation shapes (autopilot per-source cycles run NON_GLOBAL_PHASES,
+    // and `--phase synthesize` never reaches it), so close the freshness gap
+    // HERE. Runs whenever this phase wrote pages REGARDLESS of the current
+    // mode (a revert to agentic must still sweep debt left by earlier oneshot
+    // runs — cheap no-op when nothing is stale), and is BOUNDED by a 120s
+    // abort signal: the stale backlog can predate this run (embeds disabled
+    // for a while, big noEmbed sync) and an unbounded sweep would block the
+    // phase past the cycle-lock TTL. The standing stale-embed machinery owns
+    // any remainder. Best-effort: never fails a phase that wrote its pages.
+    if (writtenSlugs.length > 0) {
+      try {
+        const { isAvailable } = await import('../ai/gateway.ts');
+        if (isAvailable('embedding')) {
+          const { embedStalePages } = await import('../embed-stale.ts');
+          const { currentEmbeddingSignature } = await import('../embedding.ts');
+          // Scoped to THIS phase's written pages only — the spend is exactly
+          // the deferred cost of our own writes (what the agentic inline
+          // path would have paid at put_page time), so it needs no backfill
+          // lock, budget ledger, or cooldown; the source-wide stale backlog
+          // stays the budget-tracked embed-backfill job's business. Racing a
+          // concurrent backfill is idempotent (it finds these chunks
+          // embedded). Signature stamping keeps the new pages inside the
+          // v0.41.31 model-drift invalidation contract.
+          const embedSig = currentEmbeddingSignature();
+          const embedRes = await embedStalePages(engine, writtenSlugs, cycleSourceId, {
+            signal: AbortSignal.timeout(120_000),
+            ...(embedSig !== null && { embeddingSignature: embedSig }),
+          });
+          if (embedRes.embedded > 0) {
+            process.stderr.write(`[dream] phase-end embed of written pages: ${embedRes.embedded} chunk(s)${embedRes.aborted ? ' (120s budget hit; stale sweep owns the rest)' : ''}.\n`);
+          }
+        }
+      } catch (e) {
+        process.stderr.write(`[dream] phase-end embed failed (the stale-embed sweep will catch up): ${e instanceof Error ? e.message : String(e)}\n`);
+      }
+    }
+
+    // #4194 telemetry: queue-wait + runtime percentiles from the children's
+    // own timestamps, so a slow-but-healthy cycle is observable while it
+    // drains and a concurrency change shows up as a queue-wait drop.
+    let queueWaitP50: number | null = null;
+    let queueWaitP95: number | null = null;
+    let runtimeP50: number | null = null;
+    let runtimeP95: number | null = null;
+    try {
+      const timing = await engine.executeRaw<{ created_at: Date | string; started_at: Date | string | null; finished_at: Date | string | null }>(
+        `SELECT created_at, started_at, finished_at FROM minion_jobs WHERE id = ANY($1::bigint[])`,
+        [childIds],
+      );
+      const ts = (v: Date | string | null): number | null => v == null ? null : (v instanceof Date ? v.getTime() : new Date(v).getTime());
+      const waits: number[] = [];
+      const runtimes: number[] = [];
+      for (const row of timing) {
+        const created = ts(row.created_at);
+        const started = ts(row.started_at);
+        const finished = ts(row.finished_at);
+        if (created != null && started != null && started >= created) waits.push(started - created);
+        if (started != null && finished != null && finished >= started) runtimes.push(finished - started);
+      }
+      queueWaitP50 = percentile(waits, 50);
+      queueWaitP95 = percentile(waits, 95);
+      runtimeP50 = percentile(runtimes, 50);
+      runtimeP95 = percentile(runtimes, 95);
+    } catch { /* telemetry is best-effort */ }
+
+    // CDX-4 phase outcome gate: dead children must not masquerade as a clean
+    // phase. Vocabulary discipline: 'dead'/'cancelled' are TERMINAL failures
+    // (nothing will ever be written for that key); 'timeout' means the PARENT
+    // stopped waiting — the child's real outcome is unknown and may still
+    // land, so it degrades the phase but is never grounds for the ALL-DEAD
+    // error. ALL children terminally failed → the phase itself failed (mirror
+    // patterns.ts's outcome gate — "22 dead jobs, zero pages, phase ok" was
+    // barely better than the #4217 incident). ANY child non-completed → the
+    // cooldown stamp is SKIPPED: dead jobs release their idempotency keys
+    // (queue.ts), so the next nightly run retries exactly the failed
+    // transcripts instead of being suppressed for cooldown_hours.
+    const deadChildren = childOutcomes.filter(o => o.status === 'dead' || o.status === 'cancelled');
+    const failedChildren = childOutcomes.filter(o => o.status !== 'completed');
+    if (childOutcomes.length > 0 && deadChildren.length === childOutcomes.length) {
+      return failed(makeError('InternalError', 'SYNTH_ALL_CHILDREN_DEAD',
+        `all ${childOutcomes.length} synthesis child job(s) ended '${deadChildren[0].status}' ` +
+        `(${deadChildren.map(o => `${o.jobId}:${o.status}`).slice(0, 5).join(', ')}${deadChildren.length > 5 ? ', …' : ''}); ` +
+        `nothing was written — see minion_jobs error_text for the cause`),
+        // Keep fan-out observability on the failure path: operators (and the
+        // fan-out-shape tests) still see what was submitted and how it died.
+        {
+          transcripts_discovered: transcripts.length,
+          children_submitted: childIds.length,
+          child_outcomes: childOutcomes,
+          skips: skipReports,
+          verdicts,
+          triage: triageDetails,
+          synthesis: {
+            jobs: childIds.length,
+            max_turns_config: config.maxTurns,
+            inline_concurrency_config: config.inlineConcurrency,
+            inline_concurrency_effective: effectiveConcurrency,
+            dead_jobs: deadChildren.length,
+            degraded: true,
+          },
+        });
+    }
+
+    // Write completion timestamp ON SUCCESS only — and only when every child
+    // completed (CDX-4: the cooldown must not suppress the retry of failed or
+    // still-unknown keys) AND nothing was budget-deferred (#4168 adversarial:
+    // "deferred transcripts retry next cycle" is a lie if the next cycle is
+    // cooldown-skipped for half a day).
+    if (failedChildren.length === 0 && budgetExhaustedDeferrals.length === 0) {
+      await engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
+    } else {
+      process.stderr.write(
+        `[dream] synthesize: ${failedChildren.length}/${childOutcomes.length} child job(s) incomplete + ${budgetExhaustedDeferrals.length} deferred — cooldown NOT stamped so the next run retries them.\n`,
+      );
+    }
 
     const ms = Date.now() - start;
-    const submittedTranscripts = worthProcessing.length - skipReports.length;
-    return ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s`, {
+    // Adversarial F3: deferred transcripts were NOT synthesized — a run that
+    // deferred 8 of 10 must not report "10 synthesized".
+    const submittedTranscripts = Math.max(
+      0,
+      worthProcessing.length - skipReports.length - budgetExhaustedDeferrals.length,
+    );
+    const turnsSamples = childOutcomes.filter(
+      (o): o is { jobId: number; status: string; turns: number } => typeof o.turns === 'number',
+    );
+    return ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
       transcripts_discovered: transcripts.length,
       transcripts_processed: submittedTranscripts,
       pages_written: writtenSlugs.length,
@@ -738,10 +1091,43 @@ export async function runPhaseSynthesize(
       // transcript for single-chunk). Differs from transcripts_processed
       // when chunking is in play.
       children_submitted: childIds.length,
-      // D5 cap hits + D8 legacy-key skips. Empty when nothing skipped.
+      budget_deferred_transcripts: budgetExhaustedDeferrals,
+      // D5 cap hits + D8 legacy-key skips + daily_cap_reached. Empty when nothing skipped.
       skips: skipReports,
       summary_slug: summarySlug,
       verdicts,
+      triage: triageDetails,
+      synthesis: {
+        jobs: childIds.length,
+        max_turns_config: config.maxTurns,
+        avg_turns: turnsSamples.length > 0
+          ? Math.round((turnsSamples.reduce((a, o) => a + o.turns, 0) / turnsSamples.length) * 10) / 10
+          : null,
+        // #4216 execution-path mix.
+        mode: config.mode,
+        oneshot_jobs: childOutcomes.filter(o => o.synth_mode_used === 'oneshot').length,
+        fallback_jobs: childOutcomes.filter(o => o.synth_mode_used === 'agentic_fallback').length,
+        agentic_jobs: childOutcomes.filter(o => o.synth_mode_used === 'agentic').length,
+        fallback_reasons: childOutcomes.reduce<Record<string, number>>((acc, o) => {
+          if (o.fallback_reason) acc[o.fallback_reason] = (acc[o.fallback_reason] ?? 0) + 1;
+          return acc;
+        }, {}),
+        // #4194 drain observability.
+        inline_concurrency_config: config.inlineConcurrency,
+        inline_concurrency_effective: effectiveConcurrency,
+        drain_ms: drainMs,
+        queue_wait_ms_p50: queueWaitP50,
+        queue_wait_ms_p95: queueWaitP95,
+        child_runtime_ms_p50: runtimeP50,
+        child_runtime_ms_p95: runtimeP95,
+        // CDX-4: dead-child visibility (0 on a clean run). dead_jobs counts
+        // TERMINAL failures only (dead/cancelled — same semantics as the
+        // failure-path details); non_completed_jobs additionally includes
+        // 'timeout' (parent stopped waiting, outcome unknown).
+        dead_jobs: deadChildren.length,
+        non_completed_jobs: failedChildren.length,
+        degraded: failedChildren.length > 0,
+      },
     });
   } catch (e) {
     return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL',
@@ -751,14 +1137,33 @@ export async function runPhaseSynthesize(
 
 // ── Config ────────────────────────────────────────────────────────────
 
-interface SynthConfig {
+export interface SynthTriageConfig {
+  /** Resolved triage model. Precedence: models.dream.triage > models.dream.synthesize_verdict > dream.synthesize.verdict_model > tier utility. */
+  model: string;
+  /** Read-time gate (dream.triage.threshold, default 0.5, clamped [0,1]). 0 = synthesize everything judged. */
+  threshold: number;
+  /** Sample window (dream.triage.max_chars, default 24000, floor 1000). NOT part of cache validity. */
+  maxChars: number;
+  /** Judge output budget (dream.triage.max_tokens, default 2048, floor 256). NOT part of cache validity. */
+  maxTokens: number;
+  /** Wall-clock miss budget per pass (dream.triage.max_ms, default 300000, 0 = unlimited). */
+  maxMs: number;
+  /** Concurrent judge calls (dream.triage.concurrency, default 4, clamped [1,16]). */
+  concurrency: number;
+}
+
+export interface SynthConfig {
   enabled: boolean;
   corpusDir: string | null;
   meetingTranscriptsDir: string | null;
   minChars: number;
   excludePatterns: string[];
   model: string;
-  verdictModel: string;
+  triage: SynthTriageConfig;
+  /** dream.synthesize.max_turns, default 16 (see DEFAULT_MAX_TURNS rationale), floor 1. */
+  maxTurns: number;
+  /** dream.synthesize.max_submissions_per_source_per_day, default 0 = disabled (D2D). Docs recommend 200 for busy deployments. */
+  maxSubmissionsPerSourcePerDay: number;
   cooldownHours: number;
   /**
    * D1: Override the per-chunk token budget (model_context × HEADROOM_RATIO
@@ -783,6 +1188,29 @@ interface SynthConfig {
   outputRoot: string;
   subagentTimeoutMs: number;
   subagentWaitTimeoutMs: number;
+  /**
+   * #4194: concurrent inline-drain loops for this phase's private child
+   * queue. Config `dream.synthesize.inline_concurrency`, default 1 (serial —
+   * the pre-#4194 behavior), clamped [1,8]. PGLite is FORCED serial at the
+   * callsite (exclusive-engine safety). Provider ceilings stay with the rate
+   * leases — this knob only parallelizes the drain machinery.
+   */
+  inlineConcurrency: number;
+  /**
+   * #4216: inject the pre-retrieval LINK CANDIDATES manifest into the
+   * synthesis prompt (both modes). Config `dream.synthesize.link_manifest`,
+   * default true. Zero-embed retrieval from triage entities/segments; turning
+   * it off restores the pre-wave "search for targets yourself" prompt.
+   */
+  linkManifest: boolean;
+  /**
+   * #4216: synthesis execution mode. 'oneshot' (DEFAULT) = one structured
+   * completion + programmatic validated writes with automatic per-transcript
+   * fallback to the agentic loop; 'agentic' = the classic multi-turn tool
+   * loop. Config `dream.synthesize.mode`; unknown values warn + default.
+   * Revert dial: `gbrain config set dream.synthesize.mode agentic`.
+   */
+  mode: 'agentic' | 'oneshot';
 }
 
 /** #2415: shared output-root resolution (synthesize + patterns phases). */
@@ -797,7 +1225,7 @@ export async function loadOutputRoot(engine: BrainEngine): Promise<string> {
   return 'wiki';
 }
 
-async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
+export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
   const enabledRaw = await engine.getConfig('dream.synthesize.enabled');
   const corpusDir = await engine.getConfig('dream.synthesize.session_corpus_dir');
   // v2: enabled defaults to true when corpus dir is configured, false otherwise.
@@ -806,19 +1234,43 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
   const meetingTranscriptsDir = await engine.getConfig('dream.synthesize.meeting_transcripts_dir');
   const excludeStr = await engine.getConfig('dream.synthesize.exclude_patterns');
   // v0.28: resolveModel() unifies CLI flag > new key > deprecated key > models.default > env > fallback
-  const { resolveModel } = await import('../model-config.ts');
+  const { resolveModel, resolveAlias } = await import('../model-config.ts');
   const model = await resolveModel(engine, {
     configKey: 'models.dream.synthesize',
     deprecatedConfigKey: 'dream.synthesize.model',
     tier: 'reasoning',
     fallback: 'sonnet',
   });
-  const verdictModel = await resolveModel(engine, {
-    configKey: 'models.dream.synthesize_verdict',
-    deprecatedConfigKey: 'dream.synthesize.verdict_model',
-    tier: 'utility',
-    fallback: 'haiku',
-  });
+  // #4152 (eng-review 2A): `models.dream.triage` is the preferred key, read
+  // via an EXPLICIT pre-read (not resolveModel's cliFlag slot — that slot
+  // stays free for a future real CLI flag). Both legacy spellings keep
+  // resolving through the standard chain when the new key is unset.
+  const triageModelOverride = await engine.getConfig('models.dream.triage');
+  const verdictModel = triageModelOverride?.trim()
+    ? await resolveAlias(engine, triageModelOverride.trim())
+    : await resolveModel(engine, {
+        configKey: 'models.dream.synthesize_verdict',
+        deprecatedConfigKey: 'dream.synthesize.verdict_model',
+        tier: 'utility',
+        fallback: 'haiku',
+      });
+  // Triage knobs. getNumberConfig honors a configured 0 where 0 is meaningful
+  // (threshold 0 = synthesize everything judged; max_ms 0 = unlimited).
+  let triageThreshold = await getNumberConfig(engine, 'dream.triage.threshold', DEFAULT_TRIAGE_THRESHOLD);
+  if (triageThreshold < 0 || triageThreshold > 1) {
+    process.stderr.write(
+      `[dream] dream.triage.threshold ${triageThreshold} is outside [0,1]; clamping.\n`,
+    );
+    triageThreshold = Math.min(1, Math.max(0, triageThreshold));
+  }
+  const triageMaxChars = Math.max(1000, await getNumberConfig(engine, 'dream.triage.max_chars', DEFAULT_TRIAGE_MAX_CHARS));
+  const triageMaxTokens = Math.max(256, await getNumberConfig(engine, 'dream.triage.max_tokens', DEFAULT_TRIAGE_MAX_TOKENS));
+  const triageMaxMs = Math.max(0, await getNumberConfig(engine, 'dream.triage.max_ms', DEFAULT_TRIAGE_MAX_MS));
+  const triageConcurrency = Math.max(1, Math.min(16,
+    Math.floor(await getNumberConfig(engine, 'dream.triage.concurrency', DEFAULT_TRIAGE_CONCURRENCY)) || 1));
+  const maxTurns = Math.max(1, Math.floor(await getNumberConfig(engine, 'dream.synthesize.max_turns', DEFAULT_MAX_TURNS)) || 1);
+  const maxSubmissionsPerSourcePerDay = Math.max(0,
+    Math.floor(await getNumberConfig(engine, 'dream.synthesize.max_submissions_per_source_per_day', 0)));
   // getNumberConfig (not `parseInt(str, 10) || N`) so a configured 0 is honored — a bare
   // `|| N` coerces an explicit 0 back to the default (cooldown 0 = "no cooldown").
   const cooldownHours = Math.max(0, await getNumberConfig(engine, 'dream.synthesize.cooldown_hours', 12));
@@ -835,8 +1287,23 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
     'dream.synthesize.subagent_wait_timeout_ms',
     DEFAULT_SUBAGENT_WAIT_TIMEOUT_MS,
   );
+  // #4194: clamp [1,8] — 8 stays under the default lease cap (32) so a
+  // misconfigured pool can never self-starve the provider bucket.
+  const inlineConcurrency = Math.max(1, Math.min(8,
+    Math.floor(await getNumberConfig(engine, 'dream.synthesize.inline_concurrency', 1)) || 1));
+  // #4216: manifest default ON; only an explicit 'false'/'0'/'off' disables.
+  const linkManifestRaw = (await engine.getConfig('dream.synthesize.link_manifest'))?.trim().toLowerCase();
+  const linkManifest = !(linkManifestRaw === 'false' || linkManifestRaw === '0' || linkManifestRaw === 'off');
+  // #4216: mode default 'oneshot' (D1=A). loadOutputRoot pattern: unknown
+  // values warn to stderr and fall back to the default rather than failing.
+  const modeRaw = (await engine.getConfig('dream.synthesize.mode'))?.trim().toLowerCase();
+  let synthMode: 'agentic' | 'oneshot' = 'oneshot';
+  if (modeRaw === 'agentic') synthMode = 'agentic';
+  else if (modeRaw && modeRaw !== 'oneshot') {
+    process.stderr.write(`[dream] dream.synthesize.mode "${modeRaw}" is not 'oneshot' | 'agentic'; using 'oneshot'.\n`);
+  }
 
-  let excludePatterns: string[] = ['medical', 'therapy'];
+  let excludePatterns: string[] = [...DEFAULT_EXCLUDE_PATTERNS];
   if (excludeStr) {
     try {
       const parsed = JSON.parse(excludeStr);
@@ -868,14 +1335,46 @@ async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig> {
     minChars,
     excludePatterns,
     model,
-    verdictModel,
+    triage: {
+      model: verdictModel,
+      threshold: triageThreshold,
+      maxChars: triageMaxChars,
+      maxTokens: triageMaxTokens,
+      maxMs: triageMaxMs,
+      concurrency: triageConcurrency,
+    },
+    maxTurns,
+    maxSubmissionsPerSourcePerDay,
     cooldownHours,
     maxPromptTokens,
     maxChunksPerTranscript,
     outputRoot: await loadOutputRoot(engine),
     subagentTimeoutMs,
     subagentWaitTimeoutMs,
+    inlineConcurrency,
+    linkManifest,
+    mode: synthMode,
   };
+}
+
+/**
+ * Count dream synth-v2 subagent submissions for a source in the last 24h —
+ * the opt-in daily-cap denominator. Filters on `data->>'source_id'` (NOT a
+ * LIKE on the key's encoded source segment — avoids LIKE-metachar issues);
+ * cancelled rows are excluded so retriage-cancelled jobs don't eat budget.
+ */
+async function countRecentSynthSubmissions(engine: BrainEngine, sourceId: string): Promise<number> {
+  const rows = await engine.executeRaw<{ n: number }>(
+    `SELECT COUNT(*)::int AS n
+       FROM minion_jobs
+      WHERE name = 'subagent'
+        AND idempotency_key LIKE 'dream:synth-v2:%'
+        AND COALESCE(NULLIF(data->>'source_id', ''), 'default') = $1
+        AND status <> 'cancelled'
+        AND created_at > NOW() - INTERVAL '24 hours'`,
+    [sourceId],
+  );
+  return rows[0]?.n ?? 0;
 }
 
 async function getNumberConfig(
@@ -1019,15 +1518,36 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
       });
 
       // Map gateway.ChatResult → Anthropic.Message shape. judgeSignificance
-      // reads `.content[0].type === 'text'` and `.content[0].text`; other
-      // fields are best-effort for downstream telemetry parity.
+      // reads `.content[0].type === 'text'`, `.content[0].text`, and
+      // `.stop_reason`; other fields are best-effort for downstream
+      // telemetry parity. The stopReason mapping is load-bearing:
+      // 'length' → 'max_tokens' lets judgeSignificance detect a truncated
+      // verdict (reasoning models can burn the whole max_tokens budget on
+      // reasoning tokens, leaving empty/partial text) and
+      // 'refusal'/'content_filter' → 'refusal' surfaces a blocked response,
+      // instead of silently treating either as a clean end-of-turn.
+      // 'other' (gateway's mapStopReason catch-all — unknown provider
+      // finish reasons, which includes both non-standard SUCCESSFUL stops
+      // and the AI SDK's 'error'/'unknown' labels) maps to 'end_turn'
+      // deliberately. Rationale: (a) treating 'other' as abnormal would
+      // permanently disable verdict caching on providers whose successful
+      // stops the gateway doesn't recognize; (b) the residual risk is
+      // narrow — an errored response only gets cached if it still contains
+      // a complete, parseable JSON object with a finite numeric score in
+      // [0,1] (unparseable output is never cached), and such a complete
+      // verdict is trustworthy regardless of the finish label. Distinguishing
+      // error/unknown from benign-unknown belongs in gateway.ts's
+      // mapStopReason (out of scope here — see PR notes).
       return {
         id: '',
         type: 'message',
         role: 'assistant',
         model: modelStr,
         content: [{ type: 'text', text: result.text }],
-        stop_reason: 'end_turn',
+        stop_reason: result.stopReason === 'length' ? 'max_tokens'
+          : result.stopReason === 'tool_calls' ? 'tool_use'
+          : (result.stopReason === 'refusal' || result.stopReason === 'content_filter') ? 'refusal'
+          : 'end_turn',
         stop_sequence: null,
         usage: {
           input_tokens: result.usage.input_tokens,
@@ -1038,81 +1558,590 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
   };
 }
 
-interface VerdictResult {
+export interface TriageResult {
+  /**
+   * Ordinal salience score in [0,1] — NOT a calibrated probability.
+   * Comparable only within (model, TRIAGE_VERSION), which is exactly the
+   * cache-validity tuple. 0 on degenerate results (never cached anyway).
+   */
+  score: number;
+  content_type: string | null;
+  /** ≤8 candidate segments, quotes clipped to 300 chars, notes to 200. */
+  segments: TriageSegment[];
+  /** ≤12 entity candidates, each clipped to 80 chars. */
+  entities: string[];
+  /** Derived at judge time as `score >= DEFAULT_TRIAGE_THRESHOLD` (back-compat column). */
   worth_processing: boolean;
   reasons: string[];
+  /**
+   * Set when the judgement is degenerate and must NOT be cached in
+   * dream_verdicts:
+   *   'truncated'   — the response hit max_tokens (reasoning models can spend
+   *                   the whole budget on reasoning tokens before emitting the
+   *                   verdict JSON), so the verdict is unreliable;
+   *   'refusal'     — the model refused or a provider content filter blocked
+   *                   the response (stop_reason=refusal);
+   *   'unparseable' — no JSON object with a finite numeric `score` in [0,1]
+   *                   could be parsed out of the response. Out-of-range scores
+   *                   land here deliberately — clamping would cache a
+   *                   fabricated verdict.
+   * runTriagePass skips putDreamVerdict for these so the next cycle re-judges
+   * the transcript instead of permanently trusting a degenerate rejection.
+   */
+  unreliable?: 'truncated' | 'refusal' | 'unparseable';
+}
+
+/** Degenerate TriageResult factory — score 0, never cached (unreliable is always set). */
+function degenerateTriage(
+  unreliable: NonNullable<TriageResult['unreliable']>,
+  reason: string,
+): TriageResult {
+  return {
+    score: 0,
+    content_type: null,
+    segments: [],
+    entities: [],
+    worth_processing: false,
+    reasons: [reason],
+    unreliable,
+  };
+}
+
+/**
+ * Build the judge sample: full content when it fits in maxChars, else a
+ * head 50% / middle 20% / tail 30% three-window sample so mid-transcript
+ * signal is not structurally invisible to a cached verdict (#4152 C5).
+ *
+ * v0.41.13 surrogate-safety: every split index routes through safeSplitIndex
+ * so an emoji at a window boundary never produces a lone surrogate that
+ * Anthropic's JSON parser rejects ("no low surrogate in string", caught
+ * 2026-05-24 on telegram). Contract: the sampling branch only runs when
+ * content.length > maxChars (>= 1000 floor), so every raw index below is
+ * strictly inside (0, length). The middle window is clamped between the head
+ * and tail windows; when length is barely over maxChars the clamp collapses
+ * it to nothing rather than duplicating head/tail content.
+ */
+function buildTriageSample(content: string, maxChars: number): { text: string; sampledPct: number | null } {
+  if (content.length <= maxChars) return { text: content, sampledPct: null };
+  const headLen = Math.floor(maxChars * 0.5);
+  const midLen = Math.floor(maxChars * 0.2);
+  const tailLen = maxChars - headLen - midLen;
+  const headEnd = safeSplitIndex(content, headLen);
+  const tailStart = safeSplitIndex(content, content.length - tailLen);
+  const midStartRaw = Math.max(headEnd, Math.floor((content.length - midLen) / 2));
+  const midEndRaw = Math.min(tailStart, midStartRaw + midLen);
+  let middle = '';
+  if (midEndRaw > midStartRaw) {
+    const midStart = safeSplitIndex(content, midStartRaw);
+    const midEnd = safeSplitIndex(content, midEndRaw);
+    if (midEnd > midStart) middle = content.slice(midStart, midEnd) + '\n[...truncated...]\n';
+  }
+  const text = content.slice(0, headEnd) + '\n[...truncated...]\n' + middle + content.slice(tailStart);
+  return { text, sampledPct: Math.max(1, Math.round((maxChars / content.length) * 100)) };
 }
 
 export async function judgeSignificance(
   client: JudgeClient,
   t: DiscoveredTranscript,
   verdictModel = 'claude-haiku-4-5-20251001',
-): Promise<VerdictResult> {
-  // Truncate the transcript at 8K chars for cost control. Haiku's verdict
-  // doesn't need the full body; the opening + closing sections are usually
-  // representative of significance.
-  //
-  // v0.41.13 surrogate-safety (supersedes PRs #1559+#1561's safeSliceEnd
-  // helper; see text-safe.ts:18-21 module docstring for why that helper
-  // re-introduces the case-3 bug the canonical safeSplitIndex was written
-  // to fix). Routes head + tail slicing through safeSplitIndex so an emoji
-  // at offset 4000 (or length-4000) never produces a lone surrogate that
-  // Anthropic's JSON parser rejects ("no low surrogate in string", caught
-  // 2026-05-24 on telegram).
-  //
-  // Contract: this branch only runs when content.length > 8000, so
-  // length - 4000 > 4000 > 0 — safeSplitIndex never sees an out-of-range
-  // maxChars here. (Codex C-10 documented contract.)
-  let trimmed: string;
-  if (t.content.length > 8000) {
-    const headEnd = safeSplitIndex(t.content, 4000);
-    const tailStart = safeSplitIndex(t.content, t.content.length - 4000);
-    trimmed = t.content.slice(0, headEnd) + '\n[...truncated...]\n' + t.content.slice(tailStart);
-  } else {
-    trimmed = t.content;
-  }
+  opts: { maxChars?: number; maxTokens?: number } = {},
+): Promise<TriageResult> {
+  const maxChars = Math.max(1000, opts.maxChars ?? DEFAULT_TRIAGE_MAX_CHARS);
+  const { text: trimmed, sampledPct } = buildTriageSample(t.content, maxChars);
 
-  const sys = `You judge whether a conversation transcript is worth synthesizing into a personal knowledge brain.
+  // Score bands are NON-OVERLAPPING with no gaps (outside-voice C7). The
+  // score is an ordinal salience rating, not a calibrated probability;
+  // comparability holds within (model, TRIAGE_VERSION) only — exactly the
+  // cache-validity tuple runTriagePass enforces.
+  const sys = `You triage a conversation transcript for synthesis into a personal knowledge brain.
+Score how much durable, synthesis-worthy signal it contains.
 
-WORTH PROCESSING (return worth_processing=true):
+HIGH signal (score 0.70-1.0):
 - The user articulates a new idea, frame, mental model, or thesis
 - The user reflects on themselves, names patterns, processes emotion
 - The user discusses specific people, companies, or decisions in depth
 - The user makes a strategic call worth remembering
+MEDIUM (score 0.30-0.69): some original thought mixed into routine content.
+LOW (score 0.0-0.29): routine ops ("check my email", "schedule X"), pure code
+debugging without reflection, short exchanges with no original thought,
+repetitive content the brain already has.
 
-NOT WORTH PROCESSING (return worth_processing=false):
-- Routine ops ("check my email", "schedule X")
-- Pure code debugging without user reflection
-- Short message exchanges with no original thought
-- Repetitive content the brain already has
-
-Respond as JSON: {"worth_processing": <bool>, "reasons": ["<short>", "<short>"]}.
-Two reasons max, one phrase each.`;
+Respond with ONLY a JSON object:
+{
+  "score": <number between 0.0 and 1.0>,
+  "content_type": "<one of: reflection|idea|people|strategy|technical|routine|mixed>",
+  "segments": [{"quote": "<verbatim quote from the transcript, max 200 chars>",
+                "note": "<why it matters, max 12 words>"}],
+  "entities": ["<person, company, or project named in the transcript>"],
+  "reasons": ["<short phrase>", "<short phrase>"]
+}
+At most 8 segments (the most synthesis-worthy passages), at most 12 entities,
+two reasons. Quote verbatim; never paraphrase inside "quote".`;
 
   const msg = await client.create({
     model: verdictModel,
-    max_tokens: 200,
+    // 2048: the segments+entities JSON needs ~700 tokens worst case, and
+    // reasoning models spend output budget on reasoning tokens BEFORE the
+    // visible text, so a tight cap gets eaten whole and the verdict comes
+    // back empty/truncated. (Judge-call ballpark elsewhere: grade-takes.ts
+    // 600, eval-contradictions/judge.ts 1024 — this one carries segments.)
+    max_tokens: opts.maxTokens ?? DEFAULT_TRIAGE_MAX_TOKENS,
     system: sys,
     messages: [{ role: 'user', content: `Transcript ${t.basename}:\n\n${trimmed}` }],
   });
 
-  for (const block of msg.content) {
-    if (block.type === 'text') {
-      const text = block.text.trim();
-      const m = /\{[\s\S]*\}/.exec(text);
-      if (!m) continue;
+  // stop_reason === 'max_tokens' means the response was cut off; 'refusal'
+  // means the model refused or a content filter blocked it. Even if a
+  // parseable JSON object survives either condition, don't trust it as a
+  // durable verdict — mark it unreliable so the caller skips the
+  // dream_verdicts write and the next cycle re-judges. (Legacy SDK-shape
+  // clients and mocks without a stop_reason field land on undefined here,
+  // which is treated as a clean stop — preserves the pre-existing contract.)
+  // Widen: the pinned Anthropic SDK's stop_reason union predates 'refusal',
+  // but the gateway adapter (and newer SDKs) can emit it.
+  const stopReasonRaw = (msg as { stop_reason?: string | null }).stop_reason;
+  const truncated = stopReasonRaw === 'max_tokens';
+  const refused = stopReasonRaw === 'refusal';
+  const abnormalStop: TriageResult['unreliable'] | undefined =
+    truncated ? 'truncated' : refused ? 'refusal' : undefined;
+
+  const text = msg.content
+    .map(b => (b.type === 'text' ? b.text : ''))
+    .join('')
+    .trim();
+  const parsed = parseLlmJson<{
+    score?: unknown;
+    content_type?: unknown;
+    segments?: unknown;
+    entities?: unknown;
+    reasons?: unknown;
+  }>(text);
+
+  // Discriminant: a finite numeric score is REQUIRED. A JSON object without
+  // one (`{}`, `{"score": "0.7"}`) is NOT a verdict — treat as unparseable
+  // rather than coercing to a cacheable rejection.
+  if (parsed && typeof parsed.score === 'number' && Number.isFinite(parsed.score)) {
+    const score = parsed.score;
+    // NEW rule vs the boolean era: out-of-range scores are degenerate, never
+    // clamped — clamping would cache a fabricated verdict (same poison class
+    // the unreliable contract exists to prevent).
+    if (score < 0 || score > 1) {
+      return degenerateTriage('unparseable', `score out of range: ${score}`);
+    }
+    // Optional fields are LENIENT — bad shapes are dropped/nulled, never
+    // unreliable on their own. Only the score is load-bearing.
+    // Whitespace is COLLAPSED (not just trimmed) on every field that later
+    // rides into the synthesis prompt: an interior newline in an LLM-produced
+    // "quote" could otherwise spoof structural prompt lines in
+    // buildTriageMapBlock (security review, #4152).
+    const collapse = (s: string): string => s.replace(/\s+/g, ' ').trim();
+    const contentType = typeof parsed.content_type === 'string'
+      ? collapse(parsed.content_type).toLowerCase().slice(0, 40) || null
+      : null;
+    const segments: TriageSegment[] = Array.isArray(parsed.segments)
+      ? parsed.segments
+          .filter((s): s is { quote: string; note?: unknown } =>
+            !!s && typeof s === 'object' && typeof (s as { quote?: unknown }).quote === 'string'
+            && (s as { quote: string }).quote.trim().length > 0)
+          .slice(0, 8)
+          .map(s => ({
+            quote: collapse(s.quote).slice(0, 300),
+            ...(typeof s.note === 'string' && s.note.trim() ? { note: collapse(s.note).slice(0, 200) } : {}),
+          }))
+      : [];
+    const entities = Array.isArray(parsed.entities)
+      ? parsed.entities
+          .filter((e): e is string => typeof e === 'string' && e.trim().length > 0)
+          .slice(0, 12)
+          .map(e => collapse(e).slice(0, 80))
+      : [];
+    const reasons = Array.isArray(parsed.reasons)
+      ? parsed.reasons.filter((r): r is string => typeof r === 'string').slice(0, 4)
+      : [];
+    if (sampledPct !== null) reasons.push(`sampled: ~${sampledPct}% of transcript`);
+    const result: TriageResult = {
+      score,
+      content_type: contentType,
+      segments,
+      entities,
+      worth_processing: score >= DEFAULT_TRIAGE_THRESHOLD,
+      reasons,
+    };
+    return abnormalStop ? { ...result, unreliable: abnormalStop } : result;
+  }
+
+  // Couldn't parse a scored verdict — default to NOT processing this cycle,
+  // but flag the result unreliable so it is never cached permanently.
+  if (truncated) {
+    return degenerateTriage('truncated', 'judge response truncated (stop_reason=max_tokens)');
+  }
+  if (refused) {
+    return degenerateTriage('refusal', 'judge response refused or content-filtered (stop_reason=refusal)');
+  }
+  return degenerateTriage('unparseable', 'judge response unparseable');
+}
+
+// ── Synth-v2 idempotency-key grammar (#4152 retriage) ─────────────────
+
+export interface ParsedSynthV2Key {
+  source: string;
+  basename: string;
+  hash16: string;
+  chunk?: { i: number; n: number };
+}
+
+/**
+ * Parse a `dream:synth-v2:<source>:filename:<basename>:<hash16>[:c<i>of<n>]`
+ * idempotency key. Returns null on anything outside the grammar (including
+ * malformed percent-encoding) — retriage treats unparseable keys as
+ * unmatched, never cancels on a guess. Lives next to the producer above so
+ * the grammar can't drift.
+ */
+export function parseSynthV2Key(key: string): ParsedSynthV2Key | null {
+  const m = /^dream:synth-v2:([^:]*):filename:([^:]*):([0-9a-f]{16})(?::c(\d+)of(\d+))?$/.exec(key);
+  if (!m) return null;
+  try {
+    const source = decodeURIComponent(m[1]);
+    const base = decodeURIComponent(m[2]);
+    if (m[4] !== undefined && m[5] !== undefined) {
+      return { source, basename: base, hash16: m[3], chunk: { i: parseInt(m[4], 10), n: parseInt(m[5], 10) } };
+    }
+    return { source, basename: base, hash16: m[3] };
+  } catch {
+    return null;
+  }
+}
+
+// ── Triage pass (#4152) — shared by the synthesize phase and dream retriage ──
+
+/**
+ * Single source of truth for triage cache validity (#4152 C8). Lives next to
+ * TRIAGE_VERSION so the tuple can't drift across its three consumers
+ * (runTriagePass, retriage's dry-run reads, retriage's spend estimate).
+ * A row is valid when it carries a score, matches BOTH the current prompt
+ * version and the resolved model, and postdates `staleBefore` (when set).
+ */
+export function isTriageCacheValid(
+  cached: Pick<DreamVerdict, 'score' | 'triage_version' | 'model' | 'judged_at'>,
+  model: string,
+  staleBefore?: Date,
+): boolean {
+  return cached.score !== null
+    && cached.triage_version === TRIAGE_VERSION
+    && cached.model === model
+    && (!staleBefore || Date.parse(cached.judged_at) >= staleBefore.getTime());
+}
+
+/**
+ * Liveness grace for per-run `dream-inline-<ms>-<uuid8>` queues (outside-voice
+ * CX1). A queue younger than this may belong to a cycle that is STILL running
+ * (children waiting for its inline drain) — neither retriage's backlog
+ * conversion nor the fan-out self-heal may cancel rows in it. 1h comfortably
+ * covers the 35-min default subagent wait + drain latency.
+ */
+export const DREAM_INLINE_LIVE_GRACE_MS = 60 * 60 * 1000;
+
+/**
+ * Parse the creation timestamp out of a `dream-inline-<ms>-<uuid8>` queue
+ * name; null for anything outside the grammar. Used to decide whether a
+ * private per-run queue is provably dead (older than the grace) or possibly
+ * live.
+ */
+export function dreamInlineQueueAgeMs(queueName: string, nowMs = Date.now()): number | null {
+  const m = /^dream-inline-(\d{10,16})-[0-9a-f]{8}$/.exec(queueName);
+  if (!m) return null;
+  const ts = Number(m[1]);
+  if (!Number.isFinite(ts)) return null;
+  return nowMs - ts;
+}
+
+export interface TriagePassCfg {
+  /** Resolved triage model (provider-prefixed or bare claude-*). Part of cache validity. */
+  model: string;
+  maxChars: number;
+  maxTokens: number;
+  /** Read-time gate; stamps `worth` on reports. Stored verdicts derive from DEFAULT_TRIAGE_THRESHOLD instead. */
+  threshold: number;
+  /** Concurrent judge calls, clamped [1,16]. */
+  concurrency: number;
+  /** Wall-clock budget (ms) for cache-MISS judging; 0 = unlimited. Hits are always free. */
+  maxMs: number;
+  /** Retriage: ignore the cache entirely. */
+  force?: boolean;
+  /** Retriage --since: cached rows judged before this instant are stale (re-judged). */
+  staleBefore?: Date;
+  /** Test seam: judge client override (null = simulate no reachable provider). */
+  judge?: JudgeClient | null;
+  /** Test seam: clock for the maxMs budget. */
+  now?: () => number;
+  /** Retriage --max-usd: called after each judged file; return true to stop pulling new misses. */
+  shouldStop?: () => boolean;
+}
+
+export interface TriageFileReport {
+  filePath: string;
+  /** Passed the read-time gate (`score >= cfg.threshold`). False for degraded/deferred. */
+  worth: boolean;
+  score: number | null;
+  content_type: string | null;
+  reasons: string[];
+  cached: boolean;
+  unreliable?: string;
+  /** True when the maxMs budget (or shouldStop) expired before this file could be judged. */
+  deferred?: boolean;
+}
+
+export interface TriagePassResult {
+  /** One report per transcript, in discovery order. */
+  reports: TriageFileReport[];
+  /** filePath → usable verdict (cache hit or fresh reliable judgment). Degraded/deferred files are absent. */
+  byPath: Map<string, DreamVerdict>;
+  judged: number;
+  cacheHits: number;
+  unreliable: number;
+  deferred: number;
+}
+
+/**
+ * Run scored triage over a transcript set with a bounded worker pool.
+ *
+ * Cache validity (outside-voice C8): a dream_verdicts row is a HIT only when
+ * `score` is non-null AND `triage_version === TRIAGE_VERSION` AND
+ * `model === cfg.model` (switching models re-judges, bounded by maxMs) AND it
+ * postdates `staleBefore` (when set) AND `force` is off. Legacy boolean-era
+ * rows always miss. `maxChars`/`maxTokens` are deliberately NOT part of
+ * validity — tuning them must not cold-restart the corpus; use
+ * `gbrain dream retriage --force` to re-judge under new sampling knobs.
+ *
+ * Time budget: once `now() - start > maxMs` (>0), workers stop pulling new
+ * MISSES — remaining misses are reported `deferred` (not cached, not
+ * synthesized) and the next pass continues where this one stopped, because
+ * hits are free. In-flight judge calls at expiry complete and ARE cached
+ * (no torn judgments).
+ *
+ * Failure contract (byte-compatible with the pre-#4152 sequential loop):
+ * a null judge client or an AIConfigError degrades PER TRANSCRIPT (reason
+ * entry, nothing cached, phase continues); any other error aborts new pulls,
+ * lets in-flight items settle, and rethrows (the phase fails).
+ *
+ * Lock renewal: `yieldDuringPhase` ticks at most once per 30s (single-flight).
+ * The cycle lock has its own background refresher (cycle.ts
+ * startCycleLockRefresher); this coarse tick serves the Minion JOB lock on
+ * the hook path per the cycle.ts:618 split.
+ */
+export async function runTriagePass(
+  engine: BrainEngine,
+  transcripts: DiscoveredTranscript[],
+  cfg: TriagePassCfg,
+  yieldDuringPhase?: () => Promise<void>,
+): Promise<TriagePassResult> {
+  const now = cfg.now ?? Date.now;
+  const start = now();
+  const concurrency = Math.max(1, Math.min(16, Math.floor(cfg.concurrency) || 1));
+  const judge = cfg.judge !== undefined ? cfg.judge : makeJudgeClient(cfg.model);
+
+  const reports: TriageFileReport[] = new Array(transcripts.length);
+  const byPath = new Map<string, DreamVerdict>();
+  let judged = 0;
+  let cacheHits = 0;
+  let unreliableCount = 0;
+  let deferredCount = 0;
+
+  let cursor = 0;
+  let abortError: unknown = null;
+  let stopped = false;
+
+  // Coarse single-flight lock-renewal tick (at most every 30s).
+  let lastTick = start;
+  let tickInFlight = false;
+  const maybeTick = (): void => {
+    if (!yieldDuringPhase || tickInFlight || now() - lastTick < 30_000) return;
+    tickInFlight = true;
+    lastTick = now();
+    yieldDuringPhase()
+      .catch(() => { /* best-effort */ })
+      .finally(() => { tickInFlight = false; });
+  };
+
+  const budgetExhausted = (): boolean =>
+    stopped || (cfg.maxMs > 0 && now() - start > cfg.maxMs);
+
+  const gateWorth = (score: number | null): boolean =>
+    score !== null && score >= cfg.threshold;
+
+  const processOne = async (idx: number): Promise<void> => {
+    const t = transcripts[idx];
+    // Cache lookup is always free — never deferred by the time budget.
+    const cached = cfg.force ? null : await engine.getDreamVerdict(t.filePath, t.contentHash);
+    const cacheValid = cached !== null && isTriageCacheValid(cached, cfg.model, cfg.staleBefore);
+    if (cached && cacheValid) {
+      cacheHits++;
+      byPath.set(t.filePath, cached);
+      reports[idx] = {
+        filePath: t.filePath,
+        worth: gateWorth(cached.score),
+        score: cached.score,
+        content_type: cached.content_type,
+        reasons: cached.reasons,
+        cached: true,
+      };
+      return;
+    }
+    if (budgetExhausted()) {
+      deferredCount++;
+      reports[idx] = {
+        filePath: t.filePath,
+        worth: false,
+        score: null,
+        content_type: null,
+        reasons: ['triage deferred: dream.triage.max_ms budget reached'],
+        cached: false,
+        deferred: true,
+      };
+      return;
+    }
+    if (!judge) {
+      // No configured provider for the triage model — per-transcript degrade,
+      // nothing cached, phase continues (pre-#4152 contract preserved).
+      reports[idx] = {
+        filePath: t.filePath,
+        worth: false,
+        score: null,
+        content_type: null,
+        reasons: [`no configured provider for verdict model: ${cfg.model}`],
+        cached: false,
+      };
+      return;
+    }
+    try {
+      let triage: TriageResult;
       try {
-        const parsed = JSON.parse(m[0]) as { worth_processing?: unknown; reasons?: unknown };
-        const worth = parsed.worth_processing === true;
-        const reasons = Array.isArray(parsed.reasons)
-          ? parsed.reasons.filter((r): r is string => typeof r === 'string').slice(0, 4)
-          : [];
-        return { worth_processing: worth, reasons };
-      } catch { /* fall through */ }
+        triage = await judgeSignificance(judge, t, cfg.model, {
+          maxChars: cfg.maxChars,
+          maxTokens: cfg.maxTokens,
+        });
+      } finally {
+        // Spend accounting (outside-voice CX3): the paid call happened whether
+        // or not the verdict came back reliable — tick shouldStop on EVERY
+        // judge attempt (including throws, conservatively) so --max-usd can't
+        // be bypassed by refusals/truncations/unparseable responses.
+        if (cfg.shouldStop?.()) stopped = true;
+      }
+      judged++;
+      if (triage.unreliable) {
+        // Degenerate judgement — do NOT write it to dream_verdicts: a cached
+        // rejection is permanent for this content hash, and a triage model
+        // that reliably truncates would silently reject every transcript
+        // forever. Log + skip so the next cycle re-judges.
+        unreliableCount++;
+        process.stderr.write(
+          `[dream] triage for ${t.basename} was ${triage.unreliable} ` +
+          `(${triage.reasons.join('; ')}); not caching in dream_verdicts — ` +
+          `next cycle will re-judge ${t.filePath}\n`,
+        );
+        reports[idx] = {
+          filePath: t.filePath,
+          worth: false,
+          score: null,
+          content_type: null,
+          reasons: triage.reasons,
+          cached: false,
+          unreliable: triage.unreliable,
+        };
+        return;
+      }
+      await engine.putDreamVerdict(t.filePath, t.contentHash, {
+        worth_processing: triage.worth_processing,
+        reasons: triage.reasons,
+        score: triage.score,
+        content_type: triage.content_type,
+        segments: triage.segments,
+        entities: triage.entities,
+        model: cfg.model,
+        triage_version: TRIAGE_VERSION,
+      });
+      byPath.set(t.filePath, {
+        worth_processing: triage.worth_processing,
+        reasons: triage.reasons,
+        judged_at: new Date().toISOString(),
+        score: triage.score,
+        content_type: triage.content_type,
+        segments: triage.segments,
+        entities: triage.entities,
+        model: cfg.model,
+        triage_version: TRIAGE_VERSION,
+      });
+      reports[idx] = {
+        filePath: t.filePath,
+        worth: gateWorth(triage.score),
+        score: triage.score,
+        content_type: triage.content_type,
+        reasons: triage.reasons,
+        cached: false,
+      };
+    } catch (e) {
+      // AIConfigError at chat time = provider auth/config went bad mid-run
+      // (revoked key, recipe misconfig surfacing at first real call). Skip
+      // this transcript with the gateway error message so the user sees the
+      // shape of the problem in `gbrain dream --phase synthesize --dry-run`.
+      if (e instanceof AIConfigError) {
+        reports[idx] = {
+          filePath: t.filePath,
+          worth: false,
+          score: null,
+          content_type: null,
+          reasons: [`gateway error: ${e.message}`],
+          cached: false,
+        };
+        return;
+      }
+      throw e;
+    }
+  };
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      if (abortError !== null) return;
+      const idx = cursor++;
+      if (idx >= transcripts.length) return;
+      try {
+        await processOne(idx);
+      } catch (e) {
+        // Hard error: stop pulling new items; in-flight workers settle; the
+        // first error propagates after the pool drains (phase fails, matching
+        // the pre-#4152 `throw e`).
+        if (abortError === null) abortError = e;
+        return;
+      }
+      maybeTick();
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, Math.max(1, transcripts.length)) }, () => worker()),
+  );
+  if (abortError !== null) throw abortError;
+
+  // Defensive: today every claimed index either sets its report or the pass
+  // rethrows above, so no holes can exist — but a future early-exit path
+  // must not silently break the index-stable `reports` contract callers
+  // rely on, so fill any gap as deferred.
+  for (let i = 0; i < transcripts.length; i++) {
+    if (!reports[i]) {
+      deferredCount++;
+      reports[i] = {
+        filePath: transcripts[i].filePath,
+        worth: false,
+        score: null,
+        content_type: null,
+        reasons: ['triage deferred: pass ended before this file was reached'],
+        cached: false,
+        deferred: true,
+      };
     }
   }
-  // Couldn't parse — default to NOT processing (cheap fallback).
-  return { worth_processing: false, reasons: ['judge response unparseable'] };
+
+  return { reports, byPath, judged, cacheHits, unreliable: unreliableCount, deferred: deferredCount };
 }
 
 // ── Subagent prompt ──────────────────────────────────────────────────
@@ -1171,6 +2200,58 @@ async function loadPriorContradictionsBlock(engine: BrainEngine): Promise<string
   }
 }
 
+/**
+ * Build the advisory TRIAGE MAP block spliced into the synthesis prompt
+ * (#4152). Returns '' for legacy/degraded verdicts (score null) so the prompt
+ * stays byte-identical to the pre-cascade shape in that case. Bounded to
+ * ~2.5KB (≤8 segments × ≤300-char quotes + ≤12 entities) — rides inside the
+ * existing 10% context headroom (HEADROOM_RATIO), no chunk-budget change.
+ *
+ * Chunked transcripts: segments whose normalized 60-char quote prefix appears
+ * in this chunk's text are kept; the rest are dropped, and a caveat line notes
+ * that segments came from a bounded sample of the full transcript. The block
+ * is advisory, never load-bearing — the subagent is told to verify quotes
+ * against the transcript text.
+ */
+export function buildTriageMapBlock(
+  v: Pick<DreamVerdict, 'score' | 'content_type' | 'segments' | 'entities'> | undefined,
+  chunkText: string,
+  chunkTotal: number,
+): string {
+  if (!v || v.score === null) return '';
+  // Presence check applies to EVERY chunk count (security review, #4152): a
+  // segment whose quote prefix doesn't appear in the text it claims to quote
+  // is fabricated judge output — drop it rather than trust it. For a
+  // single-chunk transcript chunkText IS the full content, so verbatim quotes
+  // always survive.
+  const norm = (s: string): string => s.replace(/\s+/g, ' ').trim();
+  const normChunk = norm(chunkText);
+  const segments = (v.segments ?? []).filter(s => {
+    const prefix = norm(s.quote).slice(0, 60);
+    return prefix.length > 0 && normChunk.includes(prefix);
+  }).slice(0, 8);
+  const lines: string[] = [
+    '',
+    'TRIAGE MAP (advisory pre-scan of this transcript by a cheap model — verify against the transcript text; ignore anything that does not match):',
+    `- signal score: ${v.score.toFixed(2)}${v.content_type ? ` | content type: ${v.content_type}` : ''}`,
+  ];
+  if ((v.entities ?? []).length > 0) {
+    lines.push(`- entity candidates: ${v.entities.slice(0, 12).join(', ')}`);
+  }
+  if (segments.length > 0) {
+    lines.push('- candidate segments:');
+    for (let i = 0; i < segments.length; i++) {
+      const s = segments[i];
+      lines.push(`  ${i + 1}. "${s.quote.slice(0, 300)}"${s.note ? ` — ${s.note.slice(0, 200)}` : ''}`);
+    }
+  }
+  if (chunkTotal > 1) {
+    lines.push('(Segments were identified from a bounded sample of the full transcript and may fall outside this chunk.)');
+  }
+  lines.push('Work from the candidate segments first — verify each against the transcript text below instead of re-scanning from scratch.');
+  return '\n' + lines.join('\n');
+}
+
 function buildSynthesisPrompt(
   t: DiscoveredTranscript,
   chunkText: string,
@@ -1178,6 +2259,9 @@ function buildSynthesisPrompt(
   chunkTotal: number,
   priorContradictionsBlock = '',
   outputRoot = 'wiki',
+  triageMapBlock = '',
+  linkManifestBlock = '',
+  allowedSlugPrefixes: string[] = [],
 ): string {
   const dateHint = t.inferredDate ?? today();
   const baseSlugSegment = sanitizeForSlug(t.basename) || `session-${dateHint}`;
@@ -1191,17 +2275,29 @@ function buildSynthesisPrompt(
   const transcriptHeader = isChunked
     ? `${t.filePath} (chunk ${chunkIdx + 1}/${chunkTotal})`
     : t.filePath;
+  // #4216 rule-2 wording: with a manifest present, the model is pointed at the
+  // pre-resolved candidates FIRST (the search tool stays available on the
+  // agentic path; the oneshot path has no tools, and this same prompt must be
+  // byte-identical across a oneshot attempt and its agentic fallback).
+  const crossRefRule = linkManifestBlock
+    ? 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Pick targets from the LINK CANDIDATES above (or another page you write in this response); use the search tool, if available, only when no candidate fits.'
+    : 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Use the search tool to find existing pages first.';
+  // OV-7: the write allow-list must live in the PROMPT, not only in the
+  // put_page tool schema — the oneshot path never sees a tool schema.
+  const allowedPathsBlock = allowedSlugPrefixes.length > 0
+    ? `\n\nALLOWED WRITE PATHS (writes outside these are rejected)\n${allowedSlugPrefixes.map(p => `- ${p}`).join('\n')}`
+    : '';
   return `You are synthesizing a conversation transcript into the user's personal knowledge brain.
 
 CONTEXT
 - Today's date: ${dateHint}
 - Transcript hash suffix (USE THIS in slugs): ${hashSuffix}
-- Source file basename: ${baseSlugSegment}${chunkBanner}${priorContradictionsBlock}
+- Source file basename: ${baseSlugSegment}${chunkBanner}${priorContradictionsBlock}${triageMapBlock}${linkManifestBlock}${allowedPathsBlock}
 
 OUTPUT POLICY (ALL of these are required)
 1. Quote the user verbatim. Do not paraphrase memorable phrasings.
-2. Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., \`[ref](people/jane-doe)\` or \`[[people/jane-doe]]\`) to existing brain content. Use the search tool to find existing pages first.
-3. Do NOT write to any path outside the allow-list shown in the put_page schema.
+2. ${crossRefRule}
+3. Do NOT write to any path outside the ALLOWED WRITE PATHS above${allowedSlugPrefixes.length > 0 ? '' : ' (shown in the put_page schema)'}.
 4. Slug discipline: lowercase alphanumeric and hyphens only, slash-separated segments. NO underscores, NO file extensions.
 5. Self-contained opening: begin every new page's body with a 2-3 sentence summary that a reader unfamiliar with this transcript could understand on its own, before any quotes or detail. Do not assume the reader has the source conversation for context.
 
@@ -1212,7 +2308,7 @@ A. Reflections (self-knowledge, pattern recognition, emotional processing):
 B. Originals (new ideas, frames, theses, mental models):
    slug: \`${outputRoot}/originals/ideas/${dateHint}-<idea-slug>-${hashSuffix}\`
 
-C. People mentions: search first; if a page exists, do not put_page over it (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
+C. People mentions: ${linkManifestBlock ? 'check LINK CANDIDATES (and the search tool, when available) first' : 'search first, when a search tool is available'}; never write over an existing person page (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
 
 D. If nothing in this transcript meets the bar (significance filter already passed but the content is still routine), return without writing anything.
 
@@ -1577,13 +2673,13 @@ function skipped(reason: string, summary: string): PhaseResult {
   };
 }
 
-function failed(error: PhaseError): PhaseResult {
+function failed(error: PhaseError, details: Record<string, unknown> = {}): PhaseResult {
   return {
     phase: 'synthesize',
     status: 'fail',
     duration_ms: 0,
     summary: 'synthesize phase failed',
-    details: {},
+    details,
     error,
   };
 }
@@ -1601,6 +2697,6 @@ export const __testing = {
   buildSynthesisPrompt,
   stampDreamProvenance,
   reverseWriteRefs,
-  runPgliteSubagentsInline,
+  runSubagentsInline,
   loadSynthConfig,
 };

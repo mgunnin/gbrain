@@ -31,6 +31,13 @@ If you fetched this file by URL without cloning yet, the companion files live at
 > If an unrelated npm install is already present, remove it first
 > (`npm uninstall -g gbrain` / `bun remove -g gbrain`); `gbrain doctor` also detects this.
 
+> **On Codex or Claude Code?** After the CLI install below, the plugin is the
+> fastest way to wire the MCP server + curated skills:
+> `codex plugin marketplace add garrytan/gbrain@codex-plugin` +
+> `codex plugin add gbrain@gbrain` (Claude Code: `/plugin marketplace add
+> garrytan/gbrain` + `/plugin install gbrain@gbrain`). Details:
+> docs/mcp/CODEX.md and docs/mcp/CLAUDE_CODE.md.
+
 Default path (Bun is required — gbrain is a Bun + TypeScript runtime):
 
 ```bash
@@ -55,19 +62,28 @@ restart the shell or add the PATH export to the shell profile.
 
 ## Step 2: API Keys
 
-Ask the user for these. gbrain defaults to the ZeroEntropy embedding + reranker stack
-(as of v0.36.2.0); OpenAI/Voyage are still supported as fallbacks via `gbrain config
-set embedding_model <provider:model>`.
+Ask the user for these. gbrain defaults to the Voyage embedding + reranker stack
+(`voyage:voyage-4` @ 1024d + `voyage:rerank-2.5` — one key covers both); OpenAI is the
+main alternative, chosen at init via `--embedding-model <provider:model>`. ZeroEntropy
+is deprecated (its hosted API shuts down 2026-09-04): init auto-pick and the picker
+exclude it, and every ZE embed/rerank prints a deprecation warning. **Existing brain
+still on ZeroEntropy (or any need to switch embedding/reranker models later)?** Follow
+the playbook at `skills/migrations/v0.46.3.0.md` — one command migrates both.
 
 ```bash
-export ZEROENTROPY_API_KEY=ze-...     # default embedding + reranker (v0.36.2.0+)
-export OPENAI_API_KEY=sk-...          # fallback for vector search; also used for chat models
-export ANTHROPIC_API_KEY=sk-ant-...   # optional, improves search quality via query expansion
+export VOYAGE_API_KEY=pa-...          # default embedding + reranker (one key covers both)
+export OPENAI_API_KEY=sk-...          # alternative for vector search; also powers automatic fact extraction + chat models
+export ANTHROPIC_API_KEY=sk-ant-...   # automatic fact extraction + chat models; also improves search via query expansion
 ```
 
-Save to shell profile or `.env`. Keys are picked up by `gbrain config set` automatically
-or can be stored in `~/.gbrain/config.json` (file plane). Without any embedding provider,
-keyword search still works. Without Anthropic, search works but skips query expansion.
+Save to shell profile or `.env`, or store in `~/.gbrain/config.json` (file plane). Do
+NOT use `gbrain config set` for API keys — it writes the DB plane, which the provider
+pipeline never reads. Without any embedding provider, keyword search still works.
+Chat-shaped features (automatic fact extraction, enrichment, synthesis, query
+expansion) route to whichever supported chat key is present (Anthropic or OpenAI) —
+Anthropic when both are set, OpenAI when it is the only one; other chat providers
+need an explicit `models.*` pin. With neither key, extraction stays off and memory
+comes from agent-authored `## Facts` fences and the `remember` verb.
 
 ## Step 3: Create the Brain
 
@@ -90,9 +106,10 @@ NOT inside ~/gbrain.
 ## Step 3.5: Confirm search mode with the user (DO NOT SKIP)
 
 `gbrain init` auto-applied a default search mode (`tokenmax` unless your subagent
-tier is Haiku-class or no OpenAI key is configured). The init output included the
-cost matrix below preceded by `[AGENT]` markers. You must NOT silently accept the
-default. Stop and ask the operator.
+tier is Haiku-class or no expansion-capable API key — Anthropic, OpenAI, or
+Google — is configured). The init output included the cost matrix below preceded
+by `[AGENT]` markers. You must NOT silently accept the default. Stop and ask the
+operator.
 
 **Present this matrix verbatim:**
 
@@ -215,6 +232,44 @@ refuses to overwrite anything that exists. Use `gbrain skillpack reference <name
 diff against gbrain's bundle when you want upstream improvements. (The legacy
 `gbrain skillpack install` managed-block model was removed in v0.33 — run
 `gbrain skillpack migrate-fence` once if upgrading from an older release.)
+
+**If you are Hermes:** register gbrain as your MCP server:
+
+```bash
+printf 'Y\n' | hermes mcp add gbrain --env GBRAIN_HOME=$HOME --connect-timeout 60 --command $(which gbrain) --args serve
+```
+
+Keep `--args` last (everything after it becomes server argv) and verify with
+`hermes mcp test gbrain` — the add exits 0 even on failure. Full reference:
+[docs/mcp/HERMES.md](docs/mcp/HERMES.md).
+
+**If you are Grok Build** (xAI's `grok` CLI): register gbrain as your MCP server:
+
+```bash
+grok mcp add gbrain -e "GBRAIN_HOME=$HOME" -- gbrain serve --surface verbs
+```
+
+The add is lazy (exit 0 without connecting) — verify with
+`grok mcp doctor gbrain`, which spawns the server and must report
+`7 tools discovered`. This is the brain-only install; the `gbrain bootstrap`
+personal-agent path does not support Grok yet (Claude Code, Codex, and opencode only).
+Verified against Grok Build v1.0.4. Full reference:
+[docs/mcp/GROK.md](docs/mcp/GROK.md).
+
+**If you are opencode** (the SST terminal agent, opencode.ai — not OpenClaw):
+you are a bootstrap-supported harness — for the full persistent-personal-agent
+install, follow `BOOTSTRAP_FOR_AGENTS.md` instead of this page. For the
+brain-only MCP registration:
+
+```bash
+opencode mcp add gbrain --env GBRAIN_HOME=$HOME -- gbrain serve --surface verbs
+```
+
+The add is lazy (exit 0 without connecting) — verify with `opencode mcp list`,
+which spawns the server and must show `✓ gbrain connected` (the exit code is 0
+even on failure; read the output). Restart opencode afterwards — it reads
+config at session start. Verified against opencode v1.18.18. Full reference:
+[docs/mcp/OPENCODE.md](docs/mcp/OPENCODE.md).
 
 Whether you scaffolded or not, read `skills/RESOLVER.md` (in your workspace, or the
 bundled copy at `~/gbrain/skills/RESOLVER.md` when running from the cloned repo). It's

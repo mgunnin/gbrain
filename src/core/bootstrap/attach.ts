@@ -36,6 +36,8 @@ import {
   type AgentManifest,
   type InstallReceipt,
 } from './format.ts';
+import { gitOriginUrl } from './status.ts';
+import { type RepoReceipt } from './repo.ts';
 import { BootstrapError } from './lock.ts';
 
 export type AttachStepKind = 'register_source' | 'hooks_repair' | 'mcp_add' | 'verify';
@@ -49,7 +51,7 @@ export interface AttachWorkspaceOptions {
   /** The gbrain home receiving the install receipt (default: configDir()). */
   gbrainHomeDir?: string;
   /** Target harness for the hooks/MCP steps' descriptions. */
-  harness?: 'claude-code' | 'codex';
+  harness?: 'claude-code' | 'codex' | 'opencode';
   /** Recorded as the receipt's created_by (the attaching binary's version). */
   createdBy?: string;
 }
@@ -99,7 +101,23 @@ export function attachWorkspace(workspaceDir: string, opts: AttachWorkspaceOptio
   const existing = readReceipt(gbrainHomeDir);
   const sameWorkspace = existing !== null && realpathOrResolve(existing.workspace_dir) === resolvedWs;
 
-  const receipt: InstallReceipt = {
+  // Record repo_url from the adopted origin so the no-daemon push gate
+  // (repoPhaseComplete) recognizes the repo phase as done on this machine —
+  // otherwise the per-turn/session-end pushes defer FOREVER after an attach
+  // (the ONLY install path in a cloud sandbox, where `bootstrap repo` is
+  // refused). This does NOT bypass the privacy gate: workspacePush still runs
+  // the visibility ladder at push time and fails closed on a public/
+  // unverifiable origin. Preserve an existing repo_url on a same-workspace
+  // re-attach; else adopt the current github origin.
+  const existingRepoUrl = sameWorkspace ? (existing as RepoReceipt).repo_url : undefined;
+  const originUrl = gitOriginUrl(resolvedWs);
+  // Record the origin as repo_url whenever one exists — github or self-hosted.
+  // repoPhaseComplete binds by owner/name for github and by exact URL otherwise;
+  // either way workspacePush still runs the visibility ladder at push time, so a
+  // non-verifiable origin stays fail-closed (refused unless the operator sets the
+  // escape hatch). Recording it only clears the "repo phase ran" gate.
+  const adoptedRepoUrl = existingRepoUrl ?? (originUrl ?? undefined);
+  const receipt: RepoReceipt = {
     receipt_version: 1,
     workspace_dir: resolvedWs,
     source_id: manifest.source_id,
@@ -111,6 +129,7 @@ export function attachWorkspace(workspaceDir: string, opts: AttachWorkspaceOptio
     brain_created_by_bootstrap: sameWorkspace ? existing.brain_created_by_bootstrap : false,
     created_paths: sameWorkspace ? existing.created_paths : [],
     registrations: sameWorkspace ? existing.registrations : [],
+    ...(adoptedRepoUrl ? { repo_url: adoptedRepoUrl } : {}),
   };
   // writeReceipt assumes the bootstrap/ subdir exists; attach runs on a fresh
   // machine where nothing has created it yet.

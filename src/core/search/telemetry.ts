@@ -6,15 +6,18 @@
  * records — the latter is a trigger, not a guarantee: a threshold-crossing
  * record that arrives while a flush is in flight coalesces onto it and does
  * not drain the new bucket, so a buffer can exceed the threshold). There is
- * deliberately NO flush on process exit — `ensureExitHook` below documents why
- * the beforeExit/SIGINT/SIGTERM drain was removed. Consequence: anything still
- * buffered when the process exits is lost, and so is a snapshot handed to an
- * in-flight `flush()` that has not committed yet (`flush` clears `buckets`
- * before awaiting the write). Long-running processes (HTTP MCP server,
- * autopilot, jobs work) are covered by the timer; a short-lived CLI invocation
- * usually exits before either trigger fires, so its calls are simply dropped.
- * The search hot path NEVER waits on this write — `record()` is sync and
- * the flush is fire-and-forget.
+ * deliberately NO flush hook on raw process exit — `ensureExitHook` below
+ * documents why the beforeExit/SIGINT/SIGTERM drain was removed. Since #4143
+ * this module registers with the background-work registry (order 5): the CLI's
+ * BOUNDED teardown drain ('exit' mode) flushes residual buckets against the
+ * still-live engine, and `engine.disconnect()`'s drain ('disconnect' mode)
+ * awaits only the IN-FLIGHT flush — an in-flight statement racing PGLite's
+ * `close()` deadlocked the whole process permanently (this was the
+ * unregistered 5th sink the registry's own module doc warned about).
+ * Consequence: a hard kill or an abandoned snapshot still loses data, and
+ * anything buffered at engine disconnect is dropped by design. The search hot
+ * path NEVER waits on this write — `record()` is sync and the flush is
+ * fire-and-forget.
  *
  * Schema math per [CDX-17]: rows are sums + counts only, NEVER averages.
  * Read-time derives averages. ON CONFLICT DO UPDATE adds raw values so two
@@ -28,14 +31,15 @@
  * Per-process bucketing means stdio MCP, HTTP MCP, and CLI processes each
  * maintain their own buffers. Stats are directional, not exact — acceptable
  * because the consumer is the operator (or an agent running `gbrain search
- * tune`), not a financial ledger. Note the loss is not limited to hard
- * crashes: with no exit drain, an ordinary exit loses whatever has not been
- * committed. Weigh that when reading counts from a process class that exits
- * often.
+ * tune`), not a financial ledger. Loss still happens on hard kills, on drains
+ * that exceed their bound, and at engine disconnect (buffered-but-not-flushed
+ * rows are dropped there by design). Weigh that when reading counts from a
+ * process class that dies unclean often.
  */
 
 import type { BrainEngine } from '../engine.ts';
 import type { HybridSearchMeta } from '../types.ts';
+import { registerBackgroundWorkDrainer, type BackgroundWorkDrainMode } from '../background-work.ts';
 
 interface Bucket {
   date: string;
@@ -60,8 +64,40 @@ interface Bucket {
 const RANK1_SOLID_FLOOR = 0.6;
 const RANK1_HIGH_FLOOR = 0.85;
 
+/**
+ * WP2/T3 — reserved `mode` value for the empty-result cause rollup. Rides
+ * the existing (date, mode, intent) PK with ZERO new DDL: rows keyed
+ * (date, 'empty_result', <cause>) count empty responses by cause, and
+ * readSearchStats diverts them out of the call/intent/mode aggregates.
+ * Never collides with real modes ('conservative'|'balanced'|'tokenmax'|
+ * 'unset'). Bounded growth: 3 causes × 365 days ≈ 1.1k rows/year.
+ */
+export const EMPTY_RESULT_MODE = 'empty_result';
+
+export type EmptyResultCause = 'vector_disabled' | 'budget_dropped_all' | 'keyword_zero';
+
+/**
+ * WP2/T3 — why did this search return zero results? Precedence: a budget
+ * that dropped everything (only reachable with GBRAIN_SEARCH_SALVAGE=off;
+ * the minKeep failsafe otherwise returns 1) beats vector-unavailability
+ * beats "healthy pipeline, keyword found nothing".
+ */
+export function classifyEmptyResultCause(meta: HybridSearchMeta): EmptyResultCause {
+  const tb = meta.token_budget;
+  if (
+    (tb && tb.kept === 0 && tb.dropped > 0) ||
+    meta.degraded?.some((d) => d.stage === 'budget_dropped_all')
+  ) {
+    return 'budget_dropped_all';
+  }
+  if (!meta.vector_enabled) return 'vector_disabled';
+  return 'keyword_zero';
+}
+
 const FLUSH_INTERVAL_MS = 60_000;
-const FLUSH_THRESHOLD_CALLS = 100;
+/** Exported for the #4143 regression pin — the disconnect-hang test must fire
+ * the flush on its EXACT boundary, not a hard-coded copy that drifts. */
+export const FLUSH_THRESHOLD_CALLS = 100;
 
 /**
  * Per-process telemetry singleton. Each gbrain process (CLI, stdio MCP,
@@ -136,10 +172,46 @@ class TelemetryWriter {
       else b.rank1_high += 1;
     }
 
+    // WP2/T3 — empty-result cause rollup. Cache HITS are excluded: an empty
+    // hit slice is an offset-past-end artifact, not a retrieval failure.
+    if (opts.results_count === 0 && meta.cache?.status !== 'hit') {
+      this.recordEmptyResult(date, classifyEmptyResultCause(meta));
+    }
+
     this.pendingCount += 1;
     if (this.pendingCount >= FLUSH_THRESHOLD_CALLS) {
       void this.flush().catch(() => { /* swallow */ });
     }
+  }
+
+  /**
+   * Bump the reserved (date, EMPTY_RESULT_MODE, cause) bucket. Only `count`
+   * carries signal on these rows — every other column stays 0 and the flush
+   * SQL is unchanged (zero new DDL).
+   */
+  private recordEmptyResult(date: string, cause: EmptyResultCause): void {
+    const key = `${date}::${EMPTY_RESULT_MODE}::${cause}`;
+    let b = this.buckets.get(key);
+    if (!b) {
+      b = {
+        date,
+        mode: EMPTY_RESULT_MODE,
+        intent: cause,
+        count: 0,
+        sum_results: 0,
+        sum_tokens: 0,
+        sum_budget_dropped: 0,
+        cache_hit: 0,
+        cache_miss: 0,
+        sum_rank1_score: 0,
+        count_rank1: 0,
+        rank1_lt_solid: 0,
+        rank1_solid: 0,
+        rank1_high: 0,
+      };
+      this.buckets.set(key, b);
+    }
+    b.count += 1;
   }
 
   /**
@@ -213,6 +285,18 @@ class TelemetryWriter {
     }
     this.buckets.clear();
     this.pendingCount = 0;
+    // #4143: tests start clean — never inherit a prior case's in-flight write.
+    this.flushInFlight = null;
+  }
+
+  /** #4143 — the in-flight flush promise, if any (drain path; never creates work). */
+  pendingFlush(): Promise<void> | null {
+    return this.flushInFlight;
+  }
+
+  /** #4143 — whether any bucket is buffered (drain path fast-check). */
+  hasBuffered(): boolean {
+    return this.buckets.size > 0;
   }
 
   /** Test-only — read the current bucket count without draining. */
@@ -276,6 +360,63 @@ export function getTelemetryWriter(): TelemetryWriter {
 }
 
 /**
+ * #4143 — background-work drain for the telemetry sink.
+ *
+ * 'disconnect' mode: await ONLY the in-flight flush (its statement settles
+ * against the still-open raw handle; any FURTHER statement it issues fails
+ * fast on the engine's already-nulled handle and is swallowed per-bucket).
+ * Residual buckets are deliberately dropped — the buffer is lossy by design.
+ *
+ * 'exit' mode (CLI teardown, engine still live): after the in-flight flush,
+ * also flush residual buckets so a short-lived CLI invocation's calls land.
+ *
+ * O(1) when nothing is pending. Bounded, non-throwing; `unfinished` counts
+ * what the bound abandoned.
+ */
+export async function awaitPendingTelemetryFlush(
+  timeoutMs = 2000,
+  mode: BackgroundWorkDrainMode = 'disconnect',
+): Promise<{ unfinished: number }> {
+  const w = _writer;
+  if (!w) return { unfinished: 0 };
+  const inFlight = w.pendingFlush();
+  const wantsResidual = mode === 'exit' && w.hasBuffered();
+  if (!inFlight && !wantsResidual) return { unfinished: 0 };
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = Symbol('telemetry-drain-timeout');
+  const bound = new Promise<typeof timedOut>((resolve) => {
+    timer = setTimeout(() => resolve(timedOut), timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    if (inFlight) {
+      const r = await Promise.race([inFlight.catch(() => undefined), bound]);
+      if (r === timedOut) return { unfinished: 1 };
+    }
+    if (mode === 'exit' && w.hasBuffered()) {
+      const r = await Promise.race([w.flush().catch(() => undefined), bound]);
+      if (r === timedOut) return { unfinished: 1 };
+    }
+    return { unfinished: 0 };
+  } catch {
+    return { unfinished: 1 };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// #4143: register with the background-work registry so BOTH exit points drain
+// this sink (orders 0-4 are facts / last-retrieved / search-cache /
+// eval-capture / volunteer-events). Registration lives here, the
+// enqueue-owning module, per the registry's contract.
+registerBackgroundWorkDrainer({
+  name: 'search-telemetry',
+  order: 5,
+  drain: (timeoutMs, mode) => awaitPendingTelemetryFlush(timeoutMs, mode),
+});
+
+/**
  * Convenience entry point for hot-path callers. Wires the engine lazily
  * and records the call. Never throws.
  */
@@ -315,6 +456,11 @@ export interface StatsWindow {
   avg_rank1_score: number | null; // null when no rank-1 samples
   rank1_count: number;
   rank1_distribution: { lt_solid: number; solid: number; high: number };
+  // WP2/T3 — empty-result responses by cause (vector_disabled /
+  // budget_dropped_all / keyword_zero). Diverted from the reserved
+  // EMPTY_RESULT_MODE rows; never counted in total_calls or the
+  // intent/mode distributions.
+  empty_results: { total: number; by_cause: Record<string, number> };
 }
 
 export async function readSearchStats(
@@ -377,8 +523,17 @@ export async function readSearchStats(
     let r1_lt = 0;
     let r1_solid = 0;
     let r1_high = 0;
+    let empty_total = 0;
+    const empty_by_cause: Record<string, number> = {};
 
     for (const r of rows) {
+      // WP2/T3 — reserved empty-result rows carry cause in the intent slot;
+      // divert them so they never skew calls/averages/distributions.
+      if (r.mode === EMPTY_RESULT_MODE) {
+        empty_total += r.count;
+        empty_by_cause[r.intent] = (empty_by_cause[r.intent] ?? 0) + r.count;
+        continue;
+      }
       total_calls += r.count;
       cache_hits += r.cache_hit;
       cache_misses += r.cache_miss;
@@ -413,9 +568,17 @@ export async function readSearchStats(
       avg_rank1_score: count_rank1 > 0 ? sum_rank1 / count_rank1 : null,
       rank1_count: count_rank1,
       rank1_distribution: { lt_solid: r1_lt, solid: r1_solid, high: r1_high },
+      empty_results: { total: empty_total, by_cause: empty_by_cause },
     };
   } catch {
-    // Table missing or query failed — return empty stats rather than throw.
+    // Best-effort by design: a pre-v0.32.3 brain WITHOUT the search_telemetry
+    // table shows "0 searches" (with the coverage caveat explaining low/zero
+    // counts), NOT a crash — a long-standing contract pinned by
+    // test/search-telemetry.test.ts and relied on by the CLI dashboard. The
+    // search_stats op wraps this in withRelationGuard for OTHER unexpected
+    // relation errors, but the missing-telemetry-table case is intentionally
+    // graceful, not 'unavailable'. (Reverted an over-eager gap-closure rethrow
+    // that broke this contract for the CLI + dashboard to satisfy a P2 finding.)
     return {
       total_calls: 0,
       cache_hits: 0,
@@ -430,8 +593,54 @@ export async function readSearchStats(
       avg_rank1_score: null,
       rank1_count: 0,
       rank1_distribution: { lt_solid: 0, solid: 0, high: 0 },
+      empty_results: { total: 0, by_cause: {} },
     };
   }
+}
+
+/**
+ * Coverage disclosure for `readSearchStats()` consumers (`gbrain search
+ * stats` / `gbrain search tune`). This documents the buffering behavior
+ * from the module header above — it changes NO behavior, it only gives
+ * display layers a single source of truth for the caveat text instead of
+ * each caller re-describing (and risking drift on) the flush mechanics.
+ *
+ * Short-lived CLI invocations (a single `gbrain query "..."` call) don't
+ * reach the 60s timer or the 100-call threshold, but since #4143 the CLI's
+ * bounded teardown drain flushes their buffer in 'exit' mode before the
+ * engine disconnects, so a clean exit IS recorded. What still drops: hard
+ * kills (SIGKILL, crash), a drain that exceeds its bound, and anything
+ * buffered when an engine disconnects outside the CLI teardown path.
+ * Long-lived processes (`gbrain serve`, stdio/HTTP MCP, `gbrain jobs work`)
+ * are additionally covered by the periodic flush.
+ */
+export const TELEMETRY_COVERAGE_NOTE =
+  'Counts are most complete for long-lived processes (gbrain serve, MCP stdio/HTTP, ' +
+  'gbrain jobs work). Short-lived CLI invocations flush their buffer during the ' +
+  'bounded CLI teardown drain (#4143), so a clean exit is recorded; a hard kill, a ' +
+  'drain that exceeds its bound, or an engine disconnect mid-buffer still drops the ' +
+  'remainder — see search/telemetry.ts for the buffering design.';
+
+/**
+ * Short, single-line form of {@link TELEMETRY_COVERAGE_NOTE} for human CLI
+ * output (the long form is better suited to `--json`'s `reason` field).
+ * Every human-facing caveat in `gbrain search stats`/`gbrain search tune`
+ * reuses this literal string instead of paraphrasing it, so the wording
+ * cannot drift between call sites.
+ */
+export const TELEMETRY_COVERAGE_CAVEAT =
+  'Coverage favors long-lived processes (gbrain serve, MCP, jobs work); CLI search ' +
+  'calls are flushed on clean exit, but hard kills and over-bound drains still drop.';
+
+export interface TelemetryCoverage {
+  /** Whether a lone short-lived CLI search call is counted (#4143: flushed by the bounded teardown drain on clean exit). */
+  cli_invocations: 'recorded_on_clean_exit';
+  reason: string;
+}
+
+/** Machine-readable form of {@link TELEMETRY_COVERAGE_NOTE} for `--json` output. */
+export function telemetryCoverage(): TelemetryCoverage {
+  return { cli_invocations: 'recorded_on_clean_exit', reason: TELEMETRY_COVERAGE_NOTE };
 }
 
 function nowDate(): string {
@@ -444,4 +653,60 @@ export function _resetTelemetryWriterForTest(): void {
     _writer.stop();
     _writer = null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// v0.40.4 graph-signals observability (moved from src/commands/search.ts in
+// the CLI→MCP gap-closure wave so the `search_stats` op and the CLI share it).
+// ---------------------------------------------------------------------------
+
+export interface GraphSignalsStatsSection {
+  enabled: boolean;
+  source: 'config' | 'mode_default';
+  failures_count: number;
+  /** Failure-reason breakdown across the window (truncated to top reasons). */
+  failures_by_reason: Record<string, number>;
+}
+
+export async function readGraphSignalsStats(engine: BrainEngine, days: number): Promise<GraphSignalsStatsSection> {
+  // Resolve graph_signals on/off. Mirrors the resolution chain in
+  // src/commands/doctor/checks/graph-embedding.ts:checkGraphSignalsCoverage.
+  // v0.40.4 codex F1: case-insensitive + trim parity with
+  // loadOverridesFromConfig (mode.ts). Without this, search-stats would
+  // silently report the opposite of what the parser actually enables on
+  // values like 'TRUE' or 'True'.
+  const cfg = await engine.getConfig('search.graph_signals').catch(() => null);
+  let enabled: boolean;
+  let source: 'config' | 'mode_default';
+  if (cfg !== null && cfg !== undefined) {
+    const v = cfg.trim().toLowerCase();
+    enabled = v === 'true' || v === '1';
+    source = 'config';
+  } else {
+    const modeRaw = await engine.getConfig('search.mode').catch(() => null);
+    const modeVal = typeof modeRaw === 'string' ? modeRaw.trim().toLowerCase() : '';
+    const mode = modeVal === 'conservative' || modeVal === 'tokenmax' ? modeVal : 'balanced';
+    enabled = mode !== 'conservative';
+    source = 'mode_default';
+  }
+
+  let failures_count = 0;
+  const failures_by_reason: Record<string, number> = {};
+  try {
+    const { readRecentGraphSignalsFailures } = await import('./graph-signals.ts');
+    const events = readRecentGraphSignalsFailures(days);
+    failures_count = events.length;
+    // The failure event schema has error_summary (not a reason field) —
+    // bucket by the first word of the summary so operators see e.g.
+    // "ECONNREFUSED" / "timeout" / "permission" at a glance.
+    for (const e of events) {
+      const firstWord = (e.error_summary ?? '').split(/[\s:]+/)[0]?.slice(0, 32) || 'unknown';
+      failures_by_reason[firstWord] = (failures_by_reason[firstWord] ?? 0) + 1;
+    }
+  } catch {
+    // Audit reader is best-effort. Missing module / corrupt files →
+    // count stays 0, search-stats still renders.
+  }
+
+  return { enabled, source, failures_count, failures_by_reason };
 }

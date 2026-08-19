@@ -310,6 +310,49 @@ describe('[A8] provenance + read-back confirm', () => {
     expect(parsed.confirmed).toBeUndefined();
   });
 
+  test('setAnswer surfaces invalidatedConfirmation ONLY when a confirm existed', () => {
+    const ws = makeWs();
+    answerAllRequired(ws);
+    // No prior confirmation → nothing was invalidated (falsy flag).
+    const r0 = setAnswer(ws, 'SOUL_WINCE', 'Filler openers.');
+    expect(r0.ok).toBe(true);
+    if (!r0.ok || r0.sink !== 'state') throw new Error('expected a state-sink result');
+    expect(r0.invalidatedConfirmation).toBeFalsy();
+    // Full confirm, then a later set → the result SAYS it voided the confirm
+    // (the CLI warns at --set time instead of failing much later at render).
+    const h = readBackHash(ws);
+    if (!h.ok) throw new Error(h.message);
+    expect(confirm(ws, h.hash).ok).toBe(true);
+    const r1 = setAnswer(ws, 'SOUL_GOOD_OUTPUT', 'A finished artifact.');
+    expect(r1.ok).toBe(true);
+    if (!r1.ok || r1.sink !== 'state') throw new Error('expected a state-sink result');
+    expect(r1.invalidatedConfirmation).toBe(true);
+    const st = status(ws);
+    if (!st.ok) throw new Error(st.message);
+    expect(st.confirmed).toBe(false);
+  });
+
+  test('skipAnswer surfaces invalidatedConfirmation ONLY when a confirm existed (optional key — required keys refuse skip)', () => {
+    const ws = makeWs();
+    answerAllRequired(ws);
+    // No prior confirmation → falsy flag on an optional-key skip.
+    const r0 = skipAnswer(ws, 'SOUL_WINCE');
+    expect(r0.ok).toBe(true);
+    if (!r0.ok) throw new Error('unreachable');
+    expect(r0.invalidatedConfirmation).toBeFalsy();
+    // Full confirm, then a later optional-key skip → invalidation surfaced.
+    const h = readBackHash(ws);
+    if (!h.ok) throw new Error(h.message);
+    expect(confirm(ws, h.hash).ok).toBe(true);
+    const r1 = skipAnswer(ws, 'SOUL_WORLDVIEW');
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) throw new Error('unreachable');
+    expect(r1.invalidatedConfirmation).toBe(true);
+    const st = status(ws);
+    if (!st.ok) throw new Error(st.message);
+    expect(st.confirmed).toBe(false);
+  });
+
   test('show returns the read-back payload with the hash once complete', () => {
     const ws = makeWs();
     answerAllRequired(ws);

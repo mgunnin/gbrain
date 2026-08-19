@@ -15,7 +15,13 @@
  *           without LiveServeLockError while a direct engine open
  *           (createEngine + connect — the narrowest engine-open helper) DOES
  *           throw LiveServeLockError, proving the lock is really held.
- *   Pin 3 — stale serve: SIGKILL the serve, leave the socket file behind →
+ *   Pin 3 — v0.45.7 ambient recall: the compact→session-start warm-pack
+ *           round trip against the REAL serve. `hook compact` banks the
+ *           window's standing entities over the real socket (bankOnly), then
+ *           `hook session-start` (source=compact) gets a warm pack back whose
+ *           text carries the seeded entity — the real
+ *           makeContextPackIpcHandler + session_context_state row, end to end.
+ *   Pin 4 — stale serve: SIGKILL the serve, leave the socket file behind →
  *           the hook fails open (exit 0, empty stdout) with an
  *           ipc_unavailable/no_serve-class degradation.
  *
@@ -28,6 +34,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -309,7 +317,124 @@ describe('bootstrap hook under a live serve (serial e2e) [A7]', () => {
     expect((lockErr as Error).message).toContain('gbrain serve');
   }, 90_000);
 
-  test('Pin 3: stale serve (killed, socket left behind) → fail-open exit 0 with ipc_unavailable/no_serve degradation', async () => {
+  test('Pin 3: compact banks the window into the session cursor; the post-compaction session-start serves a warm pack carrying the seeded entity', async () => {
+    // Transcript under the confinement seam root (same shape as Pin 1). The
+    // turns are written so 'Alice Example' — the corpus person page seeded in
+    // beforeAll — is the ONLY extractable candidate (everything else stays
+    // lowercase / stopworded), making the banked standing set deterministic.
+    const projRoot = join(tmpParent, 'projects');
+    mkdirSync(join(projRoot, 'p3'), { recursive: true });
+    const transcript = join(projRoot, 'p3', 'session.jsonl');
+    writeFileSync(
+      transcript,
+      [
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'quick recap please — what is Alice Example driving right now?' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'she leads retrieval quality — Alice Example has a roadmap review pending.' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'keep tracking Alice Example after the compaction.' },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    // 3a — PreCompact banking: bankOnly over the REAL socket. The serve's
+    // context_pack handler extracts the window entities and persists them into
+    // session_context_state ('workspace', 'local', session id). PreCompact
+    // stdout is not context-injected — the WRITE is the whole point.
+    const bankOut = collectStdout();
+    const bankCode = await runHook(['compact'], {
+      stdin: JSON.stringify({ transcript_path: transcript, session_id: 'e2e-pack-sess' }),
+      write: bankOut.write,
+      cwd: ws,
+      transcriptRoot: projRoot,
+    });
+    expect(bankCode).toBe(0);
+    expect(bankOut.get()).toBe(''); // PreCompact emits nothing
+    const [bankHb] = await readHeartbeatTail(1);
+    expect(bankHb).toBeDefined();
+    expect(bankHb.event).toBe('compact');
+    expect(bankHb.outcome).toBe('ok'); // a degradation here means banking never reached the serve
+
+    // 3b — post-compaction SessionStart (source=compact): the SAME session id
+    // pulls the banked standing set back through the real
+    // makeContextPackIpcHandler (assembleContextPack → entity cards) and the
+    // hook appends the pack after the digest. The rendered card line carries
+    // the seeded entity's title + slug — the direct-DB row check is off the
+    // table by design (Pin 2: the serve holds the PGLite lock), so the stdout
+    // content IS the proof the session_context_state round trip worked.
+    const packOut = collectStdout();
+    const packCode = await runHook(['session-start'], {
+      stdin: JSON.stringify({ session_id: 'e2e-pack-sess', source: 'compact' }),
+      write: packOut.write,
+      cwd: ws,
+    });
+    expect(packCode).toBe(0);
+    const pack = packOut.get();
+    expect(pack).toContain('Alice Example');
+    expect(pack).toContain('people/alice-example');
+    const [packHb] = await readHeartbeatTail(1);
+    expect(packHb).toBeDefined();
+    expect(packHb.event).toBe('session-start');
+    expect(packHb.outcome).not.toBe('error');
+
+    // The pack path never widens visibility (world-only ALWAYS, D2=A): no
+    // fragment of a seeded PRIVATE belief may ride along in the warm pack.
+    const privateFragments = loadCorpusBeliefData()
+      .filter((b) => b.visibility === 'private')
+      .map((b) => b.text);
+    for (const frag of privateFragments) expect(pack).not.toContain(frag);
+  }, 60_000);
+
+  test('Pin 3b (cathedral 5): compact under a REAL serve banks a content-addressed segment + ledger and stays fail-open + lock-free', async () => {
+    // Transcript with a PRIOR boundary: the segment must carry only the
+    // since-boundary window. Runs against the live serve from beforeAll —
+    // Pin 2's lock discipline is implicitly re-proven (runHook completes
+    // while the serve holds the PGLite write lock).
+    const projRoot = join(tmpParent, 'projects');
+    mkdirSync(join(projRoot, 'p3b'), { recursive: true });
+    const transcript = join(projRoot, 'p3b', 'session.jsonl');
+    writeFileSync(
+      transcript,
+      [
+        JSON.stringify({ type: 'user', message: { role: 'user', content: 'PRE-BOUNDARY-ONLY text' } }),
+        JSON.stringify({ type: 'system', subtype: 'compact_boundary', content: 'compacted' }),
+        JSON.stringify({ type: 'user', message: { role: 'user', content: 'POST-BOUNDARY window for Alice Example' } }),
+      ].join('\n') + '\n',
+    );
+    const out = collectStdout();
+    const code = await runHook(['compact'], {
+      stdin: JSON.stringify({ transcript_path: transcript, session_id: 'e2e-seg-sess' }),
+      write: out.write,
+      cwd: ws,
+      transcriptRoot: projRoot,
+    });
+    expect(code).toBe(0);
+    expect(out.get()).toBe('');
+    const [hb] = await readHeartbeatTail(1);
+    expect(hb.event).toBe('compact');
+    expect(hb.outcome).toBe('ok'); // IPC round trip reached the serve
+    expect(hb.segment).toBe('segment_banked');
+    // Durability artifacts on disk, content-addressed, since-boundary only.
+    const corpusDir = join(tmpParent, '.gbrain', 'transcripts', 'corpus');
+    const segs = readdirSync(corpusDir).filter((f) => f.startsWith('e2e-seg-sess.seg-') && f.endsWith('.txt'));
+    expect(segs).toHaveLength(1);
+    const body = readFileSync(join(corpusDir, segs[0]), 'utf8');
+    expect(body).toContain('POST-BOUNDARY');
+    expect(body).not.toContain('PRE-BOUNDARY-ONLY');
+    const ledger = JSON.parse(readFileSync(join(corpusDir, 'e2e-seg-sess.ledger.json'), 'utf8')) as unknown[];
+    expect(ledger).toHaveLength(1);
+  }, 60_000);
+
+  test('Pin 4: stale serve (killed, socket left behind) → fail-open exit 0 with ipc_unavailable/no_serve degradation', async () => {
     // SIGKILL: the shutdown handler never runs, so the socket file survives
     // as a stale artifact — exactly the crashed-serve shape.
     expect(serveProc).not.toBeNull();

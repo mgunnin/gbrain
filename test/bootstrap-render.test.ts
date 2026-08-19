@@ -110,6 +110,25 @@ describe('renderWorkspace — happy path', () => {
     expect(third.manifest.source_id).toBe('explicit-id');
   });
 
+  test('rapid forced re-renders never collide on the backup stamp (same-millisecond EEXIST)', () => {
+    // Regression pin (CI 2026-08-16, shard 7): the backup stamp has
+    // MILLISECOND granularity, so two forced renders inside the same ms
+    // collided on the exclusive `wx` backup write with EEXIST. The stamp
+    // dir is now claimed atomically per render call (numeric suffix on
+    // collision). Ten back-to-back renders reliably land several in one
+    // millisecond on any modern machine.
+    const ws = answeredWs();
+    renderWorkspace(ws);
+    const stamps = new Set<string>();
+    for (let i = 0; i < 10; i++) {
+      const res = renderWorkspace(ws, { force: true });
+      expect(res.backups.length).toBeGreaterThan(0);
+      for (const b of res.backups) stamps.add(b.split('/')[1]);
+    }
+    // Every forced render owned a distinct backup dir.
+    expect(stamps.size).toBe(10);
+  });
+
   test('re-render with force preserves the manifest created_at (first render wins)', () => {
     const ws = answeredWs();
     renderWorkspace(ws);
@@ -426,5 +445,21 @@ describe('byteFloors (verify support)', () => {
     expect(Buffer.byteLength(readFileSync(join(ws, 'USER.md'), 'utf8'))).toBeGreaterThanOrEqual(
       floors['USER.md']
     );
+  });
+});
+
+describe('renderWorkspace — machine-specific wiring stays out of the repo [B8]', () => {
+  test('rendered .gitignore covers .mcp.json and settings.local.json; GITHUB.md drops the state/mcp.json ghost', () => {
+    const ws = answeredWs();
+    renderWorkspace(ws);
+    const gi = readFileSync(join(ws, '.gitignore'), 'utf8');
+    expect(gi).toContain('.mcp.json');
+    expect(gi).toContain('.claude/settings.local.json');
+    const gh = readFileSync(join(ws, 'GITHUB.md'), 'utf8');
+    // The portable state/mcp.json snippet was never built — the promise is gone.
+    expect(gh).not.toContain('state/mcp.json');
+    // Honest persistence copy [D9]: 30-minute pull + event-driven pushes.
+    expect(gh).toContain('30-minute pull');
+    expect(gh).not.toContain('15-minute');
   });
 });

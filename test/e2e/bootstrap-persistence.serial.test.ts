@@ -26,7 +26,7 @@ import { execFileSync } from 'node:child_process';
 
 import { runHook } from '../../src/commands/hook.ts';
 import { workspacePush, type WorkspacePushResult } from '../../src/core/workspace-push.ts';
-import { writeManifest } from '../../src/core/bootstrap/format.ts';
+import { writeManifest, writeReceipt } from '../../src/core/bootstrap/format.ts';
 
 const OPENAI_KEY = 'sk-' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4';
 const ENV_KEYS = ['HOME', 'GBRAIN_HOME', 'DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_HOOKS', 'GBRAIN_GIT_ALLOW_FILE_TRANSPORT'] as const;
@@ -87,6 +87,23 @@ beforeEach(() => {
 
   // The initialized manifest is the security boundary the hook gates on.
   writeManifest(work, MANIFEST);
+  // Repo phase complete: the receipt binds this workspace to its verified
+  // origin (exact-URL binding for non-github transports) — without it the
+  // no-daemon pushes defer by design (create-repo-first race protection).
+  const toplevel = git(work, 'rev-parse', '--show-toplevel');
+  mkdirSync(join(process.env.HOME!, '.gbrain', 'bootstrap'), { recursive: true });
+  writeReceipt(join(process.env.HOME!, '.gbrain'), {
+    receipt_version: 1,
+    workspace_dir: toplevel,
+    source_id: 'workspace',
+    agent_name: 'persist-test',
+    created_at: '2026-01-01T00:00:00.000Z',
+    created_by: 'test',
+    brain_created_by_bootstrap: false,
+    created_paths: [],
+    registrations: [],
+    repo_url: bare,
+  } as Parameters<typeof writeReceipt>[1] & { repo_url: string });
   pushes = [];
 });
 
@@ -159,5 +176,79 @@ describe('session-end → real workspace push', () => {
     const shipped = git(bare, 'ls-tree', '-r', '--name-only', 'main');
     expect(shipped).not.toContain('brain/leak.md');
     expect(shipped).not.toContain('brain/safe.md'); // blocked atomically — nothing in the batch shipped
+  }, 60_000);
+});
+
+// ── per-turn Stop push [D3]: the /exit + VM-reclaim durability lane ─────────
+//
+// SessionEnd never fires on /exit; the Stop hook fires after EVERY assistant
+// turn. This chain proves a turn's authored work physically lands on the real
+// bare remote from a single `gbrain hook stop`, and that the per-root debounce
+// holds across consecutive stops.
+
+describe('stop → real workspace push (per-turn durability)', () => {
+  test('one stop banks the turn to origin; the next stop inside the window debounces', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '60';
+    try {
+      mkdirSync(join(work, 'brain'), { recursive: true });
+      writeFileSync(join(work, 'brain', 'turn-note.md'), '# turn\n\nlearned during the turn\n');
+
+      const before = originHead(bare);
+      const code = await runHook(['stop'], {
+        write: () => {},
+        cwd: work,
+        spawnPush: realSpawnPush,
+        stdin: JSON.stringify({ session_id: 'persist-stop', cwd: work }),
+      });
+      expect(code).toBe(0);
+      expect(pushes).toHaveLength(1);
+      const res = await pushes[0];
+      expect(res.ok).toBe(true);
+      expect(res.status).toBe('pushed');
+      expect(originHead(bare)).not.toBe(before);
+
+      // Second stop, same window, clean tree — debounced, no second spawn.
+      const code2 = await runHook(['stop'], {
+        write: () => {},
+        cwd: work,
+        spawnPush: realSpawnPush,
+        stdin: JSON.stringify({ session_id: 'persist-stop-2', cwd: work }),
+      });
+      expect(code2).toBe(0);
+      expect(pushes).toHaveLength(1);
+    } finally {
+      delete process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN;
+    }
+  }, 60_000);
+
+  test('debounce 0 (the cloud-sandbox default): consecutive dirty turns both land', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '0';
+    try {
+      mkdirSync(join(work, 'brain'), { recursive: true });
+      writeFileSync(join(work, 'brain', 'a.md'), '# a\n');
+      await runHook(['stop'], {
+        write: () => {},
+        cwd: work,
+        spawnPush: realSpawnPush,
+        stdin: JSON.stringify({ session_id: 'ps-z1', cwd: work }),
+      });
+      expect(pushes).toHaveLength(1);
+      expect((await pushes[0]).ok).toBe(true);
+      writeFileSync(join(work, 'brain', 'b.md'), '# b\n');
+      await runHook(['stop'], {
+        write: () => {},
+        cwd: work,
+        spawnPush: realSpawnPush,
+        stdin: JSON.stringify({ session_id: 'ps-z2', cwd: work }),
+      });
+      expect(pushes).toHaveLength(2);
+      const res2 = await pushes[1];
+      expect(res2.ok).toBe(true);
+      const shipped = git(bare, 'ls-tree', '-r', '--name-only', 'main');
+      expect(shipped).toContain('brain/a.md');
+      expect(shipped).toContain('brain/b.md');
+    } finally {
+      delete process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN;
+    }
   }, 60_000);
 });

@@ -4,14 +4,24 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { MinionQueue } from '../core/minions/queue.ts';
+import type { FactsBackstopResult } from '../core/facts/backstop.ts';
+// Leaf module (no flag surface of its own) — see that file for why this
+// isn't imported from extract-conversation-facts.ts directly (#4135).
+import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-types.ts';
+import { MinionQueue, deriveWedgeSignal } from '../core/minions/queue.ts';
 import { MinionWorker } from '../core/minions/worker.ts';
-import { WORKER_EXIT_RSS_WATCHDOG } from '../core/minions/worker-exit-codes.ts';
+import {
+  WORKER_EXIT_RSS_WATCHDOG,
+  JOB_CHILD_EXIT_USAGE,
+} from '../core/minions/worker-exit-codes.ts';
+import { CHILD_ENV, resolveChildCliInvocation } from '../core/minions/job-isolation.ts';
+import { runChildJobEntry } from '../core/minions/run-child.ts';
 import type { MinionHandler, MinionJob, MinionJobStatus } from '../core/minions/types.ts';
 import type { PaceKeyOverrides } from '../core/pace-mode.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 import { parseNiceValue, applyNiceness, getEffectiveNiceness, formatNice } from '../core/minions/niceness.ts';
+import { defaultTimeoutMsFor, defaultLockDurationMsFor, clampLockDurationMs } from '../core/minions/handler-timeouts.ts';
 
 function parseFlag(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -37,16 +47,54 @@ export function resolveJobPull(data: Record<string, unknown>): boolean {
  * from DB-backed model config immediately before queued jobs enter gateway-backed
  * paths, so a stale process-level default cannot route new work to the wrong
  * provider.
+ *
+ * Three staleness tiers (documented in KEY_FILES's refreshGatewayForJob entry):
+ *   - DB-plane model config: re-resolved here (reconfigureGatewayWithEngine).
+ *   - FILE-plane config (`~/.gbrain/config.json` — incl. provider API keys):
+ *     re-folded here, so a key added to config.json reaches the worker at the
+ *     next job. NOTE `gbrain config set *_api_key` writes the DB plane, which
+ *     loadConfigWithEngine deliberately never merges for key fields — routing
+ *     those writes to the file plane is a filed TODO.
+ *   - True process env vars: fixed at worker start; need a restart.
  */
-async function refreshGatewayForJob(engine: BrainEngine): Promise<void> {
-  const { reconfigureGatewayWithEngine } = await import('../core/ai/gateway.ts');
+export async function refreshGatewayForJob(engine: BrainEngine): Promise<void> {
+  // Env-only refresh: a full configureGateway(buildGatewayConfig(loadConfig()))
+  // would clobber the DB-plane-merged fields the worker's boot fold installed
+  // (provider_base_urls, chat options, …) with file-plane-only values.
+  const { refreshGatewayEnvFromFilePlane, reconfigureGatewayWithEngine } = await import('../core/ai/gateway.ts');
+  refreshGatewayEnvFromFilePlane();
   await reconfigureGatewayWithEngine(engine);
+}
+
+/** Shared predicate: an inline result reporting execution-time unavailability. */
+export function factsAbsorbUnavailable(result: FactsBackstopResult): boolean {
+  return (
+    result.mode === 'inline' &&
+    (result.skipped === 'extraction_unavailable' || result.skipped_reason === 'chat_unavailable')
+  );
+}
+
+/**
+ * The facts-absorb retry decision (@internal exported for tests). A job that
+ * finds chat unavailable at EXECUTION in a KEYED worker is config drift — it
+ * must throw (retry/backoff → visible, re-runnable failure), never return
+ * success and silently consume the job. A KEYLESS worker executing a job
+ * enqueued by some other process is the steady expected state — completing
+ * as a calm skip (the execution-time gate already printed the keyless note)
+ * beats a retry loop that parks every page write as a failed job.
+ */
+export function factsAbsorbShouldRetry(
+  result: FactsBackstopResult,
+  classification: 'keyed' | 'keyless',
+): boolean {
+  return classification === 'keyed' && factsAbsorbUnavailable(result);
 }
 
 const GATEWAY_REFRESH_JOB_NAMES = new Set([
   'embed',
   'extract-conversation-facts',
   'enrich',
+  'facts-absorb',
   'contextual_reindex_per_chunk',
   'autopilot-cycle',
   'synthesize',
@@ -153,6 +201,32 @@ export function resolveWorkerConcurrency(args: string[], env: NodeJS.ProcessEnv 
   return parsed;
 }
 
+export type JobIsolationMode = 'inline' | 'process';
+
+/**
+ * issue #5: `--job-isolation <inline|process>` (space or `=` form), env
+ * fallback GBRAIN_JOB_ISOLATION, default inline. `process` runs each claimed
+ * job in a SIGKILL-able child process — blast radius 1 job instead of N.
+ * Env injected as a param so tests never mutate process.env (rule R1).
+ * Invalid values fail fast (parseMaxRssFlag convention).
+ */
+export function parseJobIsolationFlag(
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): JobIsolationMode {
+  let raw: string | undefined;
+  const eqForm = args.find((a) => a.startsWith('--job-isolation='));
+  if (eqForm !== undefined) raw = eqForm.slice('--job-isolation='.length);
+  if (raw === undefined) raw = parseFlag(args, '--job-isolation');
+  if (raw === undefined || raw === '') raw = env.GBRAIN_JOB_ISOLATION;
+  if (raw === undefined || raw === '') return 'inline';
+  if (raw === 'inline' || raw === 'process') return raw;
+  console.error(
+    `Error: invalid job isolation mode ${JSON.stringify(raw)}. Valid: inline, process.`,
+  );
+  process.exit(1);
+}
+
 /**
  * #3026: the thin-client `list`/`get` branches receive jobs as parsed JSON
  * off the MCP wire, where every timestamp is an ISO string — but formatJob /
@@ -163,6 +237,7 @@ export function resolveWorkerConcurrency(args: string[], env: NodeJS.ProcessEnv 
  */
 const JOB_DATE_FIELDS = [
   'created_at', 'updated_at', 'started_at', 'finished_at', 'lock_until', 'delay_until',
+  'timeout_at',
 ] as const;
 
 export function rehydrateJobDates<T>(job: T): T {
@@ -187,12 +262,51 @@ function formatJob(job: MinionJob): string {
   return `  ${String(job.id).padEnd(6)} ${job.name.padEnd(14)} ${(job.status + stalled).padEnd(20)} ${job.queue.padEnd(10)} ${dur.padEnd(8)} ${job.created_at.toISOString().slice(0, 19)}`;
 }
 
-function formatJobDetail(job: MinionJob): string {
+/** Render a timestamp that is a Date locally but may arrive as an ISO string
+ *  on the thin-client path against an OLDER server (rehydrateJobDates only
+ *  converts fields it knows about; a field the peer predates stays a string).
+ *  Never call .toISOString() unguarded on wire-shaped job fields. */
+function formatWhen(v: Date | string | null | undefined): string {
+  if (v instanceof Date) return v.toISOString();
+  return String(v ?? '');
+}
+
+/** The effective wall-clock budget line for `jobs get`. Wording matters: the
+ *  1x deadline (handleTimeouts, stamped at claim) is the NORMAL kill; the 2x
+ *  wall-clock sweep is the lock-state-agnostic backstop. */
+function formatTimeoutLines(job: MinionJob): string[] {
+  const lines: string[] = [];
+  if (job.timeout_ms != null) {
+    lines.push(`  Timeout: ${job.timeout_ms}ms (deadline kill at 1x when claimed; wall-clock backstop at 2x)`);
+    if (job.timeout_at) lines.push(`  Deadline: ${formatWhen(job.timeout_at)}`);
+  } else {
+    const d = defaultTimeoutMsFor(job.name);
+    if (d != null) {
+      lines.push(`  Timeout: (unset) — handler default ${d}ms stamps at claim`);
+    } else {
+      lines.push(`  Timeout: (unset) — null-default wall-clock sweep applies (2 x lock lease x max_stalled, ~5m at 30s-lease defaults)`);
+    }
+  }
+  // #4145: the lock lease line mirrors the timeout line — row value when
+  // stamped, otherwise the handler-map default that WILL stamp at claim.
+  if (job.lock_duration_ms != null) {
+    lines.push(`  Lock lease: ${job.lock_duration_ms}ms (renewed at min(lease/2, 60s) cadence)`);
+  } else {
+    const lease = defaultLockDurationMsFor(job.name);
+    if (lease != null) {
+      lines.push(`  Lock lease: (unset) — handler default ${lease}ms stamps at claim`);
+    }
+  }
+  return lines;
+}
+
+export function formatJobDetail(job: MinionJob): string {
   const lines = [
     `Job #${job.id}: ${job.name} (${job.status.toUpperCase()}${job.status === 'dead' ? ` after ${job.attempts_made} attempts` : ''})`,
     `  Queue: ${job.queue} | Priority: ${job.priority}`,
     `  Attempts: ${job.attempts_made}/${job.max_attempts} (started: ${job.attempts_started}, stalled: ${job.stalled_counter}/${job.max_stalled})`,
     `  Backoff: ${job.backoff_type} ${job.backoff_delay}ms (jitter: ${job.backoff_jitter})`,
+    ...formatTimeoutLines(job),
   ];
   if (job.started_at) lines.push(`  Started: ${job.started_at.toISOString()}`);
   if (job.finished_at) lines.push(`  Finished: ${job.finished_at.toISOString()}`);
@@ -210,25 +324,13 @@ function formatJobDetail(job: MinionJob): string {
   return lines.join('\n');
 }
 
-export async function runJobs(engineOrNull: BrainEngine | null, args: string[]): Promise<void> {
-  const sub = args[0];
-
-  // Thin-client dispatch (cli.ts) passes engine=null for the subcommands
-  // with remote MCP routing (`list`, `get`) so no scratch local engine is
-  // ever built. Any other subcommand arriving with a null engine is a
-  // routing bug upstream of this function — refuse instead of crashing
-  // inside MinionQueue.
-  if (!engineOrNull && sub !== 'list' && sub !== 'get') {
-    console.error(`\`gbrain jobs ${sub ?? ''}\` needs a local engine and cannot run on a thin client.`);
-    process.exit(1);
-  }
-  // Null only ever reaches the MCP-routed `list`/`get` branches, which
-  // never touch the engine — narrowed once here so the host-only cases
-  // below typecheck unchanged.
-  const engine = engineOrNull as BrainEngine;
-
-  if (!sub || sub === '--help' || sub === '-h') {
-    console.log(`gbrain jobs — Minions job queue
+/**
+ * The full jobs help block. Hoisted to a constant so `gbrain jobs --help`
+ * (routed engine-free via cli.ts SELF_HELP_WITHOUT_ENGINE) and bare
+ * `gbrain jobs` print the same text. Issue: jobs --help used to print the
+ * generic CLI stub because 'jobs' was missing from CLI_ONLY_SELF_HELP.
+ */
+const JOBS_HELP = `gbrain jobs — Minions job queue
 
 USAGE
   gbrain jobs submit <name> [--params JSON] [--follow] [--priority N]
@@ -236,6 +338,7 @@ USAGE
                             [--max-waiting N]
                             [--backoff-type fixed|exponential] [--backoff-delay Nms]
                             [--backoff-jitter 0..1] [--timeout-ms Nms]
+                            [--lock-duration-ms Nms]
                             [--idempotency-key K] [--queue Q] [--dry-run]
                             [--redact-secrets]   (shell only; scrubs inherit
                                                   values from stdout/stderr)
@@ -245,15 +348,18 @@ USAGE
   gbrain jobs retry <id>
   gbrain jobs prune [--older-than 30d] [--dry-run]
   gbrain jobs delete <id>
-  gbrain jobs stats
-  gbrain jobs smoke
+  gbrain jobs stats [--queue Q] [--cluster-errors]
+  gbrain jobs smoke [--sigkill-rescue] [--wedge-rescue]
+  gbrain jobs watch [--json] [--follow] [--refresh-ms=N]
   gbrain jobs work [--queue Q] [--concurrency N] [--max-rss MB]
                    [--health-interval MS] [--nice N]
+                   [--job-isolation inline|process]
   gbrain jobs supervisor [start] [--detach] [--json]
                          [--concurrency N] [--queue Q] [--pid-file PATH]
                          [--max-crashes N] [--health-interval N]
                          [--allow-shell-jobs] [--cli-path PATH]
                          [--max-rss MB] [--nice N]
+                         [--job-isolation inline|process]
 
     --nice N   OS scheduling priority, -20 (highest) to 19 (nicest). Lowers CPU
                priority without cutting concurrency — full throughput when the
@@ -266,8 +372,9 @@ USAGE
 
     Auto-restarting wrapper around 'gbrain jobs work'. Spawns the worker
     as a child process and restarts on crash with exponential backoff
-    (1s -> 60s cap). Writes a PID file to ~/.gbrain/supervisor.pid by
-    default (override via --pid-file or GBRAIN_SUPERVISOR_PID_FILE env).
+    (1s -> 60s cap). Writes a brain-scoped PID file to
+    ~/.gbrain/supervisor-<brain-id>.pid by default (override via
+    --pid-file or GBRAIN_SUPERVISOR_PID_FILE env).
     Lifecycle events are appended to
       \${GBRAIN_AUDIT_DIR:-~/.gbrain/audit}/supervisor-YYYY-Www.jsonl
 
@@ -305,9 +412,185 @@ HANDLER TYPES (built in)
   shell             Run a command or argv. Requires GBRAIN_ALLOW_SHELL_JOBS=1
                     on the worker. Params: {cmd?, argv?, cwd, env?}.
                     See: docs/guides/minions-shell-jobs.md
-`);
+
+Detailed help: gbrain jobs {work|supervisor|submit|watch|prune} --help
+Other subcommands are fully described above.
+`;
+
+/**
+ * Per-subcommand help for the flag-heavy / side-effectful subcommands.
+ * Pattern from bootstrap.ts SUBCOMMAND_HELP: the guard below prints these
+ * BEFORE the switch, so \`jobs work --help\` can never start a worker
+ * daemon (the defect class this record exists to prevent). Subcommands
+ * without an entry fall back to JOBS_HELP, which documents them fully.
+ */
+const JOBS_SUBCOMMAND_HELP: Record<string, string> = {
+  work: `gbrain jobs work — start a worker daemon (Postgres only)
+
+USAGE
+  gbrain jobs work [--queue Q] [--concurrency N] [--max-rss MB]
+                   [--health-interval MS] [--nice N]
+                   [--job-isolation inline|process]
+
+OPTIONS
+  --queue Q            Queue to claim from (default: default)
+  --job-isolation M    inline (default): handlers run in the worker process.
+                       process: each claimed job runs in its own child
+                       process — a stuck handler is group-SIGKILLed instead
+                       of abandoned, and a crash takes one job, not all N.
+                       Env fallback: GBRAIN_JOB_ISOLATION. Recommended for
+                       long-running LLM-bound handlers (subagent). Note:
+                       --max-rss then covers the worker only, and each child
+                       adds ~4 pooler client connections.
+  --concurrency N      Max jobs in flight. Resolution: flag, then
+                       GBRAIN_WORKER_CONCURRENCY env, then 1. Values < 1
+                       are clamped to 1 with a loud stderr note.
+  --max-rss MB         RSS watchdog. Absent: auto-sized to 50% of
+                       min(cgroup limit, host RAM), capped at 16384 MB,
+                       raised to a 4096 MB floor when the basis allows.
+                       0 disables the watchdog. Values 1-255 are rejected
+                       (megabytes, not gigabytes — unit-confusion guard).
+  --health-interval MS Health probe cadence (default 60000). 0 disables.
+                       Values 1-999 are rejected as unit confusion.
+                       Under GBRAIN_SUPERVISED=1 stall detection is off;
+                       the DB probe stays.
+  --nice N             OS scheduling priority, -20 (highest) to 19
+                       (nicest). Env fallback: GBRAIN_NICE; flag wins.
+                       Negative values need root.
+
+NOTES
+  Requires the Postgres engine — PGLite's exclusive file lock cannot host
+  a long-lived daemon. For crash-resilient operation prefer:
+    gbrain jobs supervisor start --detach --json
+`,
+  supervisor: `gbrain jobs supervisor — auto-restarting wrapper around 'gbrain jobs work'
+
+USAGE
+  gbrain jobs supervisor [start] [--detach] [--json]
+                         [--concurrency N] [--queue Q] [--pid-file PATH]
+                         [--max-crashes N] [--health-interval N]
+                         [--allow-shell-jobs] [--cli-path PATH]
+                         [--max-rss MB] [--nice N]
+                         [--job-isolation inline|process]
+  gbrain jobs supervisor status [--json] [--pid-file PATH]
+  gbrain jobs supervisor stop [--json] [--pid-file PATH]
+
+OPTIONS (start)
+  --detach             Fork and print {event, supervisor_pid, pid_file} JSON
+  --json               JSONL lifecycle events on stdout
+  --concurrency N      Worker concurrency (default 2)
+  --queue Q            Queue to claim from (default: default)
+  --pid-file PATH      PID file (default: brain-scoped
+                       ~/.gbrain/supervisor-<brain-id>.pid;
+                       env GBRAIN_SUPERVISOR_PID_FILE)
+  --max-crashes N      Soft crash threshold (default 10): past N crashes in
+                       24h the supervisor reports degraded and keeps backing
+                       off. It only STOPS permanently at the hard ceiling —
+                       default 10 x N; override or disable (0 = never) via
+                       GBRAIN_SUPERVISOR_HARD_STOP_CRASHES.
+  --health-interval N  Worker health probe cadence in ms
+  --allow-shell-jobs   Enable the shell handler on the spawned worker
+  --cli-path PATH      Explicit gbrain binary for the worker child
+  --max-rss MB         RSS watchdog for the worker (same rules as jobs work)
+  --nice N             OS priority for supervisor + worker children
+  --job-isolation M    Passed through to the worker (see jobs work --help)
+
+EXIT CODES (start)
+  0 clean shutdown   1 max crashes exceeded
+  2 another supervisor holds the PID lock   3 PID file unwritable
+  4 DB queue lock lost (repeated refresh failures; restart re-acquires)
+`,
+  submit: `gbrain jobs submit — enqueue a background job
+
+USAGE
+  gbrain jobs submit <name> [--params JSON] [--follow] [--priority N]
+                            [--delay Nms] [--max-attempts N] [--max-stalled N]
+                            [--max-waiting N]
+                            [--backoff-type fixed|exponential] [--backoff-delay Nms]
+                            [--backoff-jitter 0..1] [--timeout-ms Nms]
+                            [--lock-duration-ms Nms]
+                            [--idempotency-key K] [--queue Q] [--dry-run]
+                            [--redact-secrets]
+
+OPTIONS
+  --params JSON        Job payload (handler-specific; see HANDLER TYPES in
+                       'gbrain jobs --help')
+  --follow             Run inline and stream progress (constructs a real
+                       worker; works on both engines)
+  --priority N         Lower runs first (default 0)
+  --delay Nms          Delay before the job becomes claimable (default 0)
+  --max-attempts N     Retry budget (default 3)
+  --max-stalled N      Stall-requeue budget before dead-letter (default 5)
+  --max-waiting N      Backpressure: cap waiting jobs with this name/queue/
+                       source before coalescing new submissions ([1,100])
+  --timeout-ms Nms     Per-job wall-clock budget. Long-lane handlers get a
+                       default from HANDLER_DEFAULT_TIMEOUT_MS when omitted.
+  --lock-duration-ms N Per-job lock lease (#4145). Clamped to [5s, 1h].
+                       Long-lane handlers default to 300s via
+                       HANDLER_DEFAULT_LOCK_DURATION_MS; others use the
+                       worker default (30s).
+  --idempotency-key K  At-most-one row per key (dead/cancelled free the key)
+  --queue Q            Target queue (default: default)
+  --dry-run            Print what would be submitted, submit nothing
+  --redact-secrets     (shell jobs) scrub inherited env values from output
+`,
+  watch: `gbrain jobs watch — live queue dashboard
+
+USAGE
+  gbrain jobs watch [--json] [--follow] [--refresh-ms=N]
+
+OPTIONS
+  --json           JSON snapshots instead of the human dashboard
+  --follow         Keep refreshing (default: on for TTY, off otherwise)
+  --refresh-ms=N   Refresh cadence in ms (default 1000). Equals form only —
+                   'watch' does not accept a space-separated value.
+`,
+  prune: `gbrain jobs prune — delete old terminal jobs
+
+USAGE
+  gbrain jobs prune [--older-than 30d] [--dry-run]
+
+OPTIONS
+  --older-than AGE  Delete completed/failed/dead/cancelled jobs older than
+                    AGE in days (default 30d; bare N or Nd — hour forms
+                    are not supported)
+  --dry-run         Report what would be deleted without deleting
+`,
+};
+
+export async function runJobs(engineOrNull: BrainEngine | null, args: string[]): Promise<void> {
+  const sub = args[0];
+
+  // Help guards run BEFORE the thin-client refusal below: cli.ts routes
+  // `jobs … --help` here engine-free (SELF_HELP_WITHOUT_ENGINE), and help
+  // must never require an engine — or worse, fall through to a subcommand
+  // body and start a real daemon. Only --help/-h are recognized; the bare
+  // word 'help' is NOT (e.g. `jobs submit help` is a legitimate job name).
+  if (!sub || sub === '--help' || sub === '-h') {
+    console.log(JOBS_HELP);
     return;
   }
+  if (args.slice(1).includes('--help') || args.slice(1).includes('-h')) {
+    // Object.hasOwn: a plain-object lookup resolves inherited keys, so
+    // `jobs constructor --help` (toString/valueOf/…) would print the
+    // Object.prototype function instead of falling back to the full help.
+    console.log(Object.hasOwn(JOBS_SUBCOMMAND_HELP, sub) ? JOBS_SUBCOMMAND_HELP[sub] : JOBS_HELP);
+    return;
+  }
+
+  // Thin-client dispatch (cli.ts) passes engine=null for the subcommands
+  // with remote MCP routing (`list`, `get`) so no scratch local engine is
+  // ever built. Any other subcommand arriving with a null engine is a
+  // routing bug upstream of this function — refuse instead of crashing
+  // inside MinionQueue.
+  if (!engineOrNull && sub !== 'list' && sub !== 'get') {
+    console.error(`\`gbrain jobs ${sub ?? ''}\` needs a local engine and cannot run on a thin client.`);
+    process.exit(1);
+  }
+  // Null only ever reaches the MCP-routed `list`/`get` branches, which
+  // never touch the engine — narrowed once here so the host-only cases
+  // below typecheck unchanged.
+  const engine = engineOrNull as BrainEngine;
 
   // The constructor just stores the reference; on the null (thin-client
   // list/get) paths no queue method is ever reached.
@@ -355,6 +638,15 @@ HANDLER TYPES (built in)
         console.error('Error: --timeout-ms must be a positive integer (milliseconds)');
         process.exit(1);
       }
+      // #4145: per-job lock lease. Clamped to [5s,1h] in queue.add via
+      // clampLockDurationMs (shared with the MCP op); NULL falls to the
+      // handler map, then the worker default.
+      const lockDurationMsRaw = parseFlag(args, '--lock-duration-ms');
+      const lockDurationMs = lockDurationMsRaw !== undefined ? parseInt(lockDurationMsRaw, 10) : undefined;
+      if (lockDurationMsRaw !== undefined && (isNaN(lockDurationMs!) || lockDurationMs! <= 0)) {
+        console.error('Error: --lock-duration-ms must be a positive integer (milliseconds)');
+        process.exit(1);
+      }
       const idempotencyKey = parseFlag(args, '--idempotency-key');
       const queueName = parseFlag(args, '--queue') ?? 'default';
       const dryRun = hasFlag(args, '--dry-run');
@@ -378,6 +670,12 @@ HANDLER TYPES (built in)
         if (backoffDelay !== undefined) console.log(`  Backoff delay: ${backoffDelay}ms`);
         if (backoffJitter !== undefined) console.log(`  Backoff jitter: ${backoffJitter}`);
         if (timeoutMs !== undefined) console.log(`  Timeout: ${timeoutMs}ms`);
+        if (lockDurationMs !== undefined) {
+          // Echo what will actually be STORED (queue.add clamps to [5s,1h]);
+          // a dry-run that prints the raw out-of-range input lies.
+          const stored = clampLockDurationMs(lockDurationMs);
+          console.log(`  Lock lease: ${stored}ms${stored !== lockDurationMs ? ` (clamped from ${lockDurationMs}ms)` : ''}`);
+        }
         if (idempotencyKey) console.log(`  Idempotency key: ${idempotencyKey}`);
         if (delay > 0) console.log(`  Delay: ${delay}ms`);
         console.log(`  Data: ${JSON.stringify(data)}`);
@@ -423,6 +721,7 @@ HANDLER TYPES (built in)
         backoff_delay: backoffDelay,
         backoff_jitter: backoffJitter,
         timeout_ms: timeoutMs,
+        lock_duration_ms: lockDurationMs,
         idempotency_key: idempotencyKey,
         queue: queueName,
       }, trusted);
@@ -662,17 +961,100 @@ HANDLER TYPES (built in)
       const statsQueue = parseFlag(args, '--queue') ?? 'default';
       const stats = await queue.getStats({ queue: statsQueue });
 
+      // Divergence detection: intake (created in window) vs USEFUL drain
+      // (drained_completed — cancellations are outflow, not work; a naive
+      // combined drain self-inflates while the TTL sweep shreds backlog).
+      // Same env-threshold pattern as the wedge line below.
+      const divergenceRatio = (() => {
+        const raw = Number(process.env.GBRAIN_QUEUE_DIVERGENCE_RATIO ?? '');
+        return Number.isFinite(raw) && raw > 0 ? raw : 2;
+      })();
+      const divergenceMinWaiting = (() => {
+        const raw = parseInt(process.env.GBRAIN_QUEUE_DIVERGENCE_MIN_WAITING ?? '', 10);
+        return Number.isFinite(raw) && raw > 0 ? raw : 50;
+      })();
+      const divergent = stats.by_type.filter(t =>
+        t.waiting_now > divergenceMinWaiting &&
+        t.total > divergenceRatio * Math.max(t.drained_completed, 1));
+
+      // Waiting-TTL cancellations in the window (admission sweep visibility —
+      // derived from the reason prefix cancelJobs writes; no extra storage).
+      let ttlCancelled: Array<{ name: string; count: number }> = [];
+      try {
+        const { TTL_REASON_PREFIX } = await import('../core/minions/admission.ts');
+        const ttlRows = await engine.executeRaw<{ name: string; count: string }>(
+          `SELECT name, count(*)::text AS count FROM minion_jobs
+            WHERE status = 'cancelled' AND error_text LIKE $1
+              AND finished_at > now() - interval '24 hours'
+            GROUP BY name ORDER BY count(*) DESC`,
+          [`${TTL_REASON_PREFIX}%`],
+        );
+        ttlCancelled = ttlRows.map(r => ({ name: r.name, count: parseInt(r.count, 10) }));
+      } catch { /* best-effort */ }
+      // Job names originate from the MCP-exposed submit surface — strip
+      // control/ANSI bytes + cap before echoing into the terminal screams
+      // (same hygiene as frontmatter-derived type names). Names embedded in
+      // COPY-PASTEABLE command hints get the stricter safeConfigSegment gate:
+      // display-sanitize keeps shell metacharacters.
+      const { sanitizeTypeForDisplay: sanitizeName } = await import('../core/schema-pack/type-usage.ts');
+      const { safeConfigSegment } = await import('../core/minions/admission.ts');
+
+      if (hasFlag(args, '--json')) {
+        console.log(JSON.stringify({
+          queue: statsQueue,
+          ...stats,
+          divergent: divergent.map(t => ({
+            name: t.name,
+            intake_24h: t.total,
+            drained_completed_24h: t.drained_completed,
+            waiting_now: t.waiting_now,
+            oldest_waiting_minutes: t.oldest_waiting_minutes,
+          })),
+          ttl_cancelled_24h: ttlCancelled,
+        }, null, 2));
+        break;
+      }
+
       console.log('Job Stats (last 24h):');
       if (stats.by_type.length > 0) {
-        console.log(`  ${'Type'.padEnd(14)} ${'Total'.padEnd(7)} ${'Done'.padEnd(7)} ${'Failed'.padEnd(8)} ${'Dead'.padEnd(6)} Avg Time`);
+        console.log(`  ${'Type'.padEnd(14)} ${'Total'.padEnd(7)} ${'Done'.padEnd(7)} ${'Failed'.padEnd(8)} ${'Dead'.padEnd(6)} ${'Drained'.padEnd(9)} ${'Waiting'.padEnd(9)} Avg Time`);
         for (const t of stats.by_type) {
           const avgTime = t.avg_duration_ms != null ? `${(t.avg_duration_ms / 1000).toFixed(1)}s` : '—';
-          console.log(`  ${t.name.padEnd(14)} ${String(t.total).padEnd(7)} ${String(t.completed).padEnd(7)} ${String(t.failed).padEnd(8)} ${String(t.dead).padEnd(6)} ${avgTime}`);
+          // Drained = terminal outflow in-window, completed-first with the
+          // rest bracketed so TTL-cancel storms can't masquerade as work.
+          const drained = `${t.drained_completed}${(t.drained_failed + t.drained_dead + t.drained_cancelled) > 0 ? `(+${t.drained_failed + t.drained_dead + t.drained_cancelled})` : ''}`;
+          console.log(`  ${sanitizeName(t.name).padEnd(14)} ${String(t.total).padEnd(7)} ${String(t.completed).padEnd(7)} ${String(t.failed).padEnd(8)} ${String(t.dead).padEnd(6)} ${drained.padEnd(9)} ${String(t.waiting_now).padEnd(9)} ${avgTime}`);
         }
+        console.log(`  (Drained = completed in-window, +N = failed/dead/cancelled outflow; Waiting = now, all queues)`);
       } else {
         console.log('  No jobs in the last 24 hours.');
       }
       console.log(`\n  Queue health: ${stats.queue_health.waiting} waiting, ${stats.queue_health.active} active, ${stats.queue_health.stalled} stalled`);
+
+      // DIVERGENT-queue scream: intake structurally exceeds useful drain and a
+      // real backlog is sitting there. This is the default-on protection layer
+      // (quota ships config-only), so it must carry the opt-in hint.
+      for (const t of divergent) {
+        const perDay = t.drained_completed; // window is 24h
+        const etaDays = perDay > 0 ? Math.round(t.waiting_now / perDay) : null;
+        const eta = etaDays != null ? `~${etaDays}d backlog at current drain` : 'backlog never drains at current rate';
+        const ttl = ttlCancelled.find(c => c.name === t.name);
+        const ttlNote = ttl ? ` Waiting-TTL is cancelling ~${ttl.count}/day of it.` : '';
+        console.log(
+          `\n  ⚠  DIVERGENT QUEUE type '${sanitizeName(t.name)}': intake ${t.total}/24h vs ${t.drained_completed} completed/24h, ` +
+          `${t.waiting_now} waiting (${eta}).${ttlNote}\n` +
+          `     Reduce intake, raise drain, or cap admission:\n` +
+          `       gbrain config set minions.quota_max_waiting.${safeConfigSegment(t.name) ?? '<job-name>'} <n>`,
+        );
+      }
+      if (ttlCancelled.length > 0) {
+        const parts = ttlCancelled.map(c => `${sanitizeName(c.name)}: ${c.count}`).join(', ');
+        console.log(
+          `\n  ⚠  Waiting-TTL cancelled ${ttlCancelled.reduce((a, c) => a + c.count, 0)} job(s) in the last 24h (${parts}).\n` +
+          `     These waited past their TTL without ever being claimed. Tune:\n` +
+          `       gbrain config set minions.ttl_waiting_hours.<name> <hours|0>`,
+        );
+      }
 
       // Scheduling priority (niceness, issue #1815). Best-effort: measures live
       // workers from the registry + the supervisor (if running) — silently skips
@@ -704,13 +1086,9 @@ HANDLER TYPES (built in)
       {
         const w = stats.wedge;
         const mins = w.minutes_since_completion;
-        // Same threshold the doctor `wedged_queue` check uses, so the two
-        // advisory surfaces agree (issue #1801).
-        const wedgeMins = (() => {
-          const raw = parseInt(process.env.GBRAIN_WEDGED_QUEUE_WARN_MINUTES ?? '', 10);
-          return Number.isFinite(raw) && raw > 0 ? raw : 15;
-        })();
-        const wedged = w.active_healthy === 0 && w.waiting > 0 && (mins === null || mins > wedgeMins);
+        // Shared derivation (queue.ts deriveWedgeSignal) so this line, the
+        // doctor wedged_queue check, and the get_job_stats op agree (#1801).
+        const { wedged, wedge_threshold_minutes: wedgeMins } = deriveWedgeSignal(w);
         if (wedged) {
           const since = mins === null ? 'no completions on record' : `${mins}m since last completion`;
           console.log(
@@ -719,6 +1097,67 @@ HANDLER TYPES (built in)
             `       gbrain jobs supervisor stop && gbrain jobs supervisor start   # rebuild a fresh pool\n` +
             `       gbrain jobs retry <id>                                        # for dead-lettered jobs`,
           );
+        }
+
+        // Backpressure visibility: maxPending suppression keeps `waiting` at 0
+        // while a job is in flight, which silences the waiting>0 wedge line
+        // above — the exact operator-confusion cost of the duplicate-cycle
+        // incident. Surface the last 24h of coalesce events (per name, this
+        // queue) from the backpressure audit JSONL, plus a hint naming the
+        // in-flight job when a name shows suppression with zero waiting rows
+        // and a stale live-lock active. Best-effort: unreadable audit files
+        // simply omit the line.
+        try {
+          const { readRecentCoalesceCounts } = await import('../core/minions/backpressure-audit.ts');
+          const coalesceCounts = readRecentCoalesceCounts({ queue: statsQueue, windowMs: 24 * 3600_000 });
+          if (coalesceCounts.size > 0) {
+            // Sort once, reuse for the summary AND the hint slice — slicing
+            // insertion order would let low-volume early-in-file names crowd
+            // out the highest-volume (most likely wedged) ones the summary
+            // line just highlighted.
+            const sortedCoalesces = [...coalesceCounts.entries()]
+              .sort((a, b) => b[1].count - a[1].count);
+            const parts = sortedCoalesces.map(([name, s]) => `${name}: ${s.count}`);
+            console.log(`\n  Backpressure (24h): submissions coalesced onto in-flight jobs — ${parts.join(', ')}`);
+            // Hint loop is bounded: names come from the 24h audit window
+            // (normally a handful), capped defensively — this is an
+            // operator-invoked diagnostic, not a hot path. Each hint is
+            // driven by the LATEST coalesce target for the name (the audit's
+            // returned_job_id), scoped to that job's source — a name-wide
+            // aggregate would let source A's waiting row mask source B's
+            // wedge, or name A's job for B's coalesce (multi-source brains).
+            const hints = sortedCoalesces.slice(0, 10);
+            for (const [name, summary] of hints) {
+              if (summary.last_returned_job_id == null) continue;
+              // The target CTE re-checks name+queue: the audit dir is shared
+              // across brains in one GBRAIN_HOME, so an id from another
+              // brain's audit trail must fail the match here rather than
+              // name an unrelated job as the suppressor.
+              const rows = await engine.executeRaw<{ waiting: string; live_id: string | null; age_min: string | null }>(
+                `WITH target AS (
+                   SELECT id, started_at, status, lock_until,
+                          COALESCE(data->>'sourceId', data->>'source_id') AS scope
+                     FROM minion_jobs WHERE id = $3 AND name = $1 AND queue = $2
+                 )
+                 SELECT (SELECT count(*)::text FROM minion_jobs m, target t
+                          WHERE m.name = $1 AND m.queue = $2 AND m.status = 'waiting'
+                            AND COALESCE(m.data->>'sourceId', m.data->>'source_id') IS NOT DISTINCT FROM t.scope) AS waiting,
+                        (SELECT id::text FROM target WHERE status = 'active' AND lock_until > now()) AS live_id,
+                        (SELECT floor(EXTRACT(EPOCH FROM (now() - started_at)) / 60)::text FROM target
+                          WHERE status = 'active' AND lock_until > now()) AS age_min`,
+                [name, statsQueue, summary.last_returned_job_id],
+              );
+              const r = rows[0];
+              const ageMin = r?.age_min != null ? parseInt(r.age_min, 10) : null;
+              if (r && parseInt(r.waiting ?? '0', 10) === 0 && r.live_id != null && ageMin != null && ageMin > wedgeMins) {
+                console.log(
+                  `     ${name}: dispatch suppressed by in-flight job #${r.live_id} (age ${ageMin}m) — check \`gbrain jobs get ${r.live_id}\``,
+                );
+              }
+            }
+          }
+        } catch {
+          // Audit read is advisory; never break stats.
         }
       }
 
@@ -943,6 +1382,59 @@ HANDLER TYPES (built in)
       process.exit(0);
     }
 
+    case 'run-child': {
+      // INTERNAL (issue #5 process isolation): spawned by `jobs work` with
+      // process isolation enabled. One job, one process: validate the claim,
+      // run the handler with the child's own engine, write ONE outcome file,
+      // exit. Deliberately absent from user-facing help. The CLI layer owns
+      // engine.disconnect() + process.exit() (engine-ownership invariant).
+      {
+        const config = loadConfig();
+        if (config?.engine === 'pglite') {
+          console.error('[run-child] process isolation requires the Postgres engine.');
+          await engine.disconnect();
+          process.exit(JOB_CHILD_EXIT_USAGE);
+        }
+        const jobIdRaw = parseFlag(args, '--job-id');
+        const jobId = jobIdRaw != null ? parseInt(jobIdRaw, 10) : NaN;
+        const lockToken = process.env[CHILD_ENV.lockToken];
+        const resultPath = process.env[CHILD_ENV.resultPath];
+        const parentPidRaw = parseInt(process.env[CHILD_ENV.parentPid] ?? '0', 10);
+        if (!Number.isInteger(jobId) || jobId <= 0 || !lockToken || !resultPath) {
+          console.error(
+            '[run-child] internal command spawned by the jobs worker; requires ' +
+            `a numeric job id plus ${CHILD_ENV.lockToken} and ${CHILD_ENV.resultPath} in env.`,
+          );
+          await engine.disconnect();
+          process.exit(JOB_CHILD_EXIT_USAGE);
+        }
+
+        // Same handler surface as the worker: registerBuiltinHandlers also
+        // performs plugin discovery, so plugin subagent jobs isolate too.
+        const throwaway = new MinionWorker(engine, { queue: 'default', concurrency: 1 });
+        await registerBuiltinHandlers(throwaway, engine, { quiet: true });
+
+        let code: number;
+        try {
+          code = await runChildJobEntry(
+            engine,
+            {
+              jobId,
+              lockToken,
+              resultPath,
+              parentPid: Number.isInteger(parentPidRaw) && parentPidRaw > 0 ? parentPidRaw : 0,
+            },
+            { resolveHandler: (name) => throwaway.getHandler(name) },
+          );
+        } catch (e) {
+          console.error(`[run-child] fatal: ${e instanceof Error ? e.message : String(e)}`);
+          code = 1;
+        }
+        await engine.disconnect();
+        process.exit(code);
+      }
+    }
+    // eslint-disable-next-line no-fallthrough -- unreachable: the case above always exits
     case 'work': {
       // Check if PGLite
       const config = (await import('../core/config.ts')).loadConfig();
@@ -1003,11 +1495,78 @@ HANDLER TYPES (built in)
         }
       }
 
+      // issue #5: per-job process isolation. Resolve + validate the child CLI
+      // invocation ONCE at startup and refuse to start on failure — a bad
+      // path discovered per-job would release every claim as infra failures
+      // (never dead-lettering, but never progressing either).
+      const jobIsolation = parseJobIsolationFlag(args);
+      let childCliInvocation: { cmd: string; argsPrefix: string[] } | null = null;
+      let childTiniPath = '';
+      if (jobIsolation === 'process') {
+        const { resolveGbrainCliPath } = await import('./autopilot.ts');
+        const inv = resolveChildCliInvocation(
+          process.env,
+          process.execPath,
+          process.argv[1],
+          () => resolveGbrainCliPath(),
+        );
+        if (!inv) {
+          console.error(
+            'Error: process isolation needs a resolvable gbrain CLI for job children ' +
+            '(compiled binary on PATH, or GBRAIN_JOB_CHILD_CLI override).',
+          );
+          process.exit(1);
+        }
+        // Canonicalize BEFORE validating: existsSync on a relative name checks
+        // cwd while spawn() resolves via PATH — the validated file and the
+        // executed binary could differ (security review). Resolving to an
+        // absolute path makes the fail-fast check and the spawn agree.
+        const { existsSync: childCliExists } = await import('node:fs');
+        const { resolve: resolveCliPath } = await import('node:path');
+        inv.cmd = resolveCliPath(inv.cmd);
+        if (!childCliExists(inv.cmd)) {
+          console.error(
+            `Error: resolved child CLI does not exist: ${inv.cmd} ` +
+            '(set GBRAIN_JOB_CHILD_CLI to a valid gbrain binary).',
+          );
+          process.exit(1);
+        }
+        childCliInvocation = inv;
+        const { detectTini } = await import('../core/minions/spawn-helpers.ts');
+        childTiniPath = detectTini();
+        if (maxRssMb > 0) {
+          console.error(
+            '[gbrain jobs] note: with process isolation on, the --max-rss watchdog covers the ' +
+            'WORKER process only — handler memory now lives in job children. Per-child caps are ' +
+            'a filed follow-up; size host memory for concurrency x handler footprint.',
+          );
+        }
+      }
+
       try { await queue.ensureSchema(); }
       catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
+      // issue #6: the direct-pool kill switch collapses lock renewal, health
+      // probes, and handler workload onto ONE shared pool — silently. Make
+      // the collapse loud at startup so a later 'pool_starved' incident has
+      // an obvious prior warning instead of a mystery.
+      {
+        const { getConnectionRouting } = await import('../core/minions/db-probe.ts');
+        const cm = getConnectionRouting(engine);
+        if (cm?.isDualPoolActive && !cm.isDualPoolActive()) {
+          const killSwitched = cm.describeMode?.().kill_switch_active === true;
+          console.error(
+            `[gbrain jobs] single-pool mode: lock renewal, health probes and handler workload share ` +
+            `one connection pool${killSwitched ? ' (direct-lane kill switch is active)' : ''}. ` +
+            `Under heavy handler load this pool can starve the lock heartbeat. For Supabase brains, ` +
+            `ensure the direct (5432) host is reachable or set GBRAIN_DIRECT_DATABASE_URL.`,
+          );
+        }
+      }
+
       const worker = new MinionWorker(engine, {
         queue: queueName, concurrency, maxRssMb, healthCheckInterval,
+        jobIsolation, childCliInvocation, childTiniPath,
       });
       await registerBuiltinHandlers(worker, engine);
 
@@ -1017,9 +1576,37 @@ HANDLER TYPES (built in)
       // the external PM (systemd, Docker, cron watchdog) restart cleanly.
       worker.on('unhealthy', (info) => {
         if (info.reason === 'db_dead') {
+          // issue #6: name the failing LAYER, not just "DB unreachable" —
+          // that message sent operators chasing database capacity while the
+          // real fault was client-side pool exhaustion. Exiting is still
+          // correct recovery either way (it frees every client-held slot).
+          if (info.verdict === 'pool_starved') {
+            console.error(
+              `[health] FATAL: connection-pool path saturated after ${info.consecutiveFailures} probes — ` +
+              `the database server itself is reachable. (${info.message}) ` +
+              `Likely causes: long-running handler queries holding pool slots, or too-small GBRAIN_POOL_SIZE ` +
+              `for this workload. Consider --job-isolation process for long-running handlers ` +
+              `(handler connections then die with each job's child process). ` +
+              `Exiting for process-manager restart (frees all client-held slots).`,
+            );
+          } else if (info.verdict === 'server_unreachable') {
+            console.error(
+              `[health] FATAL: database server unreachable after ${info.consecutiveFailures} probes ` +
+              `(both pooler and direct lanes failed). (${info.message}) ` +
+              `Exiting for process-manager restart.`,
+            );
+          } else {
+            console.error(
+              `[health] FATAL: DB probe failed ${info.consecutiveFailures} consecutive times (${info.message}). ` +
+              `Exiting for process-manager restart.`,
+            );
+          }
+        } else if (info.reason === 'child_spawn_failing') {
           console.error(
-            `[health] FATAL: DB unreachable after ${info.consecutiveFailures} probes (${info.message}). ` +
-            `Exiting for process-manager restart.`,
+            `[health] FATAL: ${info.consecutiveFailures} consecutive job-child spawn/bootstrap ` +
+            `failures (${info.message}). The child CLI is deterministically broken — fix the ` +
+            `worker's child CLI configuration (or GBRAIN_JOB_CHILD_CLI). Exiting for ` +
+            `process-manager restart.`,
           );
         } else {
           console.error(
@@ -1048,7 +1635,10 @@ HANDLER TYPES (built in)
             : `, health-check: ${Math.round(healthCheckInterval / 1000)}s`)
         : '';
       const niceNote = niceResult ? `, nice: ${formatNice(niceResult.effective ?? niceVal!)}` : '';
-      console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}${watchdogNote}${healthNote}${niceNote})`);
+      const isolationNote = jobIsolation === 'process'
+        ? `, isolation: process (child cli: ${childCliInvocation?.cmd}${childTiniPath ? ', tini' : ''})`
+        : '';
+      console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}${watchdogNote}${healthNote}${niceNote}${isolationNote})`);
       console.log(`Registered handlers: ${worker.registeredNames.join(', ')}`);
 
       // Register in the live worker registry (issue #1815) so jobs stats / doctor
@@ -1367,6 +1957,7 @@ HANDLER TYPES (built in)
         allowShellJobs,
         json: jsonMode,
         maxRssMb,
+        jobIsolation: parseJobIsolationFlag(args),
         ...(supNice !== undefined ? { nice_requested: supNice } : {}),
         ...(supNiceResult?.effective != null ? { nice_effective: supNiceResult.effective } : {}),
         ...(supNiceResult?.error ? { nice_error: supNiceResult.error } : {}),
@@ -1541,6 +2132,15 @@ export async function registerBuiltinHandlers(
       // invocation whose whole point was to do neither.
       dryRun: !!job.data.dryRun,
       sourceId: typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined,
+      // Background parity (D7): the doc-recommended recovery
+      // `embed --stale --catch-up --include-null-signature --background`
+      // used to silently DEGRADE — the payload dropped these four, so the
+      // job ran as a plain 30-min-budget stale pass with the grandfather
+      // clause intact. Serialize + read them like every other embed knob.
+      catchUp: !!job.data.catchUp,
+      includeNullSignature: !!job.data.includeNullSignature,
+      batchSize: typeof job.data.batchSize === 'number' ? job.data.batchSize : undefined,
+      priority: job.data.priority === 'recent' ? 'recent' : undefined,
       // CX1+CX5: pace overrides ride in the job payload as explicit overrides
       // only; runEmbedCore re-resolves env > config > bundle at execution so
       // GBRAIN_PACE_* still wins during an incident.
@@ -1594,14 +2194,16 @@ export async function registerBuiltinHandlers(
       // SHOULD pin to one source per call (job_id is per-call).
       throw new Error('extract-conversation-facts Minion job requires data.sourceId');
     }
+    // ALLOWED_TYPES is the single source of truth for the conversation-facts
+    // type allowlist (see src/core/facts/conversation-types.ts).
     const types = Array.isArray(job.data.types)
-      ? (job.data.types as string[]).filter((t) =>
-          ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'].includes(t),
+      ? (job.data.types as string[]).filter(
+          (t): t is AllowedType => (ALLOWED_TYPES as readonly string[]).includes(t),
         )
       : undefined;
     const result = await runExtractConversationFactsCore(engine, {
       sourceId,
-      types: types as ('conversation' | 'meeting' | 'slack' | 'email')[] | undefined,
+      types,
       slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
       dryRun: !!job.data.dryRun,
       limit: typeof job.data.limit === 'number' ? job.data.limit : undefined,
@@ -1695,10 +2297,11 @@ export async function registerBuiltinHandlers(
   });
 
   worker.register('import', async (job) => {
-    // import.ts Core extraction deferred to v0.12.0 (import has parallel
-    // workers + checkpointing). Keep the CLI wrapper call but note the
-    // worker-kill risk is bounded: import's only process.exit fires on
-    // a missing dir arg, which this handler always passes.
+    // import.ts Core extraction deferred (import has parallel workers +
+    // checkpointing; the typed-API split lands in W7 of the fix-wave).
+    // W0 (Tier-1 #5): runImport no longer contains ANY process.exit — all
+    // five preflight sites throw typed ImportAbortError, which this
+    // handler's catch converts to a normal failJob. No worker-kill risk.
     const { runImport } = await import('./import.ts');
     const importArgs: string[] = [];
     if (job.data.dir) importArgs.push(String(job.data.dir));
@@ -1708,7 +2311,44 @@ export async function registerBuiltinHandlers(
   });
 
   worker.register('extract', async (job) => {
-    const { runExtractCore } = await import('./extract.ts');
+    const { runExtractCore, extractStaleFromDB, STALE_TIME_BUDGET_MS } = await import('./extract.ts');
+    // #2849: stale mode — the durable follow-up for extraction deferred by
+    // performSync's size gate (totalChanges > 100). Runs the same DB-source
+    // watermark sweep as `gbrain extract --stale`, scoped to the source the
+    // sync that deferred it was scoped to (job.data.sourceId; absent =
+    // unscoped, matching what the CLI hint tells a default-brain operator
+    // to run). The sweep is checkout-less + idempotent, so retries and
+    // overlapping submissions converge.
+    if (job.data.stale === true) {
+      const sourceIdFilter = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+      const r = await extractStaleFromDB(engine, {
+        dryRun: !!job.data.dryRun,
+        jsonMode: false,
+        includeFrontmatter: false,
+        sourceIdFilter,
+        catchUp: false,
+      });
+      // Internal 30-min budget hit with work remaining → chain a
+      // continuation job so a very large deferred backlog converges without
+      // waiting for the next sync. Forward-progress guard (pagesProcessed >
+      // 0) prevents an infinite chain if the sweep can't advance.
+      if (!job.data.dryRun && r.staleRemaining > 0 && r.pagesProcessed > 0) {
+        try {
+          const queue = new MinionQueue(engine);
+          // NO maxWaiting: with an unscoped (NULL-sourceId) payload the
+          // coalesce filter matches ANY waiting 'extract' job and would
+          // swallow the continuation. Each completed sweep chains at most
+          // one continuation and the sweep is an idempotent watermark scan,
+          // so there is no pile-up to guard against.
+          await queue.add(
+            'extract',
+            { ...job.data, continuation_of: job.id },
+            { timeout_ms: STALE_TIME_BUDGET_MS + 5 * 60 * 1000 },
+          );
+        } catch { /* best-effort: next sync/manual sweep picks up the rest */ }
+      }
+      return { stale: true, source_id: sourceIdFilter ?? null, ...r };
+    }
     const mode = (typeof job.data.mode === 'string' && ['links', 'timeline', 'all'].includes(job.data.mode))
       ? (job.data.mode as 'links' | 'timeline' | 'all')
       : 'all';
@@ -1738,8 +2378,10 @@ export async function registerBuiltinHandlers(
   // drain aborts it, so backstop.ts submits this job instead and the
   // long-lived worker does the LLM work here. Inline mode: errors throw,
   // so minion retry/backoff handles transient gateway failures and real
-  // failures stay visible in `gbrain jobs list --status failed`.
-  worker.register('facts-absorb', async (job) => {
+  // failures stay visible in `gbrain jobs list --status failed`. In the
+  // gateway-refresh set so the worker re-stamps model config (and re-folds
+  // file-plane keys) before every extraction job.
+  registerBuiltinJob(worker, engine, 'facts-absorb', async (job) => {
     const slug = typeof job.data.slug === 'string' ? job.data.slug : '';
     if (!slug) throw new Error('facts-absorb job requires data.slug');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : 'default';
@@ -1750,7 +2392,7 @@ export async function registerBuiltinHandlers(
     const source = (KNOWN_SOURCES as readonly string[]).includes(job.data.source as string)
       ? (job.data.source as typeof KNOWN_SOURCES[number])
       : 'mcp:put_page';
-    return await runFactsBackstop(
+    const result = await runFactsBackstop(
       {
         slug: page.slug,
         type: page.type,
@@ -1768,6 +2410,26 @@ export async function registerBuiltinHandlers(
         ...(typeof job.data.model === 'string' && job.data.model ? { model: job.data.model } : {}),
       },
     );
+    // Execution-time chat_unavailable in a KEYED worker is config drift —
+    // throw (typed) so minion retry/backoff parks it as a VISIBLE, re-runnable
+    // failure instead of consuming the job and silently losing the facts. A
+    // KEYLESS worker completes the job as a calm skip (its execution-time
+    // gate already printed the keyless note; a retry loop would turn every
+    // page write into failed-job noise). The retry conversion lives HERE, not
+    // in the shared pipeline — the same pipeline serves the extract_facts op,
+    // which must return its keyless envelope instead of throwing. The
+    // classification runs in the WORKER process: availability decisions
+    // belong to the process that executes (the submitting hook subprocess may
+    // have a deliberately neutered env).
+    if (factsAbsorbUnavailable(result)) {
+      const { classifyUnavailable } = await import('../core/facts/backstop.ts');
+      const jobModel = typeof job.data.model === 'string' && job.data.model ? job.data.model : undefined;
+      if (factsAbsorbShouldRetry(result, await classifyUnavailable(jobModel))) {
+        const { FactsExtractionError } = await import('../core/facts/extract.ts');
+        throw new FactsExtractionError('chat_unavailable', jobModel);
+      }
+    }
+    return result;
   });
 
   // Autopilot-cycle handler: delegates to runCycle. Shares the exact same
@@ -1872,12 +2534,32 @@ export async function registerBuiltinHandlers(
     const effectiveBrainDir: string | null = sourceId ? sourceLocalPath : repoPath;
 
     // Allow callers to select phases via job data (e.g. skip embed for
-    // fast cycles). Validates against ALL_PHASES to prevent injection.
-    const { ALL_PHASES } = await import('../core/cycle.ts');
+    // fast cycles). Validates against ALL_PHASES to prevent injection, then
+    // normalizes per-source payloads to the freshness set (queue payloads
+    // are machine-authored; see normalizeQueuedSourcePhases in cycle.ts).
+    const { ALL_PHASES, normalizeQueuedSourcePhases } = await import('../core/cycle.ts');
     const validPhases = new Set(ALL_PHASES);
     const requestedPhases = Array.isArray(job.data.phases)
       ? (job.data.phases as string[]).filter(p => validPhases.has(p as any))
       : undefined;
+    const { phases: effectivePhases, rejected: phasesRejectedByNormalization } =
+      normalizeQueuedSourcePhases(requestedPhases as any, sourceId);
+    // An explicitly-empty phase list (arrived empty, or emptied by the
+    // normalization) is a no-op — NOT an implicit run. The reason string is
+    // honest about WHICH of the two happened.
+    if (effectivePhases !== undefined && effectivePhases.length === 0) {
+      return {
+        partial: false,
+        status: 'skipped',
+        report: {
+          reason: phasesRejectedByNormalization.length > 0
+            ? 'all_phases_rejected_by_normalization'
+            : 'empty_phase_list',
+          ...(sourceId ? { source_id: sourceId } : {}),
+          phases_rejected_by_normalization: phasesRejectedByNormalization,
+        },
+      };
+    }
 
     const pull = resolveJobPull(job.data);
 
@@ -1902,7 +2584,7 @@ export async function registerBuiltinHandlers(
       signal: job.signal, // propagate abort so cycle bails on timeout/cancel
       deadlineAtMs: job.deadlineAtMs, // #2781: phases budget sub-work from remaining time
       ...(sourceId ? { sourceId } : {}),
-      ...(requestedPhases && requestedPhases.length > 0 ? { phases: requestedPhases as any } : {}),
+      ...(effectivePhases !== undefined ? { phases: effectivePhases as any } : {}),
       yieldBetweenPhases: async () => {
         // Yield to the event loop so worker lock-renewal can fire.
         await new Promise<void>(r => setImmediate(r));
@@ -1913,26 +2595,34 @@ export async function registerBuiltinHandlers(
       partial: report.status === 'partial' || report.status === 'failed',
       status: report.status,
       report,
+      // Surfaced so operators can see the queue-boundary normalization at
+      // work in job results (runCycle never sees rejected phases, so its
+      // excludedPhases skip-reporting cannot cover them).
+      ...(phasesRejectedByNormalization.length > 0
+        ? { phases_rejected_by_normalization: phasesRejectedByNormalization }
+        : {}),
     };
   });
 
-  // #2194 fix #3 / #2227 bug #3 — brain-wide maintenance. Runs the `global`
-  // cycle phases (embed, orphans, purge, resolve_symbol_edges, grade_takes,
-  // calibration_profile, synthesize_concepts, skillopt) ONCE per window instead
-  // of N times concurrently across per-source cycles (the 4→10GB RSS blowout).
+  // Brain-wide maintenance. Runs mixed + global phases ONCE per window instead
+  // of repeating cross-source transcript/reflection reads in every source.
   // No source_id → uses the legacy global cycle lock; stamps autopilot.last_global_at
   // on success so the dispatch gate backs off.
   worker.register('autopilot-global-maintenance', async (job) => {
-    const { runCycle, GLOBAL_PHASES, LAST_GLOBAL_AT_KEY, ALL_PHASES } = await import('../core/cycle.ts');
+    const { runCycle, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } = await import('../core/cycle.ts');
     const repoPath: string | null = typeof job.data.repoPath === 'string'
       ? job.data.repoPath
       : (await engine.getConfig('sync.repo_path')) ?? null;
 
-    const validPhases = new Set(ALL_PHASES);
+    // #4250: queued maintenance payloads are machine-authored too — intersect
+    // with MAINTENANCE_PHASES so a stale (or remote-submitted) payload can't
+    // run source-scoped phases through the global lane, symmetric with the
+    // per-source normalization in the autopilot-cycle handler.
+    const maintenanceSet = new Set<string>(MAINTENANCE_PHASES);
     const requested = Array.isArray(job.data.phases)
-      ? (job.data.phases as string[]).filter((p) => validPhases.has(p as never))
-      : GLOBAL_PHASES;
-    const phases = (requested.length > 0 ? requested : GLOBAL_PHASES) as typeof GLOBAL_PHASES;
+      ? (job.data.phases as string[]).filter((p) => maintenanceSet.has(p))
+      : MAINTENANCE_PHASES;
+    const phases = (requested.length > 0 ? requested : MAINTENANCE_PHASES) as typeof MAINTENANCE_PHASES;
 
     const report = await runCycle(engine, {
       brainDir: repoPath,
@@ -2057,14 +2747,17 @@ export async function registerBuiltinHandlers(
       const result = await engine.purgeDeletedPages(olderThanHours);
       pagesPurged = result.count;
     }
+    let sourcesBlocked: Array<{ id: string; reason: string }> = [];
     if (scope === 'sources' || scope === 'all') {
       const { purgeExpiredSources } = await import('../core/destructive-guard.ts');
-      sourcesPurged = await purgeExpiredSources(engine);
+      const purgeResult = await purgeExpiredSources(engine);
+      sourcesPurged = purgeResult.purged;
+      sourcesBlocked = purgeResult.blocked;
     }
     // GC stale op_checkpoints rows (folded scope item +C from review).
     const { purgeStaleCheckpoints } = await import('../core/op-checkpoint.ts');
     const checkpointsPurged = await purgeStaleCheckpoints(engine, 7);
-    return { pagesPurged, sourcesPurged, checkpointsPurged, dryRun };
+    return { pagesPurged, sourcesPurged, sourcesBlocked, checkpointsPurged, dryRun };
   });
 
   // Phase-wrapper handlers — each delegates to runCycle({ phases: [name] }).
@@ -2203,6 +2896,7 @@ export async function registerBuiltinHandlers(
       sourceId?: string;
       batchSize?: number;
       priority?: 'recent';
+      includeNullSignature?: boolean;
     };
     return await runEmbedCore(engine, {
       stale: true,
@@ -2210,6 +2904,9 @@ export async function registerBuiltinHandlers(
       batchSize: data.batchSize,
       priority: data.priority,
       sourceId: data.sourceId,
+      // D7/D12: submitters that detected a NULL-signature cohort thread the
+      // widening through; absent = grandfather clause stays (unchanged).
+      includeNullSignature: !!data.includeNullSignature,
     });
   });
 

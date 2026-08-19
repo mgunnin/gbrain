@@ -20,7 +20,12 @@ schema. The user gets new capabilities automatically.
 
 gbrain stays current the way gstack does: it rides invocation frequency. A
 throttled, cache-read-only check runs at the start of every `gbrain` invocation
-(CLI and MCP) and emits an `UPGRADE_AVAILABLE <old> <new>` marker on stderr. No
+(CLI and MCP) and emits an `UPGRADE_AVAILABLE <old> <new>` marker on stderr. The
+raw marker line is suppressed when stderr is an interactive TTY (a human sees
+only the plain `gbrain X -> Y available` sentence, not the machine token); set
+`GBRAIN_FORCE_UPGRADE_MARKER=1` if an agent harness parses the token but runs
+under a PTY. `<old>` is always the RUNNING binary's version, so a stale or
+foreign-written cache never nags about an upgrade this binary already has. No
 host cron required — every agent kind (Claude Code, Codex, OpenClaw, Hermes, the
 `gbrain serve` host behind a Perplexity thin client) converges to current by
 construction. The behavior is governed by one file-plane config key,

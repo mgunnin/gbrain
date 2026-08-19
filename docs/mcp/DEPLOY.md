@@ -4,9 +4,11 @@
 > PKCE, refresh rotation, optional DCR), an embedded React admin dashboard at
 > `/admin`, scoped operations, and a live SSE activity feed. Legacy bearer
 > tokens still work — `verifyAccessToken` falls back to the `access_tokens`
-> table and grandfathers tokens to `read+write+admin`. Both the legacy fallback
-> and the OAuth tables work on PGLite and Postgres (both engine schemas carry
-> `access_tokens`). See [SECURITY.md](../../SECURITY.md) for env vars and
+> table; tokens with no `scopes` grant are grandfathered to `read+write+admin`,
+> while tokens minted with `gbrain auth create --scopes …` (or by
+> `gbrain bootstrap harness`) are honored at exactly their granted scopes.
+> Both the legacy fallback and the OAuth tables work on PGLite and Postgres
+> (both engine schemas carry `access_tokens`). See [SECURITY.md](../../SECURITY.md) for env vars and
 > tunable defaults.
 
 Access your brain from any device, any AI client. GBrain ships two transports:
@@ -19,14 +21,15 @@ clients over OAuth 2.1.
 
 ```bash
 gbrain serve                  # full operation catalog (default)
-gbrain serve --surface verbs  # just the 5 memory verbs (quickstart surface)
+gbrain serve --surface verbs  # just the 7 memory verbs (quickstart surface)
 ```
 
 Works with Claude Code, Cursor, Windsurf, and any MCP client that supports stdio.
 No server, no tunnel, no token needed. Works on both PGLite and Postgres engines.
-`--surface verbs` exposes exactly the five-verb memory protocol (`recall`,
-`remember`, `entity`, `synthesize`, `forget` —
+`--surface verbs` exposes exactly the seven-verb memory protocol (`recall`,
+`remember`, `entity`, `synthesize`, `forget`, `context_pack`, `delta` —
 [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) instead of the full catalog;
+`--surface starter` sits between (~27 ops: the verbs plus the daily-driver set);
 omit the flag (default `full`) for every operation.
 
 ### Remote over OAuth 2.1 (recommended)
@@ -67,8 +70,9 @@ This requires:
 2. A public tunnel (ngrok, Tailscale, or cloud host)
 3. A bearer token created via `gbrain auth create <name>`
 
-Existing bearer tokens are grandfathered as `read+write+admin` scopes on the
-OAuth-capable HTTP server, so no migration is required.
+Existing bearer tokens (no `scopes` grant) are grandfathered as
+`read+write+admin` on the OAuth-capable HTTP server, so no migration is
+required; `gbrain auth create --scopes read,write` mints narrowed tokens.
 
 ## OAuth 2.1 Setup
 
@@ -163,6 +167,22 @@ await oauthProvider.registerClientManual(
 For self-service client registration (Dynamic Client Registration, RFC 7591),
 start the server with `--enable-dcr`. DCR is off by default.
 
+DCR requests may include an optional `token_ttl_seconds` field (integer,
+seconds) to request a per-client access-token lifetime. The server clamps the
+request into an admin-configured window — never rejects over it — persists the
+effective value as the client's TTL override, and echoes it back as
+`token_ttl_seconds` in the registration response. Subsequent `/token` responses
+for that client carry the matching `expires_in`. Clients that omit the field
+keep the server default (`--token-ttl`). The window defaults fail-closed: min
+300 seconds, max bounded by your `--token-ttl` — a self-registering client
+cannot request a longer-lived token than the server default unless you
+explicitly widen the window:
+
+```bash
+gbrain config set oauth.dcr_ttl_min_seconds 600
+gbrain config set oauth.dcr_ttl_max_seconds 86400
+```
+
 ### 3. Expose the server
 
 **Bind explicitly.** `gbrain serve --http` defaults to `127.0.0.1`.
@@ -206,7 +226,8 @@ Write ops can additionally be fenced per client with `--bound-slug-prefixes`
 ## Legacy Bearer Token Setup
 
 Bearer tokens are the simple path when you don't need per-client scoping.
-They grandfather to `read+write+admin` scopes on the HTTP server.
+Without a `--scopes` grant they grandfather to `read+write+admin` on the
+HTTP server; pass `--scopes read,write` at creation to narrow one.
 
 ### 1. Set up the tunnel
 
@@ -232,8 +253,11 @@ gbrain auth list
 gbrain auth revoke "claude-desktop"
 ```
 
-Tokens are per-client. Create one for each device/app. Revoke individually
-if compromised. Tokens are stored SHA-256 hashed in your database.
+Tokens are per-client. Create one for each device/app. Names are not
+unique: `gbrain auth revoke "<name>"` revokes EVERY active token carrying
+that name — use `gbrain auth list` (shows each token's id and scopes) and
+`gbrain auth revoke --id <uuid>` to revoke exactly one. Tokens are stored
+SHA-256 hashed in your database.
 
 ### 3. Connect your AI client
 

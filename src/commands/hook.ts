@@ -53,8 +53,11 @@ import {
   IPC_UNAVAILABLE,
   readIpcSecret,
   requestTurnContext,
+  requestContextPack,
   resolveSocketPath,
+  CONTEXT_PACK_CLIENT_TIMEOUT_MS,
   type TurnContextResponse,
+  type ContextPackResponse,
 } from '../core/context/resolve-ipc.ts';
 import type { WindowTurn } from '../core/context/entity-salience.ts';
 import {
@@ -62,8 +65,30 @@ import {
   parseTranscript,
   toCorpusText,
 } from '../core/transcripts/claude-code-jsonl.ts';
+import {
+  bankCompactSegment,
+  decideCorpusMode,
+  gcCorpusArtifacts,
+  HARVEST_RECEIPT_SUFFIX,
+} from '../core/context/corpus-segments.ts';
+import {
+  heartbeatPath,
+  hookStatusPath,
+  readHeartbeatTail,
+  writeHeartbeat as writeHeartbeatShared,
+  type HookHeartbeatEntry,
+} from '../core/context/hook-heartbeat.ts';
 import { CLAUDE_HOOK_OUTPUT_CAP_CHARS } from '../core/bootstrap/host-specs.ts';
 import { readManifest, readReceipt, type InstallReceipt } from '../core/bootstrap/format.ts';
+import { githubOwnerRepoString } from '../core/repo-visibility.ts';
+import { detectExecutionEnvironment } from '../core/execution-env.ts';
+import {
+  readPushStatuses,
+  readPushStatusForRoot,
+  sanitizePushReason,
+  summarizePushStatuses,
+  workspaceRootHash,
+} from '../core/workspace-push.ts';
 import { realpathOrResolve } from '../core/path-confine.ts';
 
 // ── Tunables ────────────────────────────────────────────────────────────────
@@ -91,8 +116,6 @@ export const CORPUS_RETENTION_DAYS_DEFAULT = 30;
  */
 export const CORPUS_INGESTED_SUFFIX = '.ingested';
 export const CORPUS_CLAIM_SUFFIX = '.in-progress';
-/** Heartbeat file line cap [S3#7]. */
-export const HEARTBEAT_MAX_LINES = 5000;
 /** Trailing-window size for the B3 failure-rate notice. */
 export const HEARTBEAT_FAILURE_WINDOW = 20;
 /**
@@ -109,6 +132,17 @@ const USER_PROMPT_WINDOW_TURNS = 4;
 export const PRIOR_CONTEXT_MAX_BYTES = 32 * 1024;
 /** user-prompt transcript parse budget (tail bytes — the window only needs the newest turns). */
 const USER_PROMPT_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024;
+/** stop-hook push [D3]: hard budget for the debounce decision + detached spawn
+ * (the spawn itself is instant; the budget bounds the two 1s git probes). */
+const STOP_PUSH_DEADLINE_MS = 3000;
+/** stop-hook push debounce default (minutes) for local + ephemeral-container
+ * environments; cloud-sandbox defaults to 0 (every turn) — a reclaimed VM's
+ * tail loss is permanent, everywhere else SessionStart recovery covers it [D17]. */
+export const STOP_PUSH_DEBOUNCE_MIN_DEFAULT = 5;
+/** failure banner [D19]: re-announce floor while the same failure persists. */
+export const PUSH_ANNOUNCE_REFIRE_MS = 30 * 60 * 1000;
+/** failure banner budget (well under ENG-1's whole-payload cap). */
+const PUSH_BANNER_MAX_CHARS = 300;
 
 // ── Test seam ───────────────────────────────────────────────────────────────
 
@@ -135,12 +169,35 @@ export interface HookIo {
   spawnPush?: (root: string) => void;
   /** TEST SEAM: user-prompt deadline override (wall-clock flake control). */
   userPromptDeadlineMs?: number;
+  /** TEST SEAM: compact deadline override (drives the per-step degrade paths). */
+  compactDeadlineMs?: number;
   /**
-   * Feedback-loop attribution channel (`--harness <claude-code|codex>`).
-   * Default 'claude-code' — the only harness bootstrap registers hooks for
-   * today; a codex hook registration passes the flag explicitly.
+   * TEST SEAM (v0.46.15, BrainBench production seam): config override for
+   * hookUserPrompt — `undefined` = load the real file-plane config;
+   * `null`/object = use as-is. Lets the bench point the hook at a throwaway
+   * brain WITHOUT mutating process-global GBRAIN_HOME (parallel-test safe).
    */
-  harness?: 'claude-code' | 'codex';
+  configOverride?: GBrainConfig | null;
+  /**
+   * TEST SEAM (v0.46.15): suppress the pending-push failure banner. The
+   * banner reads the OPERATOR's real push-status files — on a bench run
+   * that's environmental contamination (a locally-failing push would inject
+   * a banner on stay-silent turns and read as a false fire).
+   */
+  disablePushBanner?: boolean;
+  /**
+   * TEST SEAM (v0.46.15, codex ship-review): suppress hook telemetry WRITES
+   * (heartbeat JSONL). Telemetry paths resolve from GBRAIN_HOME/homedir —
+   * NOT from configOverride — so a hermetic bench replay would otherwise
+   * append every fixture turn to the operator's real hook-health history.
+   */
+  disableTelemetry?: boolean;
+  /**
+   * Feedback-loop attribution channel (`--harness <claude-code|codex|opencode>`).
+   * Default 'claude-code' — the only harness bootstrap registers hooks for
+   * today; a codex/opencode hook registration passes the flag explicitly.
+   */
+  harness?: 'claude-code' | 'codex' | 'opencode';
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -152,11 +209,14 @@ Events (wired into .claude/settings.local.json by gbrain bootstrap):
                   push status, hook health) to stdout
   user-prompt     read hook JSON on stdin, request per-turn context from a
                   running 'gbrain serve' over IPC, print additionalContext JSON
-                  (--harness <claude-code|codex> sets the feedback-loop channel;
-                  default claude-code, unknown values fall back to the default)
+                  (--harness <claude-code|codex|opencode> sets the feedback-loop
+                  channel; default claude-code, unknown values fall back to the default)
   stop            append to the per-session live buffer
   session-end     ingest the session transcript into the dream corpus
                   (secret-scanned), prune old corpus files, push the workspace
+  compact         (PreCompact) bank the window's standing entities into the
+                  session cursor so the post-compaction session-start serves
+                  a warm context pack; emits nothing
 
 Env: GBRAIN_HOOKS=0 disables all events (immediate exit 0).
 All events fail open: errors exit 0 with empty stdout and a heartbeat entry at
@@ -169,21 +229,66 @@ export async function runHook(args: string[], io: HookIo = {}): Promise<number> 
     write(io, USAGE + '\n');
     return 0;
   }
-  // `--harness <claude-code|codex>` — feedback-loop channel attribution for
-  // user-prompt. Unknown values fall back to the default (fail-open: a bad
-  // registration must never break the hook contract).
+  // `--harness <claude-code|codex|opencode>` — feedback-loop channel
+  // attribution for user-prompt. Unknown values fall back to the default
+  // (fail-open: a bad registration must never break the hook contract).
   const harnessIdx = args.indexOf('--harness');
   if (harnessIdx >= 0 && !io.harness) {
     const v = args[harnessIdx + 1];
-    if (v === 'claude-code' || v === 'codex') io = { ...io, harness: v };
+    if (v === 'claude-code' || v === 'codex' || v === 'opencode') io = { ...io, harness: v };
   }
-  if (!event || !['session-start', 'user-prompt', 'stop', 'session-end'].includes(event)) {
+  if (!event || !['session-start', 'user-prompt', 'stop', 'session-end', 'compact'].includes(event)) {
     process.stderr.write(USAGE + '\n');
     return 1;
   }
   // Kill switch — before any file/socket touch, no heartbeat (the user asked
   // for silence, and a disabled hook writing telemetry would be a lie).
   if (process.env.GBRAIN_HOOKS === '0') return 0;
+
+  // #4043 harness-lane defer guard: Claude Code MERGES user- and
+  // project-scope hook settings, so a machine wired by `bootstrap harness`
+  // (user scope) plus a real workspace bootstrap install (settings.local.json,
+  // bootstrap-v1 marker) would fire the same event twice. The workspace
+  // install wins; the harness lane yields silently (exit 0, no output, no
+  // heartbeat). Same cwd resolution as the handlers (io.cwd is the test
+  // seam; the harness runs hooks in the session's working dir). Fail-open:
+  // any read hiccup means run normally.
+  if (process.env.GBRAIN_HOOK_LANE === 'harness') {
+    try {
+      // BOTH workspace carriers count: settings.local.json (local installs)
+      // and the committed .claude/settings.json ([D12] — an event owned by
+      // the committed carrier is stripped from local, so checking only local
+      // would double-fire it against the user-scope harness wiring). The
+      // check PARSES the settings and requires a live bootstrap-v1 hook entry
+      // wiring THIS event — a raw substring match would let any repo disable
+      // the machine-wide capture lane by committing the two marker strings in
+      // an unrelated field (ship-review P1), and would over-yield events the
+      // workspace does not actually wire.
+      const eventKey = {
+        'session-start': 'SessionStart',
+        'user-prompt': 'UserPromptSubmit',
+        stop: 'Stop',
+        'session-end': 'SessionEnd',
+        compact: 'PreCompact',
+      }[event];
+      const dotClaude = join(io.cwd ?? process.cwd(), '.claude');
+      for (const file of ['settings.local.json', 'settings.json']) {
+        const p = join(dotClaude, file);
+        if (!existsSync(p)) continue;
+        const settings = JSON.parse(readFileSync(p, 'utf8')) as {
+          hooks?: Record<string, Array<{ hooks?: Array<Record<string, unknown>> }>>;
+        };
+        const groups = settings.hooks?.[eventKey ?? ''];
+        if (!Array.isArray(groups)) continue;
+        for (const g of groups) {
+          if (!Array.isArray(g?.hooks)) continue;
+          if (g.hooks.some((e) => e?._gbrain === 'bootstrap-v1')) return 0;
+        }
+      }
+    } catch {
+      /* fail-open */
+    }
+  }
 
   switch (event) {
     case 'session-start':
@@ -194,6 +299,8 @@ export async function runHook(args: string[], io: HookIo = {}): Promise<number> 
       return hookStop(io);
     case 'session-end':
       return hookSessionEnd(io);
+    case 'compact':
+      return hookCompact(io);
     default:
       return 1; // unreachable
   }
@@ -308,105 +415,28 @@ function errorCode(e: unknown): string {
 }
 
 // ── Heartbeat [S3#7, B3] ────────────────────────────────────────────────────
+// Extracted to src/core/context/hook-heartbeat.ts (cathedral 5) so the
+// serve-side checkpoint harvest appends outcome events without importing this
+// command module. Re-exported here so every existing import site
+// (doctor/status/verify/tests) keeps working unchanged.
 
-export interface HookHeartbeatEntry {
-  ts: string;
-  event: string;
-  outcome: 'ok' | 'degraded' | 'error';
-  reason?: string;
-  duration_ms: number;
-  turns?: number;
-  bytes?: number;
-  /** Secret-scan redaction COUNT at the session-end corpus write (never content) [S3#2, S3#7]. */
-  redactions?: number;
-}
-
-/** The FULL key allowlist — CI greps the fixture against this [S3#7]. */
-export const HEARTBEAT_ALLOWED_KEYS = [
-  'ts', 'event', 'outcome', 'reason', 'duration_ms', 'turns', 'bytes', 'redactions',
-] as const;
-
-async function hooksTelemetryDir(): Promise<string> {
-  const home = await resolveHome();
-  ensureDir0700(join(home, 'integrations'));
-  return ensureDir0700(join(home, 'integrations', 'hooks'));
-}
-
-/** Heartbeat JSONL path (exported for doctor/status/tests). */
-export async function heartbeatPath(): Promise<string> {
-  return join(await hooksTelemetryDir(), 'heartbeat.jsonl');
-}
-
-/** Status file the session-end parser-drift check writes [G3]. */
-export async function hookStatusPath(): Promise<string> {
-  return join(await hooksTelemetryDir(), 'status.json');
-}
+export {
+  HEARTBEAT_ALLOWED_KEYS,
+  HEARTBEAT_MAX_LINES,
+} from '../core/context/hook-heartbeat.ts';
+export { heartbeatPath, hookStatusPath, readHeartbeatTail };
+export type { HookHeartbeatEntry };
 
 /**
- * Compaction trigger: only read the file back when its byte size could hold
- * more than ~2x HEARTBEAT_MAX_LINES entries. 40B is below any real entry's
- * size (the ISO ts alone is 24 chars), so this check can never UNDER-trigger.
+ * Hook-side heartbeat writer: delegates to the shared module (cathedral 5 —
+ * the serve harvest appends its own events there), honoring the BrainBench
+ * telemetry seam (v0.46.15): a hermetic bench replay drives the REAL hook
+ * in-process, and without this gate every fixture turn would append to the
+ * operator's real hook-health history and skew doctor/failure-notice reads.
  */
-const HEARTBEAT_COMPACT_CHECK_BYTES = 2 * HEARTBEAT_MAX_LINES * 40;
-
-/**
- * Append a heartbeat entry with a single O_APPEND write (no read-modify-write
- * per event — readers already tolerate torn lines). Compaction (tail-trim to
- * HEARTBEAT_MAX_LINES via tmp+rename) runs only when a cheap size/line-count
- * check says the file exceeds ~2x the cap. Fields are copied EXPLICITLY — the
- * schema allowlist is enforced by construction, not by trust. Never throws.
- */
-async function writeHeartbeat(entry: HookHeartbeatEntry): Promise<void> {
-  try {
-    const p = await heartbeatPath();
-    const line = JSON.stringify({
-      ts: entry.ts,
-      event: entry.event,
-      outcome: entry.outcome,
-      ...(entry.reason !== undefined ? { reason: entry.reason } : {}),
-      duration_ms: entry.duration_ms,
-      ...(entry.turns !== undefined ? { turns: entry.turns } : {}),
-      ...(entry.bytes !== undefined ? { bytes: entry.bytes } : {}),
-      ...(entry.redactions !== undefined ? { redactions: entry.redactions } : {}),
-    });
-    appendFileSync(p, line + '\n', { mode: 0o600 });
-    let size = 0;
-    try {
-      size = statSync(p).size;
-    } catch {
-      /* just appended — best effort */
-    }
-    if (size > HEARTBEAT_COMPACT_CHECK_BYTES) {
-      const lines = readFileSync(p, 'utf8').split('\n').filter((l) => l.trim().length > 0);
-      if (lines.length > 2 * HEARTBEAT_MAX_LINES) {
-        const tmp = `${p}.tmp-${process.pid}`;
-        writeFileSync(tmp, lines.slice(-HEARTBEAT_MAX_LINES).join('\n') + '\n', { mode: 0o600 });
-        renameSync(tmp, p);
-      }
-    }
-  } catch {
-    /* telemetry never breaks a hook */
-  }
-}
-
-/** Last `n` heartbeat entries (oldest → newest). Doctor/status read surface. */
-export async function readHeartbeatTail(n: number): Promise<HookHeartbeatEntry[]> {
-  try {
-    const p = await heartbeatPath();
-    const raw = readFileSync(p, 'utf8');
-    const lines = raw.split('\n').filter((l) => l.trim().length > 0);
-    const out: HookHeartbeatEntry[] = [];
-    for (const line of lines.slice(-Math.max(0, n))) {
-      try {
-        out.push(JSON.parse(line) as HookHeartbeatEntry);
-      } catch {
-        /* torn line — skip */
-      }
-    }
-    return out;
-  } catch {
-    return [];
-  }
+async function writeHeartbeat(io: HookIo, entry: HookHeartbeatEntry): Promise<void> {
+  if (io.disableTelemetry) return;
+  await writeHeartbeatShared(entry);
 }
 
 // ── session-start [A3, G4, B3, B4] ──────────────────────────────────────────
@@ -452,6 +482,42 @@ async function hookSessionStart(io: HookIo): Promise<number> {
           reason = reasonCode(dirty.reason);
         }
       }
+
+      // 6. v0.45.7 ambient recall — boundary context pack over IPC. SessionStart
+      //    is Claude Code's cold-start AND post-compaction re-entry point
+      //    (source=compact/resume), so this one arm covers both. The server
+      //    owns the intelligence (banked entities + since-cursor + advance);
+      //    world-only always. Every failure is a silent skip — the file-only
+      //    digest above must never be hostage to the brain being down.
+      try {
+        const cfg = loadConfig();
+        if (cfg?.engine === 'pglite' && cfg.database_path) {
+          const secret = readIpcSecret(cfg.database_path);
+          if (secret) {
+            // Same sanitizer as the compact banking path — a raw vs sanitized
+            // id would split the cursor key and the warm pack would miss the
+            // banked entities (adversarial review).
+            const sessionId = sanitizeSessionId(j?.session_id);
+            const trigger = typeof j?.source === 'string' ? `session-start:${j.source as string}` : 'session-start';
+            // Clamp the IPC timeout to the REMAINING hook deadline (minus a
+            // 100ms write margin) so the pack call can never be the thing
+            // that blows SESSION_START_DEADLINE_MS.
+            const remaining = SESSION_START_DEADLINE_MS - (Date.now() - t0) - 100;
+            if (remaining > 100) {
+              const res = await requestContextPack(resolveSocketPath(cfg.database_path), {
+                secret,
+                ...(sessionId ? { sessionId } : {}),
+                ...(process.env.GBRAIN_SOURCE ? { sourceId: process.env.GBRAIN_SOURCE } : {}),
+                trigger,
+              }, { timeoutMs: Math.min(CONTEXT_PACK_CLIENT_TIMEOUT_MS, remaining) });
+              if (res !== IPC_UNAVAILABLE && !('degraded' in res)) {
+                const pack = res as ContextPackResponse;
+                if (pack.ok && pack.block?.text) out.push(pack.block.text);
+              }
+            }
+          }
+        }
+      } catch { /* fail-open: no pack, digest stands alone */ }
     })();
 
     const res = await withDeadline(SESSION_START_DEADLINE_MS, work);
@@ -467,7 +533,7 @@ async function hookSessionStart(io: HookIo): Promise<number> {
     outcome = 'error';
     reason = errorCode(e); // fail-open: empty stdout, exit 0
   }
-  await writeHeartbeat({
+  await writeHeartbeat(io, {
     ts: new Date().toISOString(),
     event: 'session-start',
     outcome,
@@ -547,16 +613,19 @@ async function lastSessionLine(): Promise<string | null> {
 
 async function pushStatusNote(): Promise<string | null> {
   try {
-    const home = await resolveHome();
-    const p = join(home, 'bootstrap', 'push-status.json');
-    if (!existsSync(p)) return null;
-    const s = JSON.parse(readFileSync(p, 'utf8')) as { ts?: string; ok?: boolean; reason?: string };
-    if (s.ok === false) {
-      return `Workspace push is FAILING (since ${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown reason'} — run gbrain doctor`;
+    // One reader + one aggregation for every status surface [D8]; per-root
+    // files [D13] so one workspace's success can't mask another's failure.
+    const entries = readPushStatuses();
+    if (entries.length === 0) return null;
+    const { failing, stalestTs } = summarizePushStatuses(entries);
+    if (failing.length > 0) {
+      const e = failing[0]!;
+      const which = e.repoRoot ? ` for ${e.repoRoot}` : '';
+      const rest = failing.length > 1 ? ` [+${failing.length - 1} more workspace(s)]` : '';
+      return `Workspace push${which} is FAILING (since ${e.ts ?? 'unknown'}): ${sanitizePushReason(e.reason)}${rest} — run gbrain doctor`;
     }
-    const t = s.ts ? Date.parse(s.ts) : NaN;
-    if (Number.isFinite(t) && Date.now() - t > PUSH_STALE_MS) {
-      return `Workspace push: last success ${s.ts} (>48h ago) — recent work may be unpushed [B4]`;
+    if (stalestTs !== null && Date.now() - stalestTs > PUSH_STALE_MS) {
+      return `Workspace push: last success ${new Date(stalestTs).toISOString()} (>48h ago) — recent work may be unpushed [B4]`;
     }
     return null;
   } catch {
@@ -633,13 +702,10 @@ async function resolveBootstrapWorkspaceRoot(ws: string): Promise<string | null>
   return root;
 }
 
-/** owner/name from a github https/ssh remote URL, or null. Local mirror of
- * repo.ts's parser (kept here so the engine-free hook doesn't import repo.ts). */
+/** owner/name from a github https/ssh remote URL, or null. Canonical parser
+ * (repo-visibility.ts is engine-free, so the hook contract holds). */
 function githubOwnerName(url: string): string | null {
-  const m =
-    /^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url.trim()) ??
-    /^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/.exec(url.trim());
-  return m ? `${m[1]}/${m[2]}` : null;
+  return githubOwnerRepoString(url);
 }
 
 /**
@@ -662,14 +728,22 @@ async function repoPhaseComplete(root: string): Promise<boolean> {
     if (!receipt || typeof receipt.repo_url !== 'string' || receipt.repo_url.length === 0) return false;
     if (realpathOrResolve(receipt.workspace_dir) !== realpathOrResolve(root)) return false;
     const want = githubOwnerName(receipt.repo_url);
-    if (!want) return false;
     const fetchUrl = await tryExecAsync('git', ['-C', root, 'remote', 'get-url', 'origin']);
-    if (githubOwnerName(fetchUrl ?? '') !== want) return false;
     // Push URL (remote.origin.pushurl) via the config key directly (no dash-flag):
     // unset → `git push` uses the fetch URL (already matched). Only a configured
     // push URL that points elsewhere blocks the push.
     const pushUrl = await tryExecAsync('git', ['-C', root, 'config', 'remote.origin.pushurl']);
-    return !pushUrl || githubOwnerName(pushUrl) === want;
+    if (want) {
+      if (githubOwnerName(fetchUrl ?? '') !== want) return false;
+      return !pushUrl || githubOwnerName(pushUrl) === want;
+    }
+    // Non-github repo_url (self-hosted / explicitly-trusted transports): bind
+    // by EXACT URL equality — the recorded url is what the repo phase (or the
+    // operator) verified, and a later remote redirect must still block the
+    // push. Without this branch, every non-github install's no-daemon push
+    // deferred forever (post-#4024 regression).
+    if ((fetchUrl ?? '').trim() !== receipt.repo_url) return false;
+    return !pushUrl || pushUrl.trim() === receipt.repo_url;
   } catch {
     return false;
   }
@@ -705,13 +779,7 @@ async function dirtyTreePush(
   try {
     const root = await resolveBootstrapWorkspaceRoot(ws);
     if (!root) return null;
-    const [status, aheadRaw] = await Promise.all([
-      tryExecAsync('git', ['-C', root, 'status', '--porcelain']),
-      tryExecAsync('git', ['-C', root, 'rev-list', '--count', '@{u}..HEAD']),
-    ]);
-    const dirty = (status ?? '') !== '';
-    const ahead = aheadRaw !== null ? parseInt(aheadRaw, 10) || 0 : 0;
-    if (!dirty && ahead === 0) return null; // clean + up to date → nothing to recover
+    if (!(await treeNeedsPush(root))) return null; // clean + up to date → nothing to recover
     // There IS unpushed work. Defer until the repo phase verified privacy +
     // recorded repo_url — never recover-push to an unverified origin
     // (create-repo-first race). Only fires when work actually exists (P2-1).
@@ -739,6 +807,181 @@ async function dirtyTreePush(
   }
 }
 
+/** True when the workspace has uncommitted changes or commits ahead of
+ * upstream — shared by the SessionStart recovery push and the stop-hook
+ * per-turn push. Two 1s-capped git probes; never throws. */
+async function treeNeedsPush(root: string): Promise<boolean> {
+  // Dirty tree → always needs a push. For "ahead", measure against the SAME
+  // ref workspacePush targets (origin/<default-branch>), NOT @{u}: a branch
+  // with no upstream makes `@{u}..HEAD` error → 0, which would report a clean
+  // + committed-but-unpushed tree as push_clean and silently strand it (the
+  // exact tail-loss the per-turn push exists to prevent). When the origin ref
+  // doesn't resolve yet (never pushed), any commit past the empty tree counts
+  // as needs-push.
+  const status = await tryExecAsync('git', ['-C', root, 'status', '--porcelain']);
+  if ((status ?? '') !== '') return true;
+  const branch = await tryExecAsync('git', ['-C', root, 'branch', '--show-current']);
+  const b = (branch ?? '').trim();
+  if (b) {
+    const ahead = await tryExecAsync('git', ['-C', root, 'rev-list', '--count', `origin/${b}..HEAD`]);
+    if (ahead !== null) return (parseInt(ahead, 10) || 0) > 0;
+    // origin/<b> doesn't exist (never pushed) → any local commit needs pushing.
+    const have = await tryExecAsync('git', ['-C', root, 'rev-list', '--count', 'HEAD']);
+    return (parseInt(have ?? '0', 10) || 0) > 0;
+  }
+  // Detached HEAD / no branch name — fall back to the upstream measure.
+  const ahead = await tryExecAsync('git', ['-C', root, 'rev-list', '--count', '@{u}..HEAD']);
+  return ahead !== null && (parseInt(ahead, 10) || 0) > 0;
+}
+
+// ── stop-hook per-turn push [D3/D17/D20] ────────────────────────────────────
+//
+// SessionEnd never fires on /exit (upstream: closed not-planned), can't fire
+// on crash, and a cloud sandbox VM may simply be reclaimed between turns —
+// so the Stop boundary (fires after EVERY assistant turn) is the only cadence
+// that always runs while work exists. Debounced per workspace root, detached
+// spawn (instant), fail-open everywhere.
+
+function stopPushStatePath(root: string): string {
+  return join(resolveGbrainHome(), 'bootstrap', `stop-push-${workspaceRootHash(root)}.json`);
+}
+
+/** Debounce resolution: env GBRAIN_STOP_PUSH_DEBOUNCE_MIN (minutes; 0 = every
+ * turn) → file-plane config hooks.stop_push_debounce_min → environment-kind
+ * default (cloud-sandbox: 0, everything else: 5). */
+function stopPushDebounceMs(): number {
+  const env = process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN;
+  if (env !== undefined) {
+    const n = Number.parseInt(env, 10);
+    if (Number.isFinite(n) && n >= 0) return n * 60_000;
+  }
+  try {
+    const cfg = loadConfig();
+    const v = cfg?.hooks?.stop_push_debounce_min;
+    const n = typeof v === 'number' ? v : typeof v === 'string' ? Number.parseInt(v, 10) : NaN;
+    if (Number.isFinite(n) && n >= 0) return n * 60_000;
+  } catch {
+    /* tolerant read — fall through to the default */
+  }
+  return detectExecutionEnvironment() === 'cloud-sandbox' ? 0 : STOP_PUSH_DEBOUNCE_MIN_DEFAULT * 60_000;
+}
+
+/** Floor for the [D20] failing-status retry cadence: a stuck push (e.g. gh
+ * unauthenticated for a day) must not re-run the full network ladder on every
+ * single turn — one retry a minute keeps recovery fast without the storm. */
+export const STOP_PUSH_FAILING_RETRY_FLOOR_MS = 60_000;
+
+/** Decide + (maybe) spawn the per-turn push. Returns the heartbeat reason.
+ * Ordered cheapest-first: the debounce (two file reads) answers the common
+ * case before any git subprocess runs — repoPhaseComplete's git probes only
+ * execute on turns that might actually spawn a push. */
+async function stopPushIfDue(ws: string, io: HookIo): Promise<string> {
+  if (process.env.GBRAIN_STOP_PUSH === '0') return 'push_disabled';
+  const root = await resolveBootstrapWorkspaceRoot(ws);
+  if (!root) return 'push_skipped_not_bootstrap';
+
+  const stateP = stopPushStatePath(root);
+  let lastTs: number | null = null;
+  try {
+    const s = JSON.parse(readFileSync(stateP, 'utf8')) as { ts?: string };
+    const t = Date.parse(s.ts ?? '');
+    if (Number.isFinite(t)) lastTs = t;
+  } catch {
+    /* missing/corrupt state → due (fail-open) */
+  }
+  // [D20] a failing push bypasses the normal debounce so recovery is fast —
+  // but with a 60s floor so a persistently failing push can't re-run the
+  // network verification ladder on every turn (the push lock bounds
+  // concurrency, not cadence; the banner is already showing the failure).
+  const failing = readPushStatusForRoot(root)?.ok === false;
+  const now = Date.now();
+  // Healthy: the normal debounce (0 = every turn in cloud). Failing: a fixed
+  // 60s retry floor — faster than a long local debounce so a transient failure
+  // recovers within a turn or two, but NEVER every-turn (a Math.min against the
+  // cloud debounce of 0 was a re-run-the-ladder-every-turn storm; adversarial
+  // review caught it).
+  const windowMs = failing ? STOP_PUSH_FAILING_RETRY_FLOOR_MS : stopPushDebounceMs();
+  if (lastTs !== null && now - lastTs < windowMs) return 'push_debounced';
+  // Same privacy gate as SessionEnd: never push before the repo phase has
+  // verified the origin and recorded repo_url (create-repo-first race).
+  if (!(await repoPhaseComplete(root))) return 'push_deferred_repo_pending';
+  if (!(await treeNeedsPush(root))) return 'push_clean';
+  try {
+    // Written BEFORE the spawn so repeated fail-fast children stay debounced
+    // on the healthy path; the [D20] failing-status bypass handles retries.
+    mkdirSync(join(resolveGbrainHome(), 'bootstrap'), { recursive: true, mode: 0o700 });
+    const tmp = `${stateP}.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify({ ts: new Date(now).toISOString(), root }) + '\n', { mode: 0o600 });
+    renameSync(tmp, stateP);
+  } catch {
+    /* state-write failure must not block the push itself */
+  }
+  try {
+    (io.spawnPush ?? spawnDetachedPush)(root);
+    return 'push_spawned';
+  } catch {
+    return 'push_unavailable';
+  }
+}
+
+// ── push-failure banner [D5/D13/D19] ────────────────────────────────────────
+
+interface PushAnnounceState {
+  announced_ts?: string;
+  last_announce_at?: string;
+}
+
+/**
+ * The pending ≤300-char failure banner, or null. `record()` marks the due
+ * failures announced and is called ONLY after the banner actually reached
+ * stdout — a deadline-suppressed banner must re-fire next turn. Announce
+ * state is a sidecar next to each per-root status file (`<file>.announced`):
+ * each new failure `ts` announces once, then re-announces at most every
+ * PUSH_ANNOUNCE_REFIRE_MS while the failure persists [D19].
+ */
+function pendingPushFailureBanner(): { text: string; record: () => void } | null {
+  try {
+    const failing = readPushStatuses().filter((e) => e.ok === false);
+    if (failing.length === 0) return null;
+    const now = Date.now();
+    const due = failing.filter((e) => {
+      try {
+        const s = JSON.parse(readFileSync(`${e.file}.announced`, 'utf8')) as PushAnnounceState;
+        if (s.announced_ts !== e.ts) return true;
+        const last = Date.parse(s.last_announce_at ?? '');
+        return !Number.isFinite(last) || now - last > PUSH_ANNOUNCE_REFIRE_MS;
+      } catch {
+        return true; // never announced (or unreadable state) → due
+      }
+    });
+    if (due.length === 0) return null;
+    const first = due[0]!;
+    const which = first.repoRoot ?? 'the workspace';
+    const more = due.length > 1 ? ` (+${due.length - 1} more workspace(s))` : '';
+    const text = (
+      `NOTICE: the background workspace push for ${which} is FAILING ` +
+      `(${sanitizePushReason(first.reason)})${more} — work is committed locally ` +
+      'but NOT on GitHub. Run gbrain doctor.'
+    ).slice(0, PUSH_BANNER_MAX_CHARS);
+    const record = () => {
+      for (const e of due) {
+        try {
+          writeFileSync(
+            `${e.file}.announced`,
+            JSON.stringify({ announced_ts: e.ts, last_announce_at: new Date(now).toISOString() }) + '\n',
+            { mode: 0o600 },
+          );
+        } catch {
+          /* fail-open — worst case the banner re-fires */
+        }
+      }
+    };
+    return { text, record };
+  } catch {
+    return null;
+  }
+}
+
 // ── user-prompt [ENG-1, S3#8, A9] ───────────────────────────────────────────
 
 interface UserPromptOutcome {
@@ -754,7 +997,18 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     if (!expired) write(io, s);
   };
 
+  // [D5/D19] Same-session failure surfacing: a refused/failed background push
+  // becomes visible on the NEXT turn — to the model via additionalContext AND
+  // to the human via systemMessage ("never silent" must not depend on the
+  // model choosing to relay its own tooling's failure). Embedded in the main
+  // payload when one is written; emitted alone on every degraded path.
+  // Computed INSIDE the deadline-raced closure: its sync file reads must be
+  // budgeted by the 800ms deadline, not free-ride before the race starts.
+  let banner: ReturnType<typeof pendingPushFailureBanner> = null;
+  let wrotePayload = false;
+
   const work = (async (): Promise<UserPromptOutcome> => {
+    banner = io.disablePushBanner ? null : pendingPushFailureBanner();
     const j = await readStdinJson(io, 300);
     if (!j) return { outcome: 'degraded', reason: 'no_stdin' };
 
@@ -806,7 +1060,7 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     if (prompt.trim()) turns = [...turns, { role: 'user', text: prompt }];
     if (turns.length === 0) return { outcome: 'ok', reason: 'empty_window' };
 
-    const cfg = loadConfig();
+    const cfg = io.configOverride !== undefined ? io.configOverride : loadConfig();
     if (!cfg?.database_path) {
       // No config, or a Postgres brain (no PGLite data dir → no IPC socket).
       // ENGINE-FREE means no direct-engine fallback here; pull-mode covers it.
@@ -846,19 +1100,27 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
 
     // [ENG-1] The 10000-char harness cap applies to the WHOLE stdout payload;
     // the block is budgeted ≤8KB server-side, but JSON escaping inflates, so
-    // trim defensively rather than letting the harness divert-and-drop.
+    // trim defensively rather than letting the harness divert-and-drop. The
+    // banner (≤300 chars, fixed) rides inside the same payload [D5] — only
+    // blockText is trimmed, so the failure notice survives the cap loop.
+    const bannerPrefix = banner ? `${banner.text}\n\n` : '';
+    const buildPayload = (block: string) =>
+      JSON.stringify({
+        hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: bannerPrefix + block },
+        ...(banner ? { systemMessage: banner.text } : {}),
+      });
     let blockText = text;
-    let payload = JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: blockText },
-    });
+    let payload = buildPayload(blockText);
     while (payload.length > CLAUDE_HOOK_OUTPUT_CAP_CHARS && blockText.length > 0) {
       blockText = blockText.slice(0, Math.max(0, blockText.length - (payload.length - CLAUDE_HOOK_OUTPUT_CAP_CHARS) - 16));
-      payload = JSON.stringify({
-        hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: blockText },
-      });
+      payload = buildPayload(blockText);
     }
     if (blockText.length === 0) return { outcome: 'degraded', reason: 'over_cap', turns: turns.length };
     guardedWrite(payload + '\n');
+    if (!expired) {
+      wrotePayload = true;
+      banner?.record();
+    }
     // Partial trim is delivery-count drift: the serve already logged the FULL
     // post-budget set at the response write, but pages cut from the tail here
     // were never injected. Record it so the doctor's heartbeat reconciliation
@@ -883,7 +1145,22 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     expired = true;
     result = { outcome: 'error', reason: errorCode(e) };
   }
-  await writeHeartbeat({
+  // Banner-only emission [D5]: every path that did NOT write the main payload
+  // (no_serve, ipc_unavailable, no_pglite_path, empty windows, transcript
+  // aborts, …) still surfaces the push failure — unless the deadline expired,
+  // in which case record() was never called and the banner re-fires next turn.
+  // (Local copy: TS cannot track the closure-side assignment of `banner`.)
+  const pendingBanner = banner as { text: string; record: () => void } | null;
+  if (pendingBanner && !wrotePayload && !expired) {
+    guardedWrite(
+      JSON.stringify({
+        hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: pendingBanner.text },
+        systemMessage: pendingBanner.text,
+      }) + '\n',
+    );
+    pendingBanner.record();
+  }
+  await writeHeartbeat(io, {
     ts: new Date().toISOString(),
     event: 'user-prompt',
     outcome: result.outcome,
@@ -894,14 +1171,150 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
   return 0;
 }
 
+// ── compact (PreCompact banking, v0.45.7 ambient recall) ─────────────────────
+
+/** Self-deadline for the compact event (harness timeout is 5s). */
+export const COMPACT_DEADLINE_MS = 3000;
+/** Banking wants breadth, not the 4-turn prompt window. */
+const COMPACT_WINDOW_TURNS = 20;
+/** Minimum remaining budget to START the segment scan+write (cathedral 5). */
+const SEGMENT_MIN_BUDGET_MS = 600;
+/** Minimum remaining budget for the durability WRITE itself (segment file +
+ * ledger). Named separately from the IPC threshold on purpose (pre-landing
+ * review): tuning one must not silently retune the other. */
+const SEGMENT_WRITE_MIN_BUDGET_MS = 300;
+/** Minimum remaining budget to fire the banking IPC call (cathedral 5). */
+const COMPACT_IPC_MIN_BUDGET_MS = 300;
+
+/**
+ * PreCompact fires BEFORE Claude Code compacts the transcript. Its stdout is
+ * NOT context-injected — the useful work is the WRITEs (cathedral 5 order,
+ * durability first):
+ *   1. bank the since-last-boundary window DURABLY as a content-addressed
+ *      corpus segment + ledger entry (secret-scanned; never written unscanned;
+ *      per-step deadline degrades with typed codes) — the serve sweep is the
+ *      extraction backstop even if everything after this fails;
+ *   2. ONE IPC round trip that banks the window's standing entities into the
+ *      session cursor (and, when a segment was banked, asks serve to harvest
+ *      it promptly) so the post-compaction SessionStart (source=compact)
+ *      serves a warm rehydration pack.
+ * Engine-free: transcript parse + fs + one IPC round trip. Fail-open always.
+ */
+async function hookCompact(io: HookIo): Promise<number> {
+  const t0 = Date.now();
+  const deadlineMs = io.compactDeadlineMs ?? COMPACT_DEADLINE_MS;
+  const remaining = () => deadlineMs - (Date.now() - t0);
+  let outcome: HookHeartbeatEntry['outcome'] = 'ok';
+  let reason: string | undefined;
+  let segment: string | undefined;
+  let flushAck: string | undefined;
+
+  const work = (async () => {
+    const j = await readStdinJson(io, 300);
+    if (!j) { outcome = 'degraded'; reason = 'no_stdin'; return; }
+
+    // S3#8 posture matches user-prompt: an unconfined transcript path aborts.
+    let turns: WindowTurn[] = [];
+    let boundaryTurnIndexes: number[] = [];
+    let allTurns: WindowTurn[] = [];
+    if (j.transcript_path !== undefined && j.transcript_path !== null) {
+      const conf = confineTranscriptPath(j.transcript_path, {
+        ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
+      });
+      if (!conf.ok) { outcome = 'degraded'; reason = `transcript_${conf.reason}`; return; }
+      try {
+        const parsed = parseTranscript(conf.path, { maxBytes: USER_PROMPT_TRANSCRIPT_MAX_BYTES });
+        allTurns = parsed.turns;
+        boundaryTurnIndexes = parsed.boundaryTurnIndexes;
+        turns = parsed.turns.slice(-COMPACT_WINDOW_TURNS);
+      } catch {
+        turns = [];
+      }
+    }
+    // sanitizeSessionId maps a MISSING id to the 'unknown' sentinel (fine for
+    // the stop buffer's filenames, wrong for cursor banking — a shared
+    // 'unknown' bucket would cross-pollinate sessions). Treat it as absent.
+    const sid = sanitizeSessionId(j?.session_id);
+    const sessionId = sid === 'unknown' ? null : sid;
+    if (!sessionId || turns.length === 0) {
+      // Nothing to bank against — not an error, just nothing to do.
+      if (outcome === 'ok') reason = sessionId ? 'empty_window' : 'no_session';
+      return;
+    }
+
+    const cfg = loadConfig();
+
+    // Cathedral 5, durability FIRST: content-addressed segment + ledger before
+    // any IPC. Written for EVERY engine config (the sweep backstop harvests it
+    // when serve/IPC is unavailable). Per-step deadline degrades — a scan that
+    // can't finish skips the segment ENTIRELY (never write unscanned content).
+    const banked = await bankCompactSegment(await corpusDir(cfg), sessionId, allTurns, boundaryTurnIndexes, {
+      remainingMs: remaining,
+      minScanMs: SEGMENT_MIN_BUDGET_MS,
+      minWriteMs: SEGMENT_WRITE_MIN_BUDGET_MS,
+    });
+    segment = banked.segment;
+    const flushCorpusFile = banked.flushCorpusFile;
+
+    // Same engine gate as the session-start pack arm (v0.45.7 symmetry): a
+    // Postgres config carrying a leftover database_path must not probe the
+    // PGLite socket — there is no serve behind it for this brain.
+    if (cfg?.engine !== 'pglite' || !cfg.database_path) { outcome = 'degraded'; reason = 'no_pglite_path'; return; }
+    const secret = readIpcSecret(cfg.database_path);
+    if (!secret) { outcome = 'degraded'; reason = 'no_serve'; return; }
+    if (remaining() < COMPACT_IPC_MIN_BUDGET_MS) { outcome = 'degraded'; reason = 'deadline'; return; }
+
+    const res = await requestContextPack(resolveSocketPath(cfg.database_path), {
+      secret,
+      sessionId,
+      window: turns,
+      bankOnly: true,
+      trigger: 'compact-bank',
+      ...(flushCorpusFile ? { flushCorpusFile } : {}),
+      ...(process.env.GBRAIN_SOURCE ? { sourceId: process.env.GBRAIN_SOURCE } : {}),
+    });
+    if (res === IPC_UNAVAILABLE) { outcome = 'degraded'; reason = 'ipc_unavailable'; return; }
+    if ('degraded' in res && res.degraded === 'stale_serve') { outcome = 'degraded'; reason = 'stale_serve'; return; }
+    const resp = res as ContextPackResponse;
+    if (!resp.ok) { outcome = 'degraded'; reason = reasonCode(resp.error ?? 'server_error'); return; }
+    // Fold the harvest-schedule ack into the heartbeat (adversarial review):
+    // a persistently full queue, bad basename, or split-corpus-dir not_found
+    // was previously observable NOWHERE — the ack was dropped on the floor
+    // and serve only heartbeats pump outcomes. Codes only, never content.
+    const cf = (resp.block as { checkpointFlush?: { status?: string; reason?: string } } | null | undefined)
+      ?.checkpointFlush;
+    if (cf?.status === 'scheduled') flushAck = 'scheduled';
+    else if (cf) flushAck = `skip_${cf.reason ?? 'unknown'}`;
+  })();
+
+  try {
+    const raced = await withDeadline(deadlineMs, work);
+    if (raced === DEADLINE && outcome === 'ok') { outcome = 'degraded'; reason = 'deadline'; }
+  } catch (e) {
+    outcome = 'error';
+    reason = errorCode(e); // fail-open: exit 0
+  }
+  await writeHeartbeat(io, {
+    ts: new Date().toISOString(),
+    event: 'compact',
+    outcome,
+    ...(reason ? { reason } : {}),
+    duration_ms: Date.now() - t0,
+    ...(segment ? { segment } : {}),
+    ...(flushAck ? { flush: flushAck } : {}),
+  });
+  return 0;
+}
+
 // ── stop [G15] ──────────────────────────────────────────────────────────────
 
 async function hookStop(io: HookIo): Promise<number> {
   const t0 = Date.now();
   let outcome: HookHeartbeatEntry['outcome'] = 'ok';
   let reason: string | undefined;
+  let j: Record<string, unknown> | null = null;
   try {
-    const j = await readStdinJson(io, 300);
+    j = await readStdinJson(io, 300);
     const sessionId = sanitizeSessionId(j?.session_id);
     const dir = await liveBufferDir();
     const exchange = firstString(j, ['last_assistant_message', 'lastAssistantMessage', 'prompt']);
@@ -916,11 +1329,21 @@ async function hookStop(io: HookIo): Promise<number> {
     outcome = 'error';
     reason = errorCode(e);
   }
-  await writeHeartbeat({
+  // Per-turn durability push [D3/D17/D20] — its own try/deadline so the
+  // buffer append above and the heartbeat below are never at risk.
+  let pushReason: string | undefined;
+  try {
+    const ws = io.cwd ?? (typeof j?.cwd === 'string' ? (j.cwd as string) : process.cwd());
+    const raced = await withDeadline(STOP_PUSH_DEADLINE_MS, stopPushIfDue(ws, io));
+    pushReason = raced === DEADLINE ? 'push_unavailable' : raced;
+  } catch {
+    pushReason = 'push_unavailable';
+  }
+  await writeHeartbeat(io, {
     ts: new Date().toISOString(),
     event: 'stop',
     outcome,
-    ...(reason ? { reason } : {}),
+    ...((reason ?? pushReason) ? { reason: reason ?? pushReason } : {}),
     duration_ms: Date.now() - t0,
   });
   return 0;
@@ -986,6 +1409,7 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
 
   let sessionId = 'unknown';
   let ws: string | undefined;
+  let segmentMode: string | undefined;
   try {
     const j = await readStdinJson(io, 500);
     sessionId = sanitizeSessionId(j?.session_id);
@@ -1017,41 +1441,59 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           /* status telemetry best-effort */
         }
       } else if (turnsN > 0) {
-        // [S3#2] Secret-scan AT WRITE TIME. Scanner absent → still write
-        // (the corpus is 0700-local), but say so in the heartbeat.
-        let text = toCorpusText(parsed.turns);
-        try {
-          const scan = await import('../core/secret-scan.ts');
-          const redacted = scan.redactFindings(text);
-          text = redacted.text;
-          // COUNT only — the findings themselves never land in telemetry [S3#7].
-          redactionsN = redacted.redactions.length;
-        } catch {
-          degrade('scan_unavailable');
-        }
         const dir = await corpusDir(cfg);
-        // Session-id-keyed filename: a resumed session OVERWRITES its own
-        // corpus file — dedup by construction [A6]. The write is ATOMIC
-        // (tmp+rename) so a concurrent sweep never reads a torn half-write,
-        // and the stale `.ingested`/`.in-progress` sidecars are dropped AFTER
-        // the rename so the sweep re-processes the appended transcript (a
-        // resumed session's new turns were being permanently skipped when the
-        // completion sidecar survived the overwrite).
-        const corpusFile = join(dir, `${sessionId}.txt`);
-        const tmpCorpus = `${corpusFile}.tmp-${process.pid}`;
-        writeFileSync(tmpCorpus, text, { mode: 0o600 });
-        renameSync(tmpCorpus, corpusFile);
-        try {
-          rmSync(corpusFile + CORPUS_INGESTED_SUFFIX, { force: true });
-        } catch {
-          /* best effort — sidecar invalidation never fails the hook */
+        // Cathedral 5 dedup contract: when EVERY non-empty boundary window's
+        // redacted hash is banked in the segment ledger (exact-set), write
+        // only the post-last-boundary REMAINDER; any mismatch ⇒ full
+        // transcript exactly as before (at-least-once).
+        const decided = await decideCorpusMode(dir, sessionId, parsed.turns, parsed.boundaryTurnIndexes);
+        const corpusTurns = decided.turns;
+        if (decided.mode !== 'full') segmentMode = decided.mode;
+        if (segmentMode !== 'skip_covered') {
+          // (skip_covered: everything already segment-banked; nothing new to
+          // write — existing corpus file + sidecars stay untouched.)
+          //
+          // [S3#2] Secret-scan AT WRITE TIME. Scanner absent → still write
+          // (the corpus is 0700-local), but say so in the heartbeat.
+          let text = toCorpusText(corpusTurns);
+          try {
+            const scan = await import('../core/secret-scan.ts');
+            const redacted = scan.redactFindings(text);
+            text = redacted.text;
+            // COUNT only — the findings themselves never land in telemetry [S3#7].
+            redactionsN = redacted.redactions.length;
+          } catch {
+            degrade('scan_unavailable');
+          }
+          // Session-id-keyed filename: a resumed session OVERWRITES its own
+          // corpus file — dedup by construction [A6]. The write is ATOMIC
+          // (tmp+rename) so a concurrent sweep never reads a torn half-write,
+          // and the stale `.ingested`/`.in-progress` sidecars are dropped AFTER
+          // the rename so the sweep re-processes the appended transcript (a
+          // resumed session's new turns were being permanently skipped when the
+          // completion sidecar survived the overwrite).
+          const corpusFile = join(dir, `${sessionId}.txt`);
+          const tmpCorpus = `${corpusFile}.tmp-${process.pid}`;
+          writeFileSync(tmpCorpus, text, { mode: 0o600 });
+          renameSync(tmpCorpus, corpusFile);
+          try {
+            rmSync(corpusFile + CORPUS_INGESTED_SUFFIX, { force: true });
+          } catch {
+            /* best effort — sidecar invalidation never fails the hook */
+          }
+          try {
+            rmSync(corpusFile + CORPUS_CLAIM_SUFFIX, { force: true });
+          } catch {
+            /* best effort */
+          }
         }
-        try {
-          rmSync(corpusFile + CORPUS_CLAIM_SUFFIX, { force: true });
-        } catch {
-          /* best effort */
-        }
-        gcOldFiles(dir, corpusRetentionDays(cfg) * 24 * 60 * 60 * 1000); // [G15]
+        const retentionMs = corpusRetentionDays(cfg) * 24 * 60 * 60 * 1000;
+        gcOldFiles(dir, retentionMs); // [G15]
+        gcCorpusArtifacts(dir, retentionMs, [
+          CORPUS_INGESTED_SUFFIX,
+          CORPUS_CLAIM_SUFFIX,
+          HARVEST_RECEIPT_SUFFIX,
+        ]);
       }
     }
   } catch (e) {
@@ -1093,7 +1535,7 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
     /* best effort */
   }
 
-  await writeHeartbeat({
+  await writeHeartbeat(io, {
     ts: new Date().toISOString(),
     event: 'session-end',
     outcome,
@@ -1102,6 +1544,7 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
     ...(turnsN !== undefined ? { turns: turnsN } : {}),
     ...(bytesN !== undefined ? { bytes: bytesN } : {}),
     ...(redactionsN !== undefined ? { redactions: redactionsN } : {}),
+    ...(segmentMode ? { segment: segmentMode } : {}),
   });
   return 0;
 }

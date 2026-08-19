@@ -81,7 +81,16 @@ export async function getBrainHotMemoryMeta(
     ?? (ctx as { source_session?: string }).source_session
     ?? null;
   const allowListHash = hashAllowList(ctx.takesHoldersAllowList);
-  const cacheKey = `${sourceId}::${sessionId ?? '_'}::${allowListHash}`;
+  // v0.45.7 (ambient-recall adversarial review, P1): the visibility TIER is part
+  // of the key. Without it, a trusted-local call (remote:false → all rows,
+  // private included) warms the cache and a later remote/world-only call with
+  // the same source+session+allowList is SERVED the private payload — a
+  // cross-tier leak through the cache, not through the query.
+  const tier = ctx.remote === false ? 'all' : 'world';
+  // encodeCacheField (F5): source_id / session_id are caller-controlled and
+  // may contain the '::' delimiter; percent-encode ':' so bumpHotMemoryCache's
+  // split('::') can never mis-slice a component.
+  const cacheKey = `${encodeCacheField(sourceId)}::${tier}::${encodeCacheField(sessionId ?? '_')}::${allowListHash}`;
 
   const ttl = Math.max(1000, opts.ttlMs ?? DEFAULT_TTL_MS);
   const topK = Math.max(1, Math.min(opts.topK ?? DEFAULT_TOP_K, 25));
@@ -135,6 +144,10 @@ export async function getBrainHotMemoryMeta(
         notability: r.notability,
         entity_slug: r.entity_slug,
         valid_from: r.valid_from.toISOString(),
+        // v0.45.7 ambient recall: recording time, so delta's "new facts since my
+        // last wake" filters on WHEN the fact was learned, not its semantic
+        // validity date (a fact recorded today about last month is NEW).
+        created_at: r.created_at.toISOString(),
         confidence: Number(effectiveConfidence(r, now).toFixed(3)),
       })),
     },
@@ -145,13 +158,23 @@ export async function getBrainHotMemoryMeta(
 
 /** Invalidate the cache for a (source_id, session_id) pair after extraction. */
 export function bumpHotMemoryCache(sourceId: string, sessionId: string | null): void {
-  // Walk the cache and prune any entry matching this source+session prefix
-  // (regardless of allow-list hash). Visitors with different visibility
-  // tiers all get fresh data on next read.
-  const prefix = `${sourceId}::${sessionId ?? '_'}::`;
+  // Walk the cache and prune any entry matching this source+session
+  // (regardless of visibility tier or allow-list hash — key layout is
+  // encField(source)::tier::encField(session)::allowHash since v0.45.7).
+  // Components are ':'-encoded, so split('::') slices cleanly even when the
+  // source/session id itself contains '::' (F5).
+  const encSource = encodeCacheField(sourceId);
+  const encSession = encodeCacheField(sessionId ?? '_');
   for (const k of _cache.keys()) {
-    if (k.startsWith(prefix)) _cache.delete(k);
+    const parts = k.split('::');
+    if (parts[0] === encSource && parts[2] === encSession) _cache.delete(k);
   }
+}
+
+/** Percent-encode ':' so a caller-controlled id can't inject the '::' key
+ * delimiter (F5). Cheap, reversible, and keeps keys human-readable. */
+function encodeCacheField(v: string): string {
+  return v.replace(/:/g, '%3A');
 }
 
 /** Test helper: clear the cache. */

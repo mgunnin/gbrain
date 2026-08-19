@@ -14,6 +14,7 @@ import {
   recordSearchTelemetry,
   readSearchStats,
   getTelemetryWriter,
+  awaitPendingTelemetryFlush,
   _resetTelemetryWriterForTest,
 } from '../src/core/search/telemetry.ts';
 import type { HybridSearchMeta } from '../src/core/types.ts';
@@ -232,12 +233,155 @@ describe('readSearchStats — read-time derived averages', () => {
   });
 
   test('missing search_telemetry table → empty stats (graceful)', async () => {
-    // Drop the table to simulate a pre-v0.32.3 brain.
-    await engine.executeRaw('DROP TABLE IF EXISTS search_telemetry');
+    // Simulate a pre-v0.32.3 brain by HIDING the table — a rename preserves
+    // the full column shape for the tests that follow. (The prior
+    // DROP + initSchema() restore was a silent no-op: the migration ledger
+    // already records v57, so initSchema never recreated the table.)
+    await engine.executeRaw('ALTER TABLE search_telemetry RENAME TO search_telemetry_hidden');
+    try {
+      const s = await readSearchStats(engine, { days: 7 });
+      expect(s.total_calls).toBe(0);
+      expect(s.cache_hit_rate).toBe(0);
+      expect(s.empty_results).toEqual({ total: 0, by_cause: {} });
+    } finally {
+      await engine.executeRaw('ALTER TABLE search_telemetry_hidden RENAME TO search_telemetry');
+    }
+  });
+});
+
+// WP2/T3 — empty-result cause rollup. Rides the reserved
+// (date, EMPTY_RESULT_MODE, cause) rows with zero new DDL; readSearchStats
+// diverts them out of the call/intent/mode aggregates.
+describe('empty_result bucket keyed by cause (WP2/T3)', () => {
+  test('vector down + empty response → vector_disabled cause', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta({ vector_enabled: false }), { results_count: 0 });
+    await w.flush();
     const s = await readSearchStats(engine, { days: 7 });
-    expect(s.total_calls).toBe(0);
-    expect(s.cache_hit_rate).toBe(0);
-    // Restore for subsequent tests in this describe block.
-    await engine.initSchema();
+    expect(s.empty_results.total).toBe(1);
+    expect(s.empty_results.by_cause).toEqual({ vector_disabled: 1 });
+  });
+
+  test('budget dropped everything → budget_dropped_all cause (beats vector_disabled)', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(
+      engine,
+      makeMeta({
+        vector_enabled: false,
+        token_budget: { budget: 100, used: 0, kept: 0, dropped: 5 },
+      }),
+      { results_count: 0 },
+    );
+    await w.flush();
+    const s = await readSearchStats(engine, { days: 7 });
+    expect(s.empty_results.by_cause).toEqual({ budget_dropped_all: 1 });
+  });
+
+  test('degraded budget_dropped_all stage classifies the same way', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(
+      engine,
+      makeMeta({ degraded: [{ stage: 'budget_dropped_all' }] }),
+      { results_count: 0 },
+    );
+    await w.flush();
+    const s = await readSearchStats(engine, { days: 7 });
+    expect(s.empty_results.by_cause).toEqual({ budget_dropped_all: 1 });
+  });
+
+  test('healthy pipeline + zero hits → keyword_zero cause', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 0 });
+    await w.flush();
+    const s = await readSearchStats(engine, { days: 7 });
+    expect(s.empty_results.by_cause).toEqual({ keyword_zero: 1 });
+  });
+
+  test('empty cache HIT (offset artifact) is NOT counted as an empty-result cause', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta({ cache: { status: 'hit' } }), { results_count: 0 });
+    await w.flush();
+    const s = await readSearchStats(engine, { days: 7 });
+    expect(s.empty_results.total).toBe(0);
+  });
+
+  test('reserved rows never skew total_calls or the distributions', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 5 });
+    recordSearchTelemetry(engine, makeMeta({ vector_enabled: false }), { results_count: 0 });
+    await w.flush();
+    const s = await readSearchStats(engine, { days: 7 });
+    // Both calls count as calls (the empty one still ran); the reserved
+    // cause row does NOT add a third.
+    expect(s.total_calls).toBe(2);
+    expect(Object.keys(s.mode_distribution)).toEqual(['balanced']);
+    expect(Object.keys(s.intent_distribution)).toEqual(['general']);
+    expect(s.empty_results.total).toBe(1);
+    expect(s.avg_results).toBeCloseTo(2.5, 5); // 5 / 2 calls — reserved row excluded
+  });
+});
+
+describe('awaitPendingTelemetryFlush (#4143 drain)', () => {
+  test('fast path: nothing pending resolves {unfinished: 0} without touching the DB', async () => {
+    const r = await awaitPendingTelemetryFlush(50, 'disconnect');
+    expect(r).toEqual({ unfinished: 0 });
+  });
+
+  test("exit mode flushes residual buckets — BOTH the normal and the empty_result bucket land", async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    // One normal record + one zero-result record (the empty_result cause
+    // bucket #4096 added — the second INSERT that turned the flush into the
+    // close()-deadlock trigger).
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 5 });
+    recordSearchTelemetry(engine, makeMeta({ vector_enabled: false }), { results_count: 0 });
+    expect(w.hasBuffered()).toBe(true);
+
+    const r = await awaitPendingTelemetryFlush(2000, 'exit');
+    expect(r).toEqual({ unfinished: 0 });
+    expect(w.hasBuffered()).toBe(false);
+
+    const rows = await engine.executeRaw<{ mode: string; intent: string }>(
+      'SELECT mode, intent FROM search_telemetry ORDER BY mode',
+    );
+    expect(rows.length).toBe(2);
+    expect(rows.map((x) => x.mode).sort()).toEqual(['balanced', 'empty_result']);
+  });
+
+  test('disconnect mode awaits only the in-flight flush and DROPS residual buckets (lossy by design)', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 5 });
+    // Kick a flush so it is in flight, then buffer MORE — the post-swap
+    // records that a disconnect-mode drain must NOT try to write.
+    const inFlight = w.flush();
+    recordSearchTelemetry(engine, makeMeta({ intent: 'entity' }), { results_count: 1 });
+    expect(w.hasBuffered()).toBe(true);
+
+    const r = await awaitPendingTelemetryFlush(2000, 'disconnect');
+    expect(r).toEqual({ unfinished: 0 });
+    await inFlight;
+    expect(w.pendingFlush()).toBeNull();
+    expect(w.hasBuffered()).toBe(true); // residual stays buffered — dropped with the process
+
+    const rows = await engine.executeRaw<{ intent: string }>('SELECT intent FROM search_telemetry');
+    expect(rows.map((x) => x.intent)).toEqual(['general']); // only the in-flight write landed
+  });
+
+  test('a drain that exceeds its bound reports unfinished instead of hanging', async () => {
+    const w = getTelemetryWriter();
+    // A flush that never settles (simulated) — the drain must give up at the bound.
+    (w as unknown as { flushInFlight: Promise<void> | null }).flushInFlight = new Promise<void>(() => {});
+    const started = Date.now();
+    const r = await awaitPendingTelemetryFlush(100, 'disconnect');
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(r).toEqual({ unfinished: 1 });
+    _resetTelemetryWriterForTest(); // clear the poisoned singleton for later cases
   });
 });

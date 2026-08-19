@@ -1,6 +1,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { embedBatch, currentEmbeddingSignature } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
+import { carryChunkMetadata } from '../core/embed-stale.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 import { createProgress, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -161,6 +162,16 @@ export interface EmbedOpts {
    * `gbrain embed --stale --include-null-signature` set this.
    */
   includeNullSignature?: boolean;
+  /**
+   * Migration-hardening: locks the CALLER already holds (the migration
+   * orchestrator acquires the per-source embed-backfill locks up front, before
+   * the schema transition, and holds them through the drain). When set with
+   * `singleFlight`, the drain does NOT re-acquire the same keys — re-acquiring
+   * would always fail against our own holder and misreport `lock_skipped`
+   * ("Migration paused") on every run. Ownership stays with the caller: this
+   * function refreshes them (heartbeat) but never releases them.
+   */
+  heldLocks?: DbLockHandle[];
 }
 
 /**
@@ -198,6 +209,30 @@ export interface EmbedResult {
   failure_samples: string[];
   /** True if this run was a dry-run. */
   dryRun: boolean;
+  /**
+   * Chunkless-page safety net (`--stale` only): pages with non-empty
+   * content but zero `content_chunks` rows that this run chunked (or, in
+   * dryRun, would chunk) so their new NULL-embedding chunks fold into the
+   * SAME pass. 0 on a healthy brain. Additive field — see
+   * `ChunklessPageRow` for the detection rationale.
+   */
+  chunkless_pages_healed: number;
+  /**
+   * Set when a single-flight run did NO work because another backfill holds
+   * the per-source embed lock. A hard-killed (SIGKILL/crash) run leaves its
+   * lock behind for up to EMBED_BACKFILL_LOCK_TTL_MIN — callers that promise
+   * "re-run to resume" (migrate embeddings) use this to say so instead of
+   * misreporting embed failures.
+   */
+  lock_skipped?: boolean;
+  /**
+   * Set when the single-flight lock heartbeat discovered the lock was stolen
+   * (refresh matched 0 rows) or kept erroring: mutual exclusion is gone, so
+   * the drain ABORTED with partial progress banked rather than racing the
+   * new holder. Resumable — re-run the same command once the other holder
+   * finishes (the fenced refresh means we can never steal it back silently).
+   */
+  lock_lost?: boolean;
   /**
    * E1 (paced-backfill): end-of-run pacing telemetry. Present ONLY when pacing
    * was active (enabled bundle). The number the operator could not get from an
@@ -317,6 +352,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
     failures: 0,
     failure_samples: [],
     dryRun: !!opts.dryRun,
+    chunkless_pages_healed: 0,
   };
 
   if (opts.slugs && opts.slugs.length > 0) {
@@ -342,8 +378,15 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
     // sorted (deterministic) order to avoid acquire-order deadlock. Released in
     // the finally below. Skipped for dryRun and when the caller didn't opt in
     // (cycle / catch-up / sync-auto-embed callers never single-flight).
+    //
+    // Migration hardening: when the caller ALREADY holds the locks
+    // (opts.heldLocks — the migrate-embeddings orchestrator acquires them
+    // before the schema transition), use those instead of re-acquiring — a
+    // re-acquire would always fail against our own holder and misreport
+    // lock_skipped. Ownership stays with the caller (no release here).
     const sfLocks: DbLockHandle[] = [];
-    if (opts.singleFlight && opts.stale && !opts.dryRun) {
+    const callerHeld = opts.heldLocks !== undefined && opts.heldLocks.length > 0;
+    if (callerHeld === false && opts.singleFlight && opts.stale && !opts.dryRun) {
       let lockSourceIds: string[];
       if (opts.sourceId) {
         lockSourceIds = [opts.sourceId];
@@ -375,11 +418,63 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
             try { await h.release(); } catch { /* best-effort */ }
           }
           serr(`  [embed] another backfill is already running for source "${sid}"; skipping (single-flight).`);
+          result.lock_skipped = true;
           return result;
         }
         sfLocks.push(lock);
       }
     }
+
+    // Lock heartbeat (round-2 C3/#5): the TTL is 60 minutes and million-chunk
+    // drains run longer, so without refresh another process could steal the
+    // lock mid-drain and mutual exclusion silently ends. Refresh every 5
+    // minutes; a refresh that returns false (fenced predicate matched 0 rows
+    // = stolen/released) or that keeps THROWING (3 consecutive transient
+    // errors) aborts the drain — continuing without the lock is the one
+    // thing this machinery exists to prevent. Covers both our own sfLocks
+    // and caller-held locks (the migration's).
+    const activeLocks: DbLockHandle[] = callerHeld ? [...(opts.heldLocks ?? [])] : sfLocks;
+    const lockAbort = new AbortController();
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    // Test seam: default 5 min; tests shrink it to exercise the loss path.
+    const heartbeatMs = Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS) > 0
+      ? Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS)
+      : 5 * 60 * 1000;
+    if (activeLocks.length > 0 && !opts.dryRun) {
+      let consecutiveErrors = 0;
+      let beating = false;
+      heartbeat = setInterval(() => {
+        if (beating) return; // a slow tick must not stack
+        beating = true;
+        void (async () => {
+          try {
+            if (lockAbort.signal.aborted) return;
+            for (const h of activeLocks) {
+              const ok = await h.refresh();
+              if (!ok) {
+                result.lock_lost = true;
+                serr('  [embed] single-flight lock was stolen or released mid-run; aborting the drain (partial progress is banked — re-run to resume).');
+                if (heartbeat !== undefined) clearInterval(heartbeat);
+                lockAbort.abort();
+                return;
+              }
+            }
+            consecutiveErrors = 0;
+          } catch {
+            consecutiveErrors += 1;
+            if (consecutiveErrors >= 3) {
+              result.lock_lost = true;
+              serr('  [embed] lock heartbeat failed 3 consecutive times; aborting the drain rather than running without mutual exclusion.');
+              if (heartbeat !== undefined) clearInterval(heartbeat);
+              lockAbort.abort();
+            }
+          } finally {
+            beating = false;
+          }
+        })();
+      }, heartbeatMs);
+    }
+    const drainSignal = anySignal(lockAbort.signal, opts.signal);
 
     // Resolve DB-contention pacing (env > config > bundle; env is the
     // incident escape hatch). dryRun skips it — no writes to pace. A
@@ -424,8 +519,13 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
         paceMaxConcurrency,
         quiet: opts.quiet,
         includeNullSignature: opts.includeNullSignature,
-      }, opts.signal);
+      }, drainSignal);
+    } catch (e) {
+      // A heartbeat-triggered abort is a clean, resumable stop (lock_lost is
+      // already set + explained on stderr) — not an error to propagate.
+      if (!(result.lock_lost && e instanceof AbortError)) throw e;
     } finally {
+      if (heartbeat !== undefined) clearInterval(heartbeat);
       // E1: surface pacing telemetry (human + structured) when pacing was on.
       const snap = pacer.snapshot();
       if (snap.enabled) {
@@ -529,6 +629,7 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
     return {
       embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0,
       pages_processed: 0, failures: 0, failure_samples: [], dryRun: false,
+      chunkless_pages_healed: 0,
     };
   }
 
@@ -543,12 +644,21 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
       paramBuilder: (cleanArgs) => {
         const slugsI = cleanArgs.indexOf('--slugs');
         const srcI = cleanArgs.indexOf('--source');
+        const bsI = cleanArgs.indexOf('--batch-size');
+        const bsRaw = bsI >= 0 ? parseInt(cleanArgs[bsI + 1] ?? '', 10) : NaN;
+        const prI = cleanArgs.indexOf('--priority');
         return {
           all: cleanArgs.includes('--all'),
           stale: cleanArgs.includes('--stale'),
           dryRun: cleanArgs.includes('--dry-run'),
           slugs: slugsI >= 0 ? cleanArgs.slice(slugsI + 1).filter(a => !a.startsWith('--')) : undefined,
           sourceId: srcI >= 0 ? cleanArgs[srcI + 1] : undefined,
+          // Background parity (D7): these four used to be silently DROPPED,
+          // degrading the documented recovery command to a plain stale run.
+          catchUp: cleanArgs.includes('--catch-up'),
+          includeNullSignature: cleanArgs.includes('--include-null-signature'),
+          ...(Number.isFinite(bsRaw) && bsRaw > 0 && { batchSize: Math.min(10_000, bsRaw) }),
+          ...(prI >= 0 && cleanArgs[prI + 1] === 'recent' && { priority: 'recent' }),
           // CX1+CX5: carry explicit pace overrides into the `embed` job payload
           // (the job name CLI --background actually submits). The handler
           // re-resolves env > config > bundle at execution.
@@ -684,8 +794,12 @@ async function embedPage(
     }
   }
 
-  // Embed chunks without embeddings
-  const toEmbed = chunks.filter(c => !c.embedded_at);
+  // Embed chunks without embeddings. embedding_is_null is the stored-vector
+  // truth: a schema rebuild NULLs vectors without touching embedded_at, so
+  // keying on embedded_at alone silently no-ops ("all chunks already
+  // embedded") on a rebuild-darkened page. Older callers that selected chunks
+  // without the boolean fall back to embedded_at.
+  const toEmbed = chunks.filter(c => !c.embedded_at || c.embedding_is_null === true);
   result.total_chunks += chunks.length;
   result.skipped += chunks.length - toEmbed.length;
 
@@ -750,7 +864,12 @@ async function embedPage(
   // such a page and then stamps it. #3037: a partial failure leaves failed
   // chunks NULL, so don't stamp then either.
   if (failed === 0 && toEmbed.length === chunks.length) {
-    await engine.setPageEmbeddingSignature(slug, { sourceId, signature: currentEmbeddingSignature() });
+    // D9 honesty: no stamp when the gateway is unconfigured — a wrong
+    // signature is worse than none (NULL = unknown provenance).
+    const stampSig = currentEmbeddingSignature();
+    if (stampSig) {
+      await engine.setPageEmbeddingSignature(slug, { sourceId, signature: stampSig });
+    }
     // #3507: a fully re-embedded per_chunk_synopsis page landed at the
     // title tier — keep the stamped mode honest.
     await restampIfDemotedToTitleTier(engine, page, slug, page.source_id);
@@ -765,9 +884,11 @@ async function embedPage(
 }
 
 /**
- * Carry code-chunk metadata (language, symbol_name, symbol_type, line range,
- * parent scope, doc comment, qualified name) from a loaded Chunk back into a
- * ChunkInput destined for upsertChunks.
+ * Carry per-chunk metadata — modality (the W0 fix: its omission flipped
+ * image chunks to text) plus the code fields (language, symbol_name,
+ * symbol_type, line range, parent scope, doc comment, qualified name) — from
+ * a loaded Chunk back into a ChunkInput destined for upsertChunks. The
+ * shared carryChunkMetadata list (core/embed-stale.ts) is authoritative.
  *
  * Issue #769: every re-embed used to strip these fields, and upsertChunks
  * overwrites (does not COALESCE) the metadata columns from EXCLUDED, so
@@ -776,17 +897,13 @@ async function embedPage(
  * (embedPage, embedAll non-stale, embedAllStale) in lock-step.
  */
 function preserveCodeMetadata(loaded: any, base: ChunkInput): ChunkInput {
-  return {
-    ...base,
-    language: loaded.language ?? undefined,
-    symbol_name: loaded.symbol_name ?? undefined,
-    symbol_type: loaded.symbol_type ?? undefined,
-    start_line: loaded.start_line ?? undefined,
-    end_line: loaded.end_line ?? undefined,
-    parent_symbol_path: loaded.parent_symbol_path ?? undefined,
-    doc_comment: loaded.doc_comment ?? undefined,
-    symbol_name_qualified: loaded.symbol_name_qualified ?? undefined,
-  };
+  // W0 fix-wave (Tier-1 #3, CONFIRMED): delegate to the single shared carry
+  // list. This local copy was missing `modality`, so every CLI re-embed path
+  // (embedPage, embedAll, embedAllStale) flipped image chunks to
+  // modality='text' — upsertChunks overwrites from EXCLUDED — silently
+  // zeroing image retrieval until the next full import. The minion twin in
+  // core/embed-stale.ts carried it correctly; one list now serves both.
+  return carryChunkMetadata(loaded, base);
 }
 
 async function embedAll(
@@ -814,7 +931,9 @@ async function embedAll(
   // v0.41.31: current embedding provenance signature. Stamped onto pages
   // when their chunks are (re)embedded so a later model/dimension swap is
   // detectable as stale.
-  const signature = currentEmbeddingSignature();
+  // null when the gateway is unconfigured: skip stamping + signature-widened
+  // invalidation entirely (a wrong stamp is worse than none — D9 honesty).
+  const signature = currentEmbeddingSignature() ?? undefined;
   // ─────────────────────────────────────────────────────────────
   // Stale-only fast path: avoid the listPages + per-page getChunks
   // bomb that pulled every page row + every chunk's embedding column
@@ -926,11 +1045,14 @@ async function embedAll(
       await observed(pacer, () => engine.upsertChunks(page.slug, updated, pageOpts));
       // v0.41.31: stamp embedding provenance so a later model swap is
       // detectable as stale. #3037: not on partial failure — failed chunks
-      // stay NULL under unknown provenance.
+      // stay NULL under unknown provenance. D9: no stamp without a gateway
+      // (signature undefined) — a wrong stamp is worse than none.
       if (failed === 0) {
-        await observed(pacer, () =>
-          engine.setPageEmbeddingSignature(page.slug, { sourceId: pageSourceId, signature }),
-        );
+        if (signature) {
+          await observed(pacer, () =>
+            engine.setPageEmbeddingSignature(page.slug, { sourceId: pageSourceId, signature }),
+          );
+        }
         // #3507: --all fully re-embeds; a per_chunk_synopsis page landed at
         // the title tier — keep the stamped mode honest. #3037: gated on
         // failed === 0 — a partially-failed page was NOT fully re-embedded,
@@ -989,6 +1111,201 @@ async function embedAll(
 }
 
 /**
+ * Chunkless-page safety net for `embed --stale`. `listStaleChunks` /
+ * `countStaleChunks` only ever look at `content_chunks` rows where
+ * `embedding IS NULL` — a page written directly via `putPage` that never
+ * went through chunking (e.g. an enrichment-generated entity stub) has NO
+ * chunk row at all, so it is invisible to that scan forever, even after
+ * unlimited `embed --stale` runs.
+ *
+ * This sweep finds pages with non-empty content (`compiled_truth` and/or
+ * `timeline` — both are chunked independently, mirroring `embedPage`'s
+ * chunkless branch) and zero `content_chunks` rows
+ * (`engine.listChunklessPagesWithContent`, which already excludes
+ * quarantined + embed_skip pages — both intentionally chunkless). The new
+ * chunk rows land with `embedding = NULL`, so they flow into the SAME
+ * `embed --stale` pass via the existing cursor below — no separate embed
+ * step needed here.
+ *
+ * dryRun chunks locally (a pure, in-memory operation) to report an
+ * accurate count without writing anything, matching embedPage's dry-run
+ * contract (including `pages_processed`, which embedPage's own dry-run
+ * branch increments for exactly this "examined, didn't write" case).
+ *
+ * Race note (review catch, three rounds — ACCEPTED RESIDUAL RISK, not
+ * fully closed): between listing a page and writing its chunks, a
+ * concurrent writer (sync, another `put_page`) could change or chunk the
+ * SAME page. Two mitigations, both bounded — full atomicity (a
+ * transaction/version-guarded conditional write inside `upsertChunks`)
+ * would need a new engine primitive shared by every `upsertChunks` caller,
+ * which is out of scope for a chunkless-page safety net:
+ *   1. Immediately before writing, re-fetch the LIVE page via `getPage`
+ *      and build `inputs` from ITS CURRENT content, not the batch-list
+ *      snapshot — closes the "content changed but still chunkless"
+ *      sub-case, not just the "chunks appeared" one.
+ *   2. Re-check `getChunks` right after that same fetch — skip (don't
+ *      overwrite) if chunks now exist AT THE TIME OF THE CHECK.
+ * What this does NOT close: a writer that inserts chunks in the gap
+ * BETWEEN step 2's check and the `upsertChunks` call immediately below it
+ * (no intervening `await` other than that one call, but `upsertChunks`
+ * itself is not conditioned on the check — this is still check-then-write,
+ * not compare-and-swap) can still have its chunks overwritten — HONESTLY:
+ * `upsertChunks` treats its input as the full desired chunk set for that
+ * page and deletes any existing chunk_index absent from it, so a
+ * concurrent writer's chunks landing in that exact gap CAN be replaced
+ * with this sweep's stale-content chunks (embedding NULL). This is the
+ * SAME check-then-write window `embedPage`'s existing single-page
+ * chunkless branch already ships with today (that branch doesn't even
+ * have step 2's re-check) — no new race CLASS is introduced, and the
+ * window here is a single sequential getPage+getChunks+upsertChunks
+ * instead of spanning a whole batch. The blast radius is bounded: the
+ * page is NOT deleted or corrupted, just re-chunked from a stale
+ * snapshot, and the NEXT write to that page (sync, another edit) that
+ * actually chunks it restores correct content — this sweep's own
+ * predicate is idempotent and doesn't compound the drift. Closing this
+ * fully (true atomicity) is tracked as a follow-up, not blocking this
+ * safety net.
+ *
+ * Per-page failure isolation (review catch): one malformed/oversized
+ * chunkless page must not abort the sweep and, with it, the entire
+ * `--stale` run before the normal NULL-embedding pass even starts — that
+ * would make the safety net WORSE than the bug it fixes. Each page's
+ * work is try/caught; a failure is recorded (`EmbedResult.failures` +
+ * `failure_samples`, same convention as every other embed failure path)
+ * and the sweep moves on.
+ *
+ * Bounded, keyset-paginated (like listStalePagesForExtraction) — a safety
+ * net for a rare drift case, not the primary bulk-chunking path. `BATCH_SIZE`
+ * is deliberately small (unlike the 2000-chunk-row default elsewhere in
+ * this file): each row here carries a FULL page body (`compiled_truth` +
+ * `timeline`), so a large batch of large pages is a real memory/latency
+ * concern the metadata-only `listStaleChunks` rows never had (review
+ * catch). It still respects the caller's pacer (no-op when pacing is off)
+ * and a soft wall-clock cap (`GBRAIN_EMBED_TIME_BUDGET_MS`) so a
+ * pathologically large damaged brain can't run this sweep unbounded — it
+ * heals what it can and reports the rest for the next `embed --stale` run
+ * (the SQL predicate is idempotent; nothing here requires finishing in one
+ * pass). `startedAt` is shared with the caller's overall run clock (review
+ * catch) — healing and the main stale loop draw from ONE combined budget
+ * window, not two independent 30-minute ones. `catchUp` mirrors the main
+ * loop's own `--catch-up` handling: removes the cap entirely (the keyset
+ * cursor still terminates on its own; `signal` remains the abort path).
+ */
+async function healChunklessPages(
+  engine: BrainEngine,
+  sourceId: string | undefined,
+  dryRun: boolean,
+  result: EmbedResult,
+  quiet: boolean | undefined,
+  signal: AbortSignal | undefined,
+  pacer: DbPacer | undefined,
+  startedAt: number,
+  catchUp: boolean,
+): Promise<void> {
+  const BATCH_SIZE = 50;
+  const BUDGET_MS: number | null = catchUp
+    ? null
+    : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
+  const activePacer = pacer ?? createNoopPacer();
+  let afterPageId: number | undefined;
+  let pagesHealed = 0;
+  let budgetExceeded = false;
+
+  const buildInputs = (compiledTruth: string, timeline: string): ChunkInput[] => {
+    const inputs: ChunkInput[] = [];
+    if (compiledTruth.trim()) {
+      for (const c of chunkText(compiledTruth)) {
+        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
+      }
+    }
+    if (timeline.trim()) {
+      for (const c of chunkText(timeline)) {
+        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'timeline' });
+      }
+    }
+    return inputs;
+  };
+  // BUDGET_MS === null means catch-up: no wall-clock cap on this sweep,
+  // mirroring the main stale loop's own --catch-up handling below.
+  const overBudget = (): boolean => BUDGET_MS != null && Date.now() - startedAt > BUDGET_MS;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    if (isAborted(signal)) break;
+    if (overBudget()) { budgetExceeded = true; break; }
+    const batch = await observed(activePacer, () => engine.listChunklessPagesWithContent({
+      batchSize: BATCH_SIZE,
+      ...(afterPageId != null && { afterPageId }),
+      ...(sourceId && { sourceId }),
+    }));
+    if (batch.length === 0) break;
+    afterPageId = batch[batch.length - 1].id;
+
+    for (const page of batch) {
+      if (isAborted(signal)) break;
+      if (overBudget()) { budgetExceeded = true; break; }
+
+      try {
+        if (dryRun) {
+          // dryRun never writes, so there's no live-refetch race to close —
+          // chunk the listed snapshot directly (matches embedPage's own
+          // dry-run, which chunks whatever getPage returned at call time).
+          const inputs = buildInputs(page.compiled_truth, page.timeline);
+          // Whitespace-only content (SQL prefilter is `<> ''`, not
+          // trim-aware) chunks to nothing — matches embedPage's contract.
+          if (inputs.length === 0) continue;
+          result.total_chunks += inputs.length;
+          result.would_embed += inputs.length;
+          result.pages_processed++;
+          pagesHealed++;
+          continue;
+        }
+
+        // Re-fetch the LIVE page + re-check chunks immediately before
+        // writing (see race note above): chunk CURRENT content, and skip
+        // rather than clobber if a concurrent writer already chunked this
+        // page since we listed it.
+        const [livePage, stillChunkless] = await Promise.all([
+          observed(activePacer, () => engine.getPage(page.slug, { sourceId: page.source_id })),
+          observed(activePacer, () => engine.getChunks(page.slug, { sourceId: page.source_id })),
+        ]);
+        if (!livePage || stillChunkless.length > 0) continue;
+        const inputs = buildInputs(livePage.compiled_truth, livePage.timeline);
+        if (inputs.length === 0) continue;
+
+        await observed(activePacer, () =>
+          engine.upsertChunks(page.slug, inputs, { sourceId: page.source_id }),
+        );
+        pagesHealed++;
+        try {
+          await activePacer.pace(signal);
+        } catch (e) {
+          if (!(e instanceof AbortError)) throw e;
+        }
+      } catch (e) {
+        if (isAborted(signal)) break;
+        recordFailure(result, 1, page.slug, e);
+        serr(`\n  [embed] chunkless-page heal failed for ${page.slug}: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+
+    if (budgetExceeded || batch.length < BATCH_SIZE) break;
+  }
+
+  result.chunkless_pages_healed = pagesHealed;
+  if (pagesHealed > 0 && !quiet) {
+    if (dryRun) {
+      serr(`[embed] [dry-run] would chunk ${pagesHealed} page(s) with non-empty content but zero content_chunks rows`);
+    } else {
+      serr(`[embed] chunked ${pagesHealed} page(s) that had non-empty content but zero content_chunks rows (embedding them in this pass)`);
+    }
+  }
+  if (budgetExceeded && !quiet) {
+    serr(`[embed] chunkless-page sweep hit its time budget (${BUDGET_MS}ms) with more pages left; re-run embed --stale to continue healing them`);
+  }
+}
+
+/**
  * SQL-side stale path: replaces the listPages + per-page getChunks
  * walk with a count + slug-grouped SELECT. Preserves the existing
  * functional contract (every chunk where embedding IS NULL gets
@@ -1028,10 +1345,37 @@ async function embedAllStale(
   signature?: string,
   externalSignal?: AbortSignal,
 ) {
+  // Shared wall-clock anchor (review catch): the healing sweep below and the
+  // main stale loop's own budget timer (further down) both measure against
+  // this SAME start time, so a run's total wall-clock spend stays capped at
+  // ONE `GBRAIN_EMBED_TIME_BUDGET_MS` window instead of summing two
+  // independent 30-minute budgets.
+  const overallStartedAt = Date.now();
+
   // D7: thread sourceId so source-scoped runs only count + visit
   // that source's NULL embeddings.
   const sourceOpt = sourceId ? { sourceId } : undefined;
   const includeNullSig = !!staleOpts?.includeNullSignature;
+
+  // Chunkless-page safety net: pre-flight count mirrors the countStaleChunks
+  // short-circuit just below — a healthy brain pays one extra SELECT
+  // count(*) and does no further work. Only when pages are actually found
+  // do we pay for the keyset-paginated chunk sweep. Chunking here (before
+  // countStaleChunks) means any newly-written NULL-embedding chunks flow
+  // into the SAME pass via the existing cursor.
+  const chunklessCount = await engine.countChunklessPagesWithContent(sourceOpt);
+  if (chunklessCount > 0) {
+    await healChunklessPages(
+      engine, sourceId, dryRun, result, staleOpts?.quiet, externalSignal, staleOpts?.pacer,
+      overallStartedAt, !!staleOpts?.catchUp,
+    );
+  }
+  // Review catch: an abort during healing must stop the run HERE, before
+  // falling through into invalidateStaleSignatureEmbeddings below (which —
+  // pre-existing, unchanged by this PR — does not itself check
+  // externalSignal). Without this, a caller-cancelled run could still NULL
+  // out signature-drifted embeddings and exit, leaving retrieval degraded.
+  if (isAborted(externalSignal)) return;
 
   // v0.41.31: re-embed pages whose embedding_signature drifted (model/dims
   // swap). dry-run must NOT mutate, so it counts signature-stale via the
@@ -1085,7 +1429,15 @@ async function embedAllStale(
   if (staleCount === 0) {
     if (!staleOpts?.quiet) {
       if (dryRun) {
-        slog('[dry-run] Would embed 0 chunks (0 stale found)');
+        // dryRun never writes, so a healed-but-hypothetical chunkless page's
+        // chunks never land in content_chunks and staleCount can't see them
+        // — report result.would_embed (already includes them) instead of a
+        // bare "0 chunks" that would contradict the returned EmbedResult.
+        if (result.would_embed > 0) {
+          slog(`[dry-run] Would embed ${result.would_embed} chunks (0 stale found; ${result.chunkless_pages_healed} chunkless page(s) would be chunked)`);
+        } else {
+          slog('[dry-run] Would embed 0 chunks (0 stale found)');
+        }
       } else {
         slog('Embedded 0 chunks (0 stale found)');
       }
@@ -1101,7 +1453,16 @@ async function embedAllStale(
     // made `embed.pages` claim total:1 next to a summary naming a much larger
     // stale count. docs/progress-events.md allows omitting `total` when it is
     // not known up front; it does not allow asserting a wrong one.
-    if (!staleOpts?.quiet) slog(`[dry-run] Would embed ${staleCount} stale chunks`);
+    //
+    // Log result.would_embed (staleCount + any chunkless-page-healing
+    // contribution from above), not the bare staleCount — otherwise this
+    // line understates the total whenever chunkless pages were also found.
+    if (!staleOpts?.quiet) {
+      const chunklessNote = result.chunkless_pages_healed > 0
+        ? `, including ${result.chunkless_pages_healed} chunkless page(s)`
+        : '';
+      slog(`[dry-run] Would embed ${result.would_embed} stale chunks${chunklessNote}`);
+    }
     return;
   }
 
@@ -1132,9 +1493,12 @@ async function embedAllStale(
     ? null
     : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
   const budgetController = new AbortController();
-  const budgetStart = Date.now();
+  // Shares overallStartedAt with the chunkless-page healing sweep above
+  // (review catch) so the two phases draw from ONE combined budget window
+  // instead of each getting a fresh 30 minutes.
+  const budgetStart = overallStartedAt;
   let budgetTimer = BUDGET_MS != null
-    ? setTimeout(() => budgetController.abort(), BUDGET_MS)
+    ? setTimeout(() => budgetController.abort(), Math.max(0, budgetStart + BUDGET_MS - Date.now()))
     : undefined;
   // E-4 (paced-backfill): the budget measures WORK, not waiting. After each
   // batch, re-arm the timer to fire at start + BUDGET + total-paced-sleep, so a

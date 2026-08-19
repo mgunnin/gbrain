@@ -13,6 +13,7 @@ import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import * as db from '../../src/core/db.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
 import { parseMarkdown } from '../../src/core/markdown.ts';
+import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 
 // Load .env.testing if present
 const envPath = resolve(import.meta.dir, '../../.env.testing');
@@ -67,38 +68,11 @@ export function hasDatabase(): boolean {
 }
 
 /**
- * Production guard: setupDB() TRUNCATEs every data table on whatever
- * DATABASE_URL points at, and run-e2e.sh deliberately preserves an exported
- * DATABASE_URL — so a developer with a production URL in their environment
- * would wipe their real brain by running the suite. Refuse unless the
- * database name identifies itself as a test database ("test" as a word
- * segment, e.g. gbrain_test — the CI/.env.testing.example convention), or
- * the operator explicitly opts the exact name in via GBRAIN_E2E_ALLOW_DB.
- *
- * Exported for unit testing; pure — no connection is made.
+ * Production guard, moved to test/helpers/db-guard.ts so test files outside
+ * test/e2e/ can import it without loading this module. Re-exported here for
+ * existing call sites (setupDB below, test/e2e/db-guard.test.ts).
  */
-export function assertSafeE2eDatabaseUrl(
-  url: string,
-  env: Record<string, string | undefined> = process.env,
-): void {
-  let dbName: string;
-  try {
-    dbName = decodeURIComponent(new URL(url).pathname.replace(/^\//, ''));
-  } catch {
-    throw new Error(`E2E guard: DATABASE_URL is not a parseable URL; refusing to run destructive setup.`);
-  }
-  if (!dbName) {
-    throw new Error(`E2E guard: DATABASE_URL has no database name; refusing to run destructive setup.`);
-  }
-  if (/(^|[_-])test([_-]|$)/i.test(dbName)) return;
-  if (env.GBRAIN_E2E_ALLOW_DB && env.GBRAIN_E2E_ALLOW_DB === dbName) return;
-  throw new Error(
-    `E2E guard: database "${dbName}" does not look like a test database ` +
-    `(expected "test" as a name segment, e.g. gbrain_test). setupDB() would ` +
-    `TRUNCATE every data table in it. If this is intentional, set ` +
-    `GBRAIN_E2E_ALLOW_DB=${dbName} to opt in explicitly.`,
-  );
-}
+export { assertSafeE2eDatabaseUrl };
 
 /**
  * Connect to DB, run schema init, truncate all tables.
@@ -135,6 +109,26 @@ export async function setupDB(): Promise<PostgresEngine> {
     INSERT INTO config (key, value) VALUES ('schema_version', '1')
     ON CONFLICT (key) DO NOTHING
   `);
+
+  // Reset leaked brain identity: `sources` is not in ALL_TABLES (the default
+  // row must survive), but rows/columns written by earlier files or runs
+  // persist. writeSyncAnchor's ownership guard (#3735) keys on
+  // sources.default.local_path — a stale value from another test makes every
+  // legacy-path performSync classify as first_sync forever. 42P01-tolerant
+  // like the TRUNCATE loop above.
+  try {
+    await conn.unsafe(`DELETE FROM sources WHERE id <> 'default'`);
+    // Only the sync-identity columns: local_path feeds writeSyncAnchor's
+    // ownership guard (#3735) and last_commit/last_sync_at feed first_sync
+    // classification. chunker_version is deliberately left alone — NULLing
+    // it flips extraction-staleness semantics for unrelated suites.
+    await conn.unsafe(
+      `UPDATE sources SET local_path = NULL, last_commit = NULL, last_sync_at = NULL WHERE id = 'default'`,
+    );
+  } catch (e: unknown) {
+    const code = (e as { code?: string })?.code;
+    if (code !== '42P01' && code !== '42703') throw e; // missing table/column on older schemas
+  }
 
   engine = new PostgresEngine();
   await engine.connect({ database_url: DATABASE_URL });

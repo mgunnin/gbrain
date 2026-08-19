@@ -77,6 +77,7 @@ export async function acquireLease(
   return engine.transaction(async (tx) => {
     // txn-scoped advisory lock keyed on the rate-lease key name. Released
     // automatically when the txn commits/rolls back.
+    // Lock-census (PR6 D5): INTENTIONALLY not source-keyed — a rate lease meters a shared external resource (per lease key, e.g. provider concurrency) brain-wide, not per source.
     await tx.executeRaw(`SELECT pg_advisory_xact_lock($1::bigint)`, [lockKey.toString()]);
 
     // Pre-prune stale leases for this key.
@@ -149,4 +150,28 @@ export async function renewLeaseWithBackoff(engine: BrainEngine, leaseId: number
     }
   }
   return false;
+}
+
+/**
+ * Thrown when acquireLease returns acquired=false. The worker and the inline
+ * dream drain both recognize it and requeue WITHOUT burning an attempt
+ * (lease-full is a scheduling condition, not a failure). Lives here — the
+ * lease layer — because subagent.ts, subagent-oneshot.ts, worker.ts and
+ * inline-drain.ts all need it and a handler file is a poor home for a
+ * cross-cutting error type (subagent.ts re-exports it for compatibility).
+ */
+export class RateLeaseUnavailableError extends Error {
+  constructor(public key: string, public active: number, public max: number) {
+    super(`rate lease "${key}" full (${active}/${max})`);
+    this.name = 'RateLeaseUnavailableError';
+  }
+}
+
+/**
+ * Shared lease-full requeue backoff (1-3s jittered): "yield the slot, try
+ * again soon" — one definition so worker.ts and inline-drain.ts cannot
+ * silently desync.
+ */
+export function leaseFullBackoffMs(): number {
+  return 1000 + Math.floor(Math.random() * 2000);
 }

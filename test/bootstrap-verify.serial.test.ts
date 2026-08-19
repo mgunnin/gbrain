@@ -141,6 +141,8 @@ describe('verifyWorkspace — keyless pass', () => {
     expect(check(res.checks, 'secret_scan')[0].ok).toBe(true);
     expect(check(res.checks, 'deny_globs')[0].ok).toBe(true);
     expect(check(res.checks, 'repo_privacy')[0].ok).toBe(true); // local-only
+    // execution_env is informational and NEVER gates [D-cloud].
+    expect(check(res.checks, 'execution_env')[0].ok).toBe(true);
     for (const c of check(res.checks, 'roundtrip')) expect(c.ok).toBe(true);
     expect(check(res.checks, 'graph_floor')[0].ok).toBe(true);
     expect(check(res.checks, 'magic_moment')[0].ok).toBe(true);
@@ -156,9 +158,25 @@ describe('verifyWorkspace — keyless pass', () => {
     }
     expect(res.tour).toEqual([...FIRST_RUN_TOUR]);
 
+    // The OOBE hand-off block prints after the tour on PASS: ownership (this
+    // ws has no origin remote → the local-only variant with the repo upgrade
+    // path) and the ONE next action (the cold-start skill via ClawVisor).
+    expect(res.report).toContain('What you own');
+    expect(res.report).toContain('gbrain bootstrap repo');
+    expect(res.report).toContain('cold-start');
+    expect(res.report).toContain('ClawVisor');
+    expect(res.handoff.length).toBeGreaterThan(0);
+
     // Probe cleanup [G13]: pages, files, and the reconciled fact are gone.
     expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_SLUG}.md`))).toBe(false);
     expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_ENTITY_SLUG}.md`))).toBe(false);
+    // Tombstone-proof: the cleanup HARD-deletes via engine.deletePage — a
+    // soft delete (deleted_at tombstone) would leave these rows countable.
+    const probeRows = await engine.executeRaw<{ n: string }>(
+      `SELECT count(*)::text AS n FROM pages WHERE slug = ANY($1::text[])`,
+      [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+    );
+    expect(probeRows[0].n).toBe('0');
     const facts = await engine.executeRaw<{ fact: string }>(
       `SELECT fact FROM facts WHERE source_id = $1 AND fact LIKE $2`,
       ['workspace', `%${VERIFY_MAGIC_TOKEN}%`],
@@ -247,6 +265,21 @@ describe('verifyWorkspace — keyless pass', () => {
       expect(scan.detail).not.toContain('sk-AAAAAAAAAAAAAAAAAAAAAAAA');
 
       expect(res.ok).toBe(false);
+
+      // Tour gating on FAIL: the report says fix-first and withholds the
+      // celebration prompts ("broken, but go enjoy it" is a mixed signal) …
+      expect(res.report).toContain('Fix the FAIL checks above');
+      expect(res.report).not.toContain('Who am I to you?');
+      // … the hand-off block is withheld with the tour (celebrating ownership
+      // of a FAILED install is the same mixed signal) …
+      expect(res.report).not.toContain('What you own');
+      expect(res.report).not.toContain('cold-start');
+      // … while the returned tour + handoff arrays stay unconditional so
+      // machine consumers (--json) keep a stable shape, and the check names
+      // the gate.
+      expect(res.tour).toEqual([...FIRST_RUN_TOUR]);
+      expect(res.handoff.length).toBeGreaterThan(0);
+      expect(check(res.checks, 'first_run_tour')[0].detail).toContain('withheld');
     } finally {
       rmSync(githubPath, { force: true });
       writeFileSync(userPath, userOriginal);

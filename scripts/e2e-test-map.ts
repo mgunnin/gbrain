@@ -34,6 +34,12 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/openclaw-context-engine-plugin.test.ts",
     "test/e2e/openclaw-plugin-load-real.test.ts",
   ],
+  // claw-test harness (command + core: runners, scenarios, seeding, friction
+  // merge) feeds the scripted + shim-live E2E. The hermes door
+  // (install-real-hermes.serial.test.ts) is deliberately NOT mapped — it is
+  // opt-in-gated (GBRAIN_REAL_HERMES_E2E) and self-skips in run-all anyway.
+  "src/commands/claw-test.ts": ["test/e2e/claw-test.test.ts"],
+  "src/core/claw-test/**": ["test/e2e/claw-test.test.ts"],
   // dream.ts is a thin alias over runCycle in cycle.ts.
   "src/core/cycle.ts": ["test/e2e/cycle.test.ts", "test/e2e/dream.test.ts"],
   // Multi-source sync writes share the per-source bookmark anchor.
@@ -81,6 +87,21 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/engine-parity.test.ts",
     "test/e2e/schema-drift.test.ts",
   ],
+  // Engine method modules peeled from the façades carry the same blast
+  // radius as the façades themselves.
+  "src/core/postgres-engine/**": [
+    "test/e2e/postgres-bootstrap.test.ts",
+    "test/e2e/postgres-jsonb.test.ts",
+    "test/e2e/jsonb-roundtrip.test.ts",
+    "test/e2e/engine-parity.test.ts",
+    "test/e2e/schema-drift.test.ts",
+    "test/e2e/migrate-embeddings-postgres.test.ts",
+  ],
+  "src/core/pglite-engine/**": [
+    "test/e2e/postgres-bootstrap.test.ts",
+    "test/e2e/engine-parity.test.ts",
+    "test/e2e/schema-drift.test.ts",
+  ],
   // Schema source of truth: any change must pass the cross-engine drift gate.
   "src/schema.sql": ["test/e2e/schema-drift.test.ts"],
   "src/core/pglite-schema.ts": ["test/e2e/schema-drift.test.ts"],
@@ -100,6 +121,8 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/migration-flow.test.ts",
   ],
   "src/commands/doctor.ts": ["test/e2e/doctor-progress.test.ts"],
+  // Doctor check modules peeled from doctor.ts feed the same e2e surface.
+  "src/commands/doctor/**": ["test/e2e/doctor-progress.test.ts"],
   // Knowledge graph layer feeds graph-quality.
   "src/core/link-extraction.ts": ["test/e2e/graph-quality.test.ts"],
   // v0.38 ingestion substrate. POST /ingest lives inside serve-http.ts

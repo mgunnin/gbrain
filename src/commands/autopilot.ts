@@ -19,11 +19,17 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, utimesSync, unlinkSync, chmodSync, statSync } from 'fs';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
-import { join, dirname } from 'path';
+import { detectExecutionEnvironment } from '../core/execution-env.ts';
+import { join, dirname, isAbsolute } from 'path';
 import { execSync } from 'child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadPreferences } from '../core/preferences.ts';
 import { loadConfig, loadConfigFileOnly, saveConfig, gbrainPath as gbrainHomePath } from '../core/config.ts';
+import {
+  classifyAutopilotLockHolder,
+  type AutopilotLockProbeDeps,
+  isPidAlive,
+} from '../core/autopilot-lock.ts';
 import { ChildWorkerSupervisor } from '../core/minions/child-worker-supervisor.ts';
 import { VERSION } from '../version.ts';
 import {
@@ -40,6 +46,11 @@ import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { inspectLock } from '../core/db-lock.ts';
 import { registerCleanup } from '../core/process-cleanup.ts';
 import { resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
+import {
+  autopilotRemediationIdempotencyKey,
+  shouldRunAutopilotFullCycle,
+  shouldSleepHealthyAutopilot,
+} from './autopilot-remediation-policy.ts';
 // Path helpers live in a LEAF core module so other commands (gbrain migrate)
 // can read the daemon's state files without importing this one — a dynamic
 // import of a command module drags its whole flag surface into the importer's
@@ -140,40 +151,86 @@ function logError(phase: string, e: unknown) {
 }
 
 /**
+ * Enumerate %PATH% (Windows) for the gbrain CLI shim, honoring PATHEXT.
+ *
+ * On win32 this is the FIRST resolution path (`which` does not exist in
+ * cmd/PowerShell); resolveGbrainCliPath calls it before the execPath and
+ * argv[1] fallbacks. Unlike `where`, this NEVER looks at the current
+ * directory, so a stray gbrain.exe in cwd cannot hijack resolution. Only
+ * directly spawnable extensions (.exe/.com/.cmd/.bat) are accepted, and
+ * only regular files - a directory named gbrain.exe cannot shadow a real
+ * binary. Returns the first existing candidate, or '' when none exists.
+ */
+export function resolveWindowsCliPath(): string {
+  const pathext = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';');
+  const pathDirs = (process.env.PATH ?? '').split(';');
+  for (const dir of pathDirs) {
+    // Skip empty and relative entries: '.' or 'bin' resolve against the
+    // current directory, which would reintroduce the cwd-hijack `where`
+    // has. Only absolute %PATH% entries are trusted.
+    if (!dir || !isAbsolute(dir)) continue;
+    for (const ext of pathext) {
+      // Only directly spawnable types: PATHEXT can also carry .JS/.VBS
+      // (Windows Script Host), which Bun cannot exec - spawning them fails
+      // EFTYPE. .CMD/.BAT spawn through the shell; .COM/.EXE direct.
+      const type = ext.toLowerCase();
+      if (type !== '.exe' && type !== '.com' && type !== '.cmd' && type !== '.bat') continue;
+      const candidate = join(dir, 'gbrain' + type);
+      try {
+        if (statSync(candidate).isFile()) return candidate;
+      } catch { /* missing or unreadable - keep looking */ }
+    }
+  }
+  return '';
+}
+
+/**
  * Resolve the gbrain CLI entrypoint for spawning the worker child.
  *
- * A .ts source path is never a valid spawn target — spawning it fails with
+ * A .ts source path is never a valid spawn target - spawning it fails with
  * EACCES because TypeScript source isn't executable. The canonical install
  * puts a shim at `/usr/local/bin/gbrain` (or wherever `which gbrain`
  * resolves to) that already wraps the right runtime+entrypoint; prefer it.
  *
  * Order of resolution:
- *   1. `which gbrain` — the shim on PATH, canonical for installed builds.
+ *   1. Platform PATH lookup - `which gbrain` on POSIX; explicit %PATH%
+ *      enumeration (resolveWindowsCliPath) on win32, where `which` does
+ *      not exist (#3793).
  *   2. process.execPath if it ends with /gbrain (compiled binary, no shim).
  *   3. argv[1] if it ends with /gbrain (e.g., direct invocation of compiled
  *      binary without PATH). Never .ts source paths.
  *   4. Throw with a clear install hint.
  */
 export function resolveGbrainCliPath(): string {
-  try {
-    // #2747: `env: process.env` is required under Bun. Bun's execSync
-    // snapshots process.env at Bun's OWN startup, not at call time — a
-    // runtime PATH mutation (dotenv/config loading, shell-profile sourcing
-    // in a wrapper, etc.) happening between Bun boot and this call is
-    // invisible to `which` without explicitly forwarding the current env.
-    // This is why "which gbrain" succeeds when run standalone (fresh Bun
-    // process, no prior mutation) but can fail from inside autopilot's own
-    // process at this exact call site. Same fix already applied to
-    // detectTini() in spawn-helpers.ts (see its comment) — this call site
-    // was missed.
-    const which = execSync('which gbrain', {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      env: process.env,
-    }).trim();
-    if (which) return which;
-  } catch { /* not on $PATH — fall through */ }
-
+  // #3793: `which` does not exist in cmd or PowerShell on Windows, so the
+  // bun-installed gbrain.exe shim on %PATH% was never found and autopilot
+  // died with "Could not resolve the gbrain CLI path". `where` would find
+  // it but has a cwd-hijack; use explicit %PATH% enumeration on win32.
+  if (process.platform === 'win32') {
+    const win = resolveWindowsCliPath();
+    if (win) return win;
+  } else {
+    try {
+      // #2747: `env: process.env` is required under Bun. Bun's execSync
+      // snapshots process.env at Bun's OWN startup, not at call time - a
+      // runtime PATH mutation (dotenv/config loading, shell-profile sourcing
+      // in a wrapper, etc.) happening between Bun boot and this call is
+      // invisible to `which` without explicitly forwarding the current env.
+      // This is why "which gbrain" succeeds when run standalone (fresh Bun
+      // process, no prior mutation) but can fail from inside autopilot's own
+      // process at this exact call site. Same fix already applied to
+      // detectTini() in spawn-helpers.ts (see its comment) - this call site
+      // was missed.
+      const which = execSync('which gbrain', {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: process.env,
+      })
+        .trim()
+        .split(/\r?\n/, 1)[0];
+      if (which) return which;
+    } catch { /* not on $PATH - fall through */ }
+  }
   const exec = process.execPath ?? '';
   if (exec.endsWith('/gbrain') || exec.endsWith('\\gbrain.exe')) {
     return exec;
@@ -193,24 +250,26 @@ export function resolveGbrainCliPath(): string {
       `Debug: PATH=${JSON.stringify(process.env.PATH ?? '')} execPath=${JSON.stringify(exec)} argv1=${JSON.stringify(arg1)}`,
   );
 }
-
 export function shouldSpawnAutopilotWorker(args: string[]): boolean {
   return !args.includes('--no-worker');
 }
 
-export function isPidAlive(pid: number): boolean {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
+export { isPidAlive };
+
+export const AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS = 10 * 60 * 1000;
+
+function autopilotLockAgeMs(lockPath: string): number | null {
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error: unknown) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
+    return Date.now() - statSync(lockPath).mtimeMs;
+  } catch {
+    return null;
   }
 }
 
 export function decideLockAcquisition(
   lockPath: string,
   currentPid: number,
+  deps: AutopilotLockProbeDeps = {},
 ): { action: 'acquire' } | { action: 'exit'; holderPid: number } | { action: 'takeover'; reason: string } {
   if (!existsSync(lockPath)) return { action: 'acquire' };
 
@@ -222,10 +281,21 @@ export function decideLockAcquisition(
   }
 
   const holderPid = Number.parseInt(raw, 10);
-  const sameProcess = Number.isFinite(holderPid) && holderPid === currentPid;
-  const alive = !sameProcess && isPidAlive(holderPid);
+  const holder = classifyAutopilotLockHolder(holderPid, currentPid, deps);
 
-  if (alive) return { action: 'exit', holderPid };
+  if (holder.state === 'alive-autopilot' || holder.state === 'alive-unknown') {
+    return { action: 'exit', holderPid };
+  }
+  if (holder.state === 'alive-foreign') {
+    const lockAgeMs = autopilotLockAgeMs(lockPath);
+    if (lockAgeMs !== null && lockAgeMs >= AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS) {
+      return { action: 'takeover', reason: `foreign pid ${raw || '<empty>'} with stale lock` };
+    }
+    return { action: 'exit', holderPid };
+  }
+  if (holder.state === 'self') {
+    return { action: 'takeover', reason: `own pid ${raw || '<empty>'}` };
+  }
   return { action: 'takeover', reason: `dead pid ${raw || '<empty>'}` };
 }
 
@@ -498,8 +568,9 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   // brain. Two exit paths must both close the engine:
   //   - autopilot's own shutdown() below (owns SIGINT + internal stops like
   //     max_crashes / cycle-failure-cap), and
-  //   - process-cleanup's SIGTERM handler (installed at cli.ts module load;
-  //     it runs the cleanup registry with a 3s deadline and then exits) —
+  //   - process-cleanup's SIGTERM handler (installed inside cli.ts's
+  //     import.meta.main seam before main() dispatches; it runs the cleanup
+  //     registry with a 3s deadline and then exits) —
   //     which is why closeEngine is ALSO registered there.
   // closeEngine aborts the in-flight inline cycle (runCycle checks the
   // signal between phases and threads it into phase sub-work), gives it a
@@ -829,8 +900,8 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
       //
       // New logic: compute the remediation plan (cheap; no full doctor
       // walk), then route to the right level of intervention:
-      //   - Score >= 95 + empty plan: full cycle every 60min (phase-
-      //     coupling exercise), otherwise sleep.
+      //   - Full cycle every 60min regardless of score/plan (phase-
+      //     coupling + freshness invariant); healthy brains sleep before it.
       //   - Small plan (<=3 steps, <5min): submit individual handlers.
       //   - Large plan or low score: full autopilot-cycle (the hammer).
       //
@@ -1075,16 +1146,16 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         const estTotal = plan.reduce((s, r) => s + r.est_seconds, 0);
 
         // Track time since last full cycle for the 60-min floor.
-        const FULL_CYCLE_FLOOR_MIN = 60;
         const minutesSinceLastFull = (Date.now() - lastFullCycleAt) / 60000;
 
-        const shouldFullCycle =
-          (score >= 95 && plan.length === 0 && minutesSinceLastFull >= FULL_CYCLE_FLOOR_MIN) ||
-          plan.length > 3 ||
-          estTotal >= 300 ||
-          score < 70;
+        const shouldFullCycle = shouldRunAutopilotFullCycle({
+          score,
+          planLength: plan.length,
+          estimatedSeconds: estTotal,
+          minutesSinceLastFull,
+        });
 
-        const shouldSleep = score >= 95 && plan.length === 0 && minutesSinceLastFull < FULL_CYCLE_FLOOR_MIN;
+        const shouldSleep = shouldSleepHealthyAutopilot(score, plan.length, minutesSinceLastFull);
 
         if (shouldSleep) {
           if (jsonMode) {
@@ -1135,13 +1206,23 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
               if (jsonMode) process.stderr.write(JSON.stringify({ event: 'global_maintenance_dispatch_failed', error: e instanceof Error ? e.message : String(e) }) + '\n');
             }
           }
-          if (result.dispatched.length > 0 || result.legacy_fallback) {
+          // On restart the process-local clock starts overdue. If persisted
+          // source timestamps say every source is fresh, advance the local
+          // clock too; otherwise a non-empty targeted plan would be skipped
+          // on every tick until the persisted 60-minute window elapsed.
+          // Coalesced counts as work-in-flight: before dispatched/coalesced
+          // split, a coalesced submission advanced this clock via dispatched —
+          // keep that behavior, or an all-coalesced tick (single-flight
+          // suppression) would retake the full-cycle branch every tick and
+          // starve the targeted-plan path for the whole in-flight window.
+          if (result.dispatched.length > 0 || result.coalesced.length > 0 || result.legacy_fallback || result.all_sources_fresh) {
             lastFullCycleAt = Date.now();
           }
           if (jsonMode) {
             process.stderr.write(JSON.stringify({
               event: 'fanout_summary',
               dispatched: result.dispatched,
+              coalesced: result.coalesced,
               skipped_fresh: result.skipped_fresh,
               skipped_cap: result.skipped_cap,
               skipped_cooldown: result.skipped_cooldown,
@@ -1151,7 +1232,8 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             }) + '\n');
           } else if (!result.legacy_fallback) {
             console.log(
-              `[dispatch] fanout: ${result.dispatched.length} dispatched, ` +
+              `[dispatch] fanout: ${result.dispatched.length} dispatched` +
+              `${result.coalesced.length > 0 ? ` (${result.coalesced.length} coalesced onto in-flight)` : ''}, ` +
               `${result.skipped_fresh.length} fresh, ${result.skipped_cap.length} capped, ` +
               `${result.skipped_cooldown.length} cooldown ` +
               `(score=${score}, max=${fanoutMax})`,
@@ -1159,15 +1241,17 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           }
         } else {
           // Small targeted plan — submit individual handlers per step.
-          // D9 content-hash idempotency keys (from computeRecommendations).
-          // maxWaiting:1 per submit per codex #17 (closes the backpressure
-          // gap the prior implementation had for targeted submits).
+          // Recommendation keys stay stable for doctor/remediate checkpoints;
+          // Autopilot adds the dispatch interval so completed rows cannot hold
+          // the remediation slot forever (#4046).
+          // maxWaiting:1 per submit per codex #17 bounds the cross-window
+          // backlog if a targeted handler runs longer than one interval.
           for (const step of plan) {
             try {
               const isProtected = !!step.protected;
               const submitOpts = {
                 queue: 'default',
-                idempotency_key: step.idempotency_key,
+                idempotency_key: autopilotRemediationIdempotencyKey(step.idempotency_key, slot),
                 max_attempts: 2,
                 timeout_ms: timeoutMs,
                 maxWaiting: 1,
@@ -1178,7 +1262,16 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                 submitOpts,
                 isProtected ? { allowProtectedSubmit: true } : undefined,
               );
-              if (jsonMode) {
+              // Honest-dispatch contract (same as the fanout paths): a
+              // coalesced submission never claims a dispatch that didn't
+              // insert a row.
+              if (job.coalesced) {
+                if (jsonMode) {
+                  process.stderr.write(JSON.stringify({ event: 'dispatch_coalesced', job_id: job.id, mode: 'targeted', step: step.id, score, plan_size: plan.length }) + '\n');
+                } else {
+                  console.log(`[dispatch] coalesced onto job #${job.id} ${step.job} (targeted: ${step.id}; already in flight)`);
+                }
+              } else if (jsonMode) {
                 process.stderr.write(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'targeted', step: step.id, score, plan_size: plan.length }) + '\n');
               } else {
                 console.log(`[dispatch] job #${job.id} ${step.job} (targeted: ${step.id}; score=${score})`);
@@ -1399,13 +1492,10 @@ export type InstallTarget = 'macos' | 'linux-systemd' | 'ephemeral-container' | 
 export function detectInstallTarget(): InstallTarget {
   if (process.platform === 'darwin') return 'macos';
 
-  const ephemeral = !!(
-    process.env.RENDER
-    || process.env.RAILWAY_ENVIRONMENT
-    || process.env.FLY_APP_NAME
-    || existsSync('/.dockerenv')
-  );
-  if (ephemeral) return 'ephemeral-container';
+  // Shared detector (execution-env.ts): covers the original Render/Railway/
+  // Fly//.dockerenv signals AND the cloud-sandbox signature — both get the
+  // start-script treatment here (no reliable scheduler in either).
+  if (detectExecutionEnvironment() !== 'local') return 'ephemeral-container';
 
   if (existsSync('/run/systemd/system')) {
     try {

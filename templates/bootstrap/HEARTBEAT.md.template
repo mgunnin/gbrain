@@ -32,6 +32,7 @@ enable two jobs in the same session; you cannot tell which one earned its keep.
 | memory-prune | weekly-equivalent | no | The MEMORY.md maintenance ritual (promote / demote / cut). |
 | brain-hygiene | weekly-equivalent | no | `gbrain doctor`; relay anything red. |
 | morning-briefing | first session after 06:00 | no | One screen: due today, waiting on, worth knowing. No filler — a skipped briefing costs less than an empty one. |
+| ambient-delta | every session start + turn boundary | no | `gbrain delta --session-id <thread> --budget-tokens 2000` — pull "what changed since my last wake" (new/updated pages, new facts, thread updates), deduped per session. Zero-LLM. Inject the returned block; stay silent when empty. Pair with `gbrain context-pack --entities <standing> --budget-tokens 4000` at session start / after compaction to warm context. See docs/guides/ambient-recall.md. |
 
 Cadence bookkeeping lives in `state/heartbeat-state.local.json` (machine-local,
 not committed).

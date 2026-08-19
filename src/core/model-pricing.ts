@@ -82,6 +82,16 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   // slot A from the --max-usd pre-flight and est_cost_usd audit rows.
   'openai:gpt-5.2':                       { input:  1.25, output: 10.00 },
   'openai:gpt-5.5':                       { input:  4.00, output: 16.00 },
+  // gpt-5.6 family (GA 2026-07-09; rates cross-checked 2026-08-17 across
+  // aggregator trackers — re-verify against platform.openai.com/pricing at
+  // next release). The bare `gpt-5.6` id is OpenAI's rolling alias for the
+  // family flagship (sol). These rows are LOAD-BEARING for latest-model
+  // discovery (src/core/ai/openai-latest.ts): only priced ids are eligible
+  // as defaults, so budget caps never fail closed on a discovered model.
+  'openai:gpt-5.6':                       { input:  5.00, output: 30.00 },
+  'openai:gpt-5.6-sol':                   { input:  5.00, output: 30.00 },
+  'openai:gpt-5.6-terra':                 { input:  2.50, output: 15.00 },
+  'openai:gpt-5.6-luna':                  { input:  1.00, output:  6.00 },
 
   // ── Google ─────────────────────────────────────────────────────────────
   // `gemini-1.5-pro` was retired by Google (#3510); kept so historical
@@ -131,5 +141,25 @@ export function canonicalLookup(
   const { provider, model } = splitProviderModelId(modelId);
   if (!model) return undefined;
   const key = provider ? `${provider}:${model}` : `anthropic:${model}`;
-  return CANONICAL_PRICING[key];
+  const normalized = CANONICAL_PRICING[key];
+  if (normalized) return normalized;
+  // 3. #4123 (TODOS P3 case-sensitivity): case-insensitive fallback, folding
+  //    BOTH sides — some canonical keys carry cased model tails verbatim
+  //    (Llama-3.3-70B-...), so folding only the probe would miss those. Exact
+  //    matches above stay first, so all-lowercase lookups pay nothing new.
+  //    Safe only while no two canonical keys collide case-insensitively —
+  //    pinned by test/model-pricing.test.ts.
+  const folded = canonicalFoldedView();
+  return folded[modelId.toLowerCase()] ?? folded[key.toLowerCase()];
+}
+
+let _canonicalFoldedView: Record<string, ModelPricing> | null = null;
+function canonicalFoldedView(): Record<string, ModelPricing> {
+  if (!_canonicalFoldedView) {
+    _canonicalFoldedView = {};
+    for (const [k, v] of Object.entries(CANONICAL_PRICING)) {
+      _canonicalFoldedView[k.toLowerCase()] = v;
+    }
+  }
+  return _canonicalFoldedView;
 }

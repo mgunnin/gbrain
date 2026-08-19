@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
 import { bootstrapDoctorChecks, type Check } from '../src/commands/doctor.ts';
+import { writeHarnessReceipt } from '../src/core/bootstrap/format.ts';
 import { LATEST_VERSION } from '../src/core/migrate.ts';
 import { VERSION } from '../src/version.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -134,6 +135,95 @@ describe('no-bootstrap-state gate', () => {
     writeHeartbeat(home, [{ outcome: 'ok' }]);
     const checks = await run(parent);
     expect(byName(checks, 'bootstrap_hooks_heartbeat')?.status).toBe('ok');
+  }, T);
+
+  test('a harness receipt ALONE opens the gate (#4043 — harness-only boxes get checks)', async () => {
+    const { parent, home } = makeHome();
+    writeHarnessReceipt(home, harnessReceiptFixture([]));
+    const checks = await run(parent);
+    expect(checks.length).toBeGreaterThan(0);
+    expect(byName(checks, 'bootstrap_harness_health')).toBeDefined();
+  }, T);
+});
+
+// ── 0. harness registration health (#4043) ─────────────────────────────────
+
+function harnessReceiptFixture(
+  targets: Array<{ state: 'pending' | 'confirmed' | 'failed' }>,
+  extra: Record<string, unknown> = {},
+): never {
+  return {
+    harness_receipt_version: 1,
+    created_at: new Date().toISOString(),
+    created_by: `gbrain@${VERSION}`,
+    // an unroutable TEST-NET address so the /health probe fails fast + offline
+    url: 'http://192.0.2.1:9/mcp',
+    source_id: 'default',
+    token: { name: 'bootstrap-harness', id: '33333333-3333-3333-3333-333333333333', minted: true },
+    targets: targets.map((t) => ({ host: 'claude-code', kind: 'mcp', scope: 'user', name: 'gbrain', ...t })),
+    ...extra,
+  } as never;
+}
+
+describe('bootstrap_harness_health (#4043)', () => {
+  test('failed/pending targets → fail with the converge instruction', async () => {
+    const { parent, home } = makeHome();
+    writeHarnessReceipt(home, harnessReceiptFixture([{ state: 'failed' }, { state: 'pending' }]));
+    const checks = await run(parent);
+    const c = byName(checks, 'bootstrap_harness_health');
+    expect(c?.status).toBe('fail');
+    expect(c?.message).toMatch(/1 failed \/ 1 pending/);
+  }, T);
+
+  test('host:opencode receipt flows through host-generic filtering — failed target still fails', async () => {
+    const { parent, home } = makeHome();
+    const receipt = harnessReceiptFixture([{ state: 'failed' }, { state: 'confirmed' }]) as Record<string, unknown>;
+    for (const t of receipt.targets as Array<Record<string, unknown>>) t.host = 'opencode';
+    writeHarnessReceipt(home, receipt as never);
+    const checks = await run(parent);
+    const c = byName(checks, 'bootstrap_harness_health');
+    expect(c?.status).toBe('fail');
+    expect(c?.message).toMatch(/1 failed/);
+  }, T);
+
+  test('unconverged rotation (previous_id) → fail naming the revoke command', async () => {
+    const { parent, home } = makeHome();
+    const receipt = harnessReceiptFixture([{ state: 'confirmed' }]) as Record<string, unknown>;
+    (receipt.token as Record<string, unknown>).previous_ids = ['44444444-4444-4444-4444-444444444444'];
+    writeHarnessReceipt(home, receipt as never);
+    const checks = await run(parent);
+    const c = byName(checks, 'bootstrap_harness_health');
+    expect(c?.status).toBe('fail');
+    expect(c?.message).toMatch(/never revoked/);
+  }, T);
+
+  test('healthy receipt + unreachable serve → WARN (normal transient), never fail', async () => {
+    const { parent, home } = makeHome();
+    writeHarnessReceipt(home, harnessReceiptFixture([{ state: 'confirmed' }]));
+    const checks = await run(parent);
+    const c = byName(checks, 'bootstrap_harness_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toMatch(/serve is unreachable|not answering/);
+  }, T);
+
+  test('half-removed receipt (zero targets, minted token still live) → FAIL, never a vacuous green (red-team)', async () => {
+    const { parent, home } = makeHome();
+    writeHarnessReceipt(home, harnessReceiptFixture([]));
+    const checks = await run(parent);
+    const c = byName(checks, 'bootstrap_harness_health');
+    expect(c?.status).toBe('fail');
+    expect(c?.message).toMatch(/removal pending/);
+    expect(c?.message).toContain('33333333-3333-3333-3333-333333333333');
+  }, T);
+
+  test('unreadable harness receipt → warn, never a throw (fail-soft umbrella)', async () => {
+    const { parent, home } = makeHome();
+    mkdirSync(join(home, 'bootstrap'), { recursive: true });
+    writeFileSync(join(home, 'bootstrap', 'harness.json'), 'not json{{{');
+    const checks = await run(parent);
+    const c = byName(checks, 'bootstrap_harness_health');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toMatch(/unreadable/);
   }, T);
 });
 
@@ -420,6 +510,71 @@ describe('bootstrap_last_verify', () => {
 });
 
 // ── everything torn at once — the fail-soft umbrella ────────────────────────
+
+// ── bootstrap_durability_job [B7/D7] ────────────────────────────────────────
+//
+// Presence-only checks certify dead jobs as healthy, so the doctor probes
+// consent + liveness. These pin the two branch families a unit test can hold
+// deterministically: the non-local environment (no scheduler EXPECTED — ok)
+// and the consented-but-missing job (warn naming `gbrain sources harden`).
+
+describe('bootstrap_durability_job [B7/D7]', () => {
+  /** Env keys that would flip detectExecutionEnvironment away from local. */
+  const NEUTRAL_ENV = {
+    CLAUDE_CODE_REMOTE: undefined,
+    CLAUDE_CODE_REMOTE_SESSION_ID: undefined,
+    GH_TOKEN: undefined,
+    GITHUB_TOKEN: undefined,
+    https_proxy: undefined,
+    HTTPS_PROXY: undefined,
+    RENDER: undefined,
+    RAILWAY_ENVIRONMENT: undefined,
+    FLY_APP_NAME: undefined,
+  } as const;
+
+  function writeConsent(ws: string, value: 'yes' | 'no'): void {
+    mkdirSync(join(ws, 'state'), { recursive: true });
+    writeFileSync(
+      join(ws, 'state', 'interview.json'),
+      JSON.stringify({ version: 1, answers: { PERSIST_CRON: { value, set_at: new Date().toISOString() } } }),
+    );
+  }
+
+  test('cloud sandbox: no scheduler is EXPECTED → ok naming the environment, never a warn', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace();
+    writeReceipt(home, ws);
+    writeConsent(ws, 'yes'); // even with consent, a cloud sandbox has no scheduler to check
+    const checks = await withEnv(
+      { GBRAIN_HOME: parent, CLAUDE_CODE_REMOTE: 'true' },
+      () => bootstrapDoctorChecks(null),
+    );
+    const c = byName(checks, 'bootstrap_durability_job');
+    expect(c?.status).toBe('ok');
+    expect(c?.message).toContain('no scheduler in this environment');
+    expect(c?.message).toContain('cloud-sandbox');
+  }, T);
+
+  test('local + PERSIST_CRON=yes but NO scheduled job on disk → warn naming `gbrain sources harden`', async () => {
+    const { parent, home } = makeHome();
+    const ws = makeWorkspace();
+    writeReceipt(home, ws);
+    writeConsent(ws, 'yes');
+    // HOME redirected: the launchd-plist / pull-log probes must never read the
+    // real machine's LaunchAgents (a developer's own gbrain install would flip
+    // the verdict). Fresh empty HOME → durabilityJobStatus kind 'none'.
+    const fakeHome = mkdtempSync(join(tmpdir(), 'gb-bdc-fakehome-'));
+    tmpDirs.push(fakeHome);
+    const checks = await withEnv(
+      { ...NEUTRAL_ENV, GBRAIN_HOME: parent, HOME: fakeHome },
+      () => bootstrapDoctorChecks(null),
+    );
+    const c = byName(checks, 'bootstrap_durability_job');
+    expect(c?.status).toBe('warn');
+    expect(c?.message).toContain('PERSIST_CRON=yes');
+    expect(c?.message).toContain('gbrain sources harden workspace');
+  }, T);
+});
 
 describe('fail-soft umbrella', () => {
   test('corrupt receipt + torn heartbeat + corrupt push-status + torn verify → warns, never throws', async () => {

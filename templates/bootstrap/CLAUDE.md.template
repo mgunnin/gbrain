@@ -20,3 +20,7 @@ reach is a separate knob — see ACCESS_POLICY.md).
   over file greps for anything about people, projects, or the past.
 - Follow the per-message gates in AGENTS.md — especially Gate 3 (brain first) and
   Gate 7 (write-back, same turn).
+- Cloud sandbox sessions (fresh clones): if the gbrain MCP tools or hooks are
+  missing, the binary installs via the environment setup script (print it with
+  `gbrain bootstrap cloud-setup-script`), then run `gbrain bootstrap hooks
+  --repair` — committed hooks go live on the NEXT session (startup snapshot).

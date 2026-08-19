@@ -13,6 +13,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withEnv } from './helpers/with-env.ts';
 import {
   createPrivateRepo,
   GITHUB_URL_PLACEHOLDER,
@@ -87,7 +88,9 @@ afterEach(() => {
 function happyRules(overrides: Rule[] = []): Rule[] {
   return [
     ...overrides,
-    { key: 'gh --version', code: 0 },
+    // Realistic modern `gh --version` output — Gate 2 parses this to decide
+    // whether `--active` (added in cli/cli v2.57.0) is safe to pass.
+    { key: 'gh --version', code: 0, stdout: 'gh version 2.97.0 (2026-07-31)\nhttps://github.com/cli/cli/releases/tag/v2.97.0\n' },
     { key: 'auth status', code: 0 },
     // First origin probe: no remote yet. After create, git reports the URL.
     { key: 'remote get-url origin', times: 1, code: 2, stderr: 'error: No such remote' },
@@ -390,6 +393,61 @@ describe('createPrivateRepo', () => {
     expect(err.code).toBe('GH_AUTH');
     expect(err.exitCode).toBe(2);
     expect(err.message).toContain('gh auth login');
+  });
+
+  test('Gate 2 on a modern gh checks only the active account on github.com — a stale, invalid non-active/other-host account must not false-block bootstrap', async () => {
+    // `gh auth status` (no flags) aggregates every registered account on
+    // every host and exits 1 if ANY one of them is invalid, even if the
+    // active github.com account (what `gh`/`git` actually use for this
+    // flow) is perfectly healthy — confirmed against cli/cli's status.go
+    // (statusRun: the non-active-account loop at `if opts.Active { continue }`
+    // is skipped entirely under `--active`, so only the active account's
+    // entry can contribute to the exit code; `--hostname` narrows Hosts()
+    // to the given host before that loop even starts). Gate 2 must pass
+    // both flags on a `gh` that supports them — this test pins the exact
+    // argv so a regression back to the unscoped bare form is caught.
+    const { runner, calls } = makeRunner(happyRules());
+    await createPrivateRepo(ws, { runner, gbrainHomeDir: home });
+    const authCall = calls.find((c) => c[0] === 'gh' && c[1] === 'auth' && c[2] === 'status');
+    expect(authCall).toEqual(['gh', 'auth', 'status', '--active', '--hostname', 'github.com']);
+  });
+
+  test('Gate 2 on a pre-2.57.0 gh (no `--active` support) falls back to the host-scoped bare form instead of hard-failing on an unknown flag', async () => {
+    // `--active` was added in cli/cli v2.57.0 (confirmed: present in the
+    // v2.57.0 status.go, absent in v2.56.0 and earlier). Passing it to an
+    // older `gh` would make the WHOLE command fail on an unrecognized flag —
+    // a false GH_AUTH for a perfectly authenticated user. Gate 2 must detect
+    // this from the `gh --version` output already captured in Gate 1 and
+    // drop only `--active` (keeping `--hostname`, which has existed since
+    // gh's early versions). Pinned right at the boundary (2.56.0, one minor
+    // below the flag's introduction) rather than an arbitrarily old version,
+    // so an off-by-one in the `>=` comparison would fail this test.
+    const { runner, calls } = makeRunner(
+      happyRules([
+        { key: 'gh --version', code: 0, stdout: 'gh version 2.56.0 (2024-08-01)\n' },
+      ]),
+    );
+    await createPrivateRepo(ws, { runner, gbrainHomeDir: home });
+    const authCall = calls.find((c) => c[0] === 'gh' && c[1] === 'auth' && c[2] === 'status');
+    expect(authCall).toEqual(['gh', 'auth', 'status', '--hostname', 'github.com']);
+  });
+
+  test('Gate 2 on exactly gh 2.57.0 (the version that introduced `--active`) uses the enhanced form', async () => {
+    const { runner, calls } = makeRunner(
+      happyRules([{ key: 'gh --version', code: 0, stdout: 'gh version 2.57.0 (2024-09-11)\n' }]),
+    );
+    await createPrivateRepo(ws, { runner, gbrainHomeDir: home });
+    const authCall = calls.find((c) => c[0] === 'gh' && c[1] === 'auth' && c[2] === 'status');
+    expect(authCall).toEqual(['gh', 'auth', 'status', '--active', '--hostname', 'github.com']);
+  });
+
+  test('Gate 2 with an unparseable `gh --version` falls back to the host-scoped bare form (fail conservative, not assume `--active` support)', async () => {
+    const { runner, calls } = makeRunner(
+      happyRules([{ key: 'gh --version', code: 0, stdout: 'not a recognizable version string\n' }]),
+    );
+    await createPrivateRepo(ws, { runner, gbrainHomeDir: home });
+    const authCall = calls.find((c) => c[0] === 'gh' && c[1] === 'auth' && c[2] === 'status');
+    expect(authCall).toEqual(['gh', 'auth', 'status', '--hostname', 'github.com']);
   });
 
   // ── create-repo-first adoption (the human made the repo, opened it in Claude
@@ -711,5 +769,36 @@ describe('repo helpers', () => {
     expect(parseGithubRemote('https://github.com/alice/repo.git')).toEqual({ owner: 'alice', name: 'repo' });
     expect(parseGithubRemote('git@github.com:alice/repo.git')).toEqual({ owner: 'alice', name: 'repo' });
     expect(parseGithubRemote('https://gitlab.com/alice/repo')).toBeNull();
+  });
+});
+
+// ── cloud-sandbox create guard [D-cloud] ────────────────────────────────────
+//
+// A repo created from inside a proxied cloud session is never attached to the
+// session's GitHub scope — REST verification 403s and pushes are denied — so
+// createPrivateRepo must fail FAST with the flow that works (create outside,
+// open the session ON the repo, `gbrain bootstrap attach`) instead of leaving
+// a half-created, unpushable repo behind.
+
+describe('createPrivateRepo cloud-sandbox guard [CLOUD_SANDBOX_REPO]', () => {
+  test('cloud sandbox + no existing origin → CLOUD_SANDBOX_REPO before any create call', async () => {
+    const { runner, calls } = makeRunner(happyRules());
+    const err = await withEnv({ CLAUDE_CODE_REMOTE: 'true' }, () =>
+      expectBootstrapError(createPrivateRepo(ws, { runner, gbrainHomeDir: home })),
+    );
+    expect(err.code).toBe('CLOUD_SANDBOX_REPO');
+    expect(err.message).toContain('gbrain bootstrap attach');
+    // No repo was created and nothing was pushed.
+    expect(calls.some((c) => c.join(' ').includes('repo create'))).toBe(false);
+    expect(calls.some((c) => c.join(' ').includes('push'))).toBe(false);
+  });
+
+  test('local env: the same rules create normally (guard is cloud-only)', async () => {
+    const { runner, calls } = makeRunner(happyRules());
+    const result = await withEnv({ CLAUDE_CODE_REMOTE: undefined }, () =>
+      createPrivateRepo(ws, { runner, gbrainHomeDir: home }),
+    );
+    expect(result.disposition).toBe('created');
+    expect(calls.some((c) => c.join(' ').includes('repo create'))).toBe(true);
   });
 });

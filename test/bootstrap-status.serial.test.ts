@@ -64,9 +64,10 @@ describe('phase list is the single TS source of truth [D5]', () => {
     }
   });
 
-  test('wire hint carries the harness scope rule (Claude Code consent vs Codex user-global)', () => {
+  test('wire hint carries the harness scope rule (Claude Code + opencode consent vs Codex user-global)', () => {
     const wire = PHASES.find((p) => p.id === 'wire');
-    expect(wire?.resume_hint).toContain('MCP scope consent is Claude Code only');
+    expect(wire?.resume_hint).toContain('MCP scope consent applies on Claude Code and opencode');
+    expect(wire?.resume_hint).toContain('opencode defaults to user-global');
     expect(wire?.resume_hint).toContain('Codex registrations are always user-global (no scope flag)');
   });
 });
@@ -137,6 +138,8 @@ describe('statusReport detection + support blob [B5]', () => {
     expect(byId.get('render')!.state).toBe('pending');
     expect(byId.get('verify')!.state).toBe('pending');
     expect(report.next).toBeTruthy();
+    // The third axis [D-cloud]: installing agents branch on this field.
+    expect(['local', 'cloud-sandbox', 'ephemeral-container']).toContain(report.execution_environment);
     expect(report.support.binary_version).toBe(VERSION);
     expect(report.support.engine).toBeNull();
     expect(report.support.harness_registrations).toEqual([]);
@@ -281,8 +284,11 @@ esac
       origin: 'https://github.com/tester/agent-template.git',
       detail: expect.stringContaining('PUBLIC'),
     });
-    // The probe went through gh repo view --json isPrivate (recorded argv).
-    expect(readFileSync(recordFile, 'utf8')).toContain('gh repo view https://github.com/tester/agent-template.git --json isPrivate');
+    // The probe went through REST (`gh api repos/...`), NEVER `gh repo view`
+    // — that command rides GraphQL, which cloud sandbox proxies always 403.
+    const recorded = readFileSync(recordFile, 'utf8');
+    expect(recorded).toContain('gh api repos/tester/agent-template --jq .private');
+    expect(recorded).not.toContain('repo view');
 
     const r = await captureStatus();
     expect(r.code).toBe(1);

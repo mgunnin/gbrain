@@ -1,0 +1,167 @@
+{
+  "_comment": "Curation record for the Codex + Claude Code plugin lanes (the committed plugin/ tree). Lane set = (openclaw.plugin.json#skills minus base_exclusions) plus additions. Every entry is a recorded publication decision with a reason — scripts/generate-plugin-tree.ts validates this file and test/codex-plugin-manifest.test.ts pins membership. The openclaw lane's own curation (openclaw.plugin.json + skills/plugin-exclusions.json) is untouched: a skill can be openclaw-excluded and plugin-lane-included because plugin users ARE the brain host (the downstream-vs-host inversion). starter_gaps is a generated snapshot (refresh: bun run scripts/generate-plugin-tree.ts --out plugin --write-gaps): per-skill gbrain MCP ops declared in frontmatter tools: that sit beyond the starter serve surface — every one has a first-class gbrain CLI path (see plugin/README.md), and a change here is a review-visible curation event, not silent drift.",
+  "starter_policy": "cli-primary: bundled skills drive gbrain through the CLI when an op is beyond the starter MCP surface; users can widen a machine with GBRAIN_SURFACE=full (launcher-honored).",
+  "additions": {
+    "setup": "the plugin lane's own onboarding path (install + gbrain init + first import); swept 2026-08-15 — install command, privacy names, daemon-only prose, and repo-relative doc refs fixed for plugin consumers",
+    "gbrain-upgrade": "binary upgrade path — plugin users own the gbrain install; swept clean (one daemon-convention mention generalized)",
+    "smoke-test": "post-restart health checks; plugin users are the host — swept to make `gbrain smoke-test` the user entrypoint and label OpenClaw-service checks as conditional",
+    "migrate": "engine/data migration is a brain-owner activity and plugin users own their brain; swept clean",
+    "frontmatter-guard": "brain-page frontmatter hygiene applies to any brain owner; synthetic-name fix applied in sweep",
+    "schema-author": "schema-pack authoring is a brain-owner activity; repo-relative links converted for plugin consumers",
+    "schema-unify": "type unification is a brain-owner migration; PGLite --follow guidance + doc links fixed in sweep",
+    "skill-optimizer": "skillopt ships in the gbrain CLI; sweep added the read-only-snapshot note (optimize copies in your own skills dir)"
+  },
+  "base_exclusions": {
+    "testing": "gbrain-repo development skill — instructs running this repository's own test suite; meaningless-to-harmful in a plugin snapshot",
+    "skillify": "writes new skills into the host repo's skill tree — repo-dev workflow, not a plugin-consumer activity",
+    "skill-autobench": "benchmark infrastructure for gbrain skill development; requires repo-side harnesses",
+    "skillpack-harvest": "writes back to openclaw.plugin.json (host-repo curation surface) — repo-dev only"
+  },
+  "not_added": {},
+  "personas": {
+    "coding-agent": {
+      "description": "Brain-first coding agent working inside a repo: retrieval, routing, ingest discipline, correction hygiene. Default persona for the claude-code harness bridge; also published as the gbrain-coding marketplace variant.",
+      "plugin_name": "gbrain-coding",
+      "skills": {
+        "query": "core retrieval loop — every coding session asks the brain questions",
+        "ingest": "content routing into the brain — the write half of the core loop",
+        "brain-ops": "day-to-day brain operations (links, sync, timeline) a coding agent performs constantly",
+        "repo-architecture": "repository-structure capture — the coding persona's signature artifact",
+        "signal-detector": "detects durable signals in work sessions worth banking to the brain",
+        "functional-area-resolver": "two-layer skill routing keeps large skill sets navigable in coding contexts",
+        "idea-ingest": "capture engineering ideas with provenance while coding",
+        "idea-lineage": "trace how engineering decisions and ideas evolved across sessions",
+        "concept-synthesis": "synthesize scattered notes into concepts — turns session exhaust into knowledge",
+        "enrich": "backfill entities and links on pages the coding loop creates",
+        "maintain": "brain health checks keep a heavily-written coding brain consistent",
+        "context-audit": "token hygiene over CLAUDE.md/AGENTS.md/MEMORY — direct coding-agent pain",
+        "brain-link-discipline": "backlink discipline for pages the coding loop writes",
+        "resolve-before-asking": "resolve references from the brain before interrupting the user",
+        "correction-pipeline": "user corrections become durable brain updates instead of session-local fixes",
+        "measure-before-you-fix": "measurement discipline before performance/bug fixes — engineering hygiene",
+        "brain-ingest-gate": "gates what session content deserves brain ingestion — noise control",
+        "data-loss-gate": "guards destructive operations touching brain data during coding work"
+      }
+    },
+    "daily-driver": {
+      "description": "Personal knowledge-brain daily use: meetings, tasks, briefings, reading, research. Published as the gbrain-daily marketplace variant.",
+      "plugin_name": "gbrain-daily",
+      "skills": {
+        "query": "core retrieval loop — daily questions against the brain",
+        "ingest": "content routing into the brain — the write half of the core loop",
+        "meeting-ingestion": "meeting notes and transcripts are the daily driver's highest-volume input",
+        "daily-task-manager": "task capture and tracking against the brain",
+        "daily-task-prep": "morning prep pulls tasks, meetings, and salience into one view",
+        "briefing": "daily/weekly briefings synthesized from brain state",
+        "reports": "recurring reports over brain content for personal review",
+        "voice-note-ingest": "voice memos land in the brain with structure",
+        "media-ingest": "images, PDFs, and clips filed with extraction",
+        "strategic-reading": "long-form reading distilled into brain pages",
+        "data-research": "structured research runs with sources filed as raw data",
+        "perplexity-research": "web research capture with citation discipline",
+        "gbrain-advisor": "ranked high-leverage brain actions — the daily health nudge",
+        "conversation-archive": "conversation capture for cross-session memory",
+        "blog-ingest": "blog and article ingestion into the reading graph",
+        "research-compendium": "multi-source research compiled into a living compendium",
+        "bulk-ingestion": "batch imports (folders, exports) with manifest discipline"
+      }
+    }
+  },
+  "starter_gaps": {
+    "brain-ops": [
+      "add_link",
+      "sync_brain"
+    ],
+    "briefing": [
+      "get_timeline"
+    ],
+    "cold-start": [
+      "add_link",
+      "sync_brain"
+    ],
+    "daily-task-prep": [
+      "get_timeline"
+    ],
+    "data-research": [
+      "add_link",
+      "file_upload",
+      "put_raw_data"
+    ],
+    "eiirp": [
+      "add_link"
+    ],
+    "enrich": [
+      "add_link"
+    ],
+    "gbrain-advisor": [
+      "advisor"
+    ],
+    "idea-ingest": [
+      "add_link",
+      "file_upload"
+    ],
+    "idea-lineage": [
+      "find_contradictions",
+      "find_trajectory",
+      "takes_search"
+    ],
+    "ingest": [
+      "add_link",
+      "sync_brain"
+    ],
+    "maintain": [
+      "add_link",
+      "get_health"
+    ],
+    "media-ingest": [
+      "add_link",
+      "file_upload"
+    ],
+    "meeting-ingestion": [
+      "add_link",
+      "chronicle_day",
+      "get_timeline"
+    ],
+    "migrate": [
+      "add_link",
+      "add_tag",
+      "sync_brain"
+    ],
+    "minion-orchestrator": [
+      "cancel_job",
+      "get_job",
+      "get_job_progress",
+      "list_jobs",
+      "pause_job",
+      "replay_job",
+      "resume_job",
+      "send_job_message",
+      "submit_job"
+    ],
+    "query": [
+      "get_timeline"
+    ],
+    "schema-author": [
+      "get_active_schema_pack",
+      "list_schema_packs",
+      "reload_schema_pack",
+      "schema_apply_mutations",
+      "schema_explain_type",
+      "schema_graph",
+      "schema_lint",
+      "schema_review_orphans",
+      "schema_stats"
+    ],
+    "schema-unify": [
+      "run_onboard"
+    ],
+    "setup": [
+      "get_health",
+      "get_stats",
+      "sync_brain"
+    ],
+    "signal-detector": [
+      "add_link"
+    ]
+  }
+}

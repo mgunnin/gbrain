@@ -294,6 +294,40 @@ architecture that gets you from 10 to 50. That's normal. Systems that
 scale change shape. The important thing is that each tier preserves full
 capability. You're organizing, not deleting.
 
+## Plugin bundling is a curation decision
+
+Not every skill in `skills/` reaches downstream installs. The plugin
+manifest (`openclaw.plugin.json`) is the bundled set; everything else is a
+recorded exclusion in `skills/plugin-exclusions.json`, each with a reason.
+The two are test-pinned in both directions: every manifest skill is either
+bundled or a recorded exclusion, and no skill is both. Adding a skill to
+the tree does NOT ship it — bundling is an explicit decision, and an
+unbundled skill never reaches a downstream install. When you write a new
+skill, decide (and record) which side of that line it lives on.
+
+`bun run gate:skills` (`scripts/skills-commit-gate.sh`) is the per-commit gate
+for any change under `skills/`. It runs the conformance + resolver +
+plugin-manifest tests, `check-resolvable --strict`, the `skills.lock.json`
+regen + freshness check, and `check-skill-refs` in seconds — run it before
+committing a skills change so the membership/closure and `plugin.version`
+assertions fail locally instead of in CI.
+
+## When a skill misroutes
+
+Treat a misroute like a failing test, because it becomes one. First
+reproduce it as a fixture in the skill's `routing-eval.jsonl` — the utterance
+that misrouted, with the expected skill (or `null`). Rewrite the misrouted
+utterance onto placeholder entities (`alice-example`, `acme-example`) before
+committing the fixture — same rule as skill-autobench; a routing fixture is a
+public artifact and must not carry a real contact or company name. Only then
+fix the cause:
+usually a trigger in the skill's frontmatter or its row in
+`skills/RESOLVER.md`. Regenerate the lock (`bun run
+scripts/generate-skills-manifest.ts`) and the llms bundles (`bun run
+build:llms`), verify with `gbrain check-resolvable --strict`, and ship it as
+a MICRO release. Downstream installs heal on their next upgrade — the fix
+travels with the skillpack, not with a support thread.
+
 ## Related
 
 - [Skill development cycle](skill-development.md) — the 5-step loop for

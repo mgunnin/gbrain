@@ -239,7 +239,7 @@ function requiredKeys(bank: QuestionBank): string[] {
 // ---------------------------------------------------------------------------
 
 export type SetAnswerResult =
-  | { ok: true; sink: 'state'; key: string; value: string }
+  | { ok: true; sink: 'state'; key: string; value: string; invalidatedConfirmation?: boolean }
   /** Config-sink keys [CX2-13]: nothing persisted here; the caller routes the
    * value via `routeProviderKeyToConfig`. The value is deliberately NOT
    * echoed back in this result. */
@@ -305,20 +305,23 @@ export function setAnswer(workspaceDir: string, key: string, rawValue: string): 
   if (!read.ok) return read;
   const state = read.state;
   state.answers[key] = { value: stored, set_at: new Date().toISOString() };
-  // Any change invalidates a prior read-back confirmation [A8].
+  // Any change invalidates a prior read-back confirmation [A8]. Surfaced to
+  // the caller so the CLI can WARN — silently voiding the confirmation used
+  // to fail much later, at render, with no pointer back to this --set.
+  const invalidatedConfirmation = state.confirmed !== undefined;
   delete state.confirmed;
   try {
     writeInterviewState(workspaceDir, state);
   } catch (e) {
     return { ok: false, code: 'io_error', message: `could not write interview state: ${(e as Error).message}` };
   }
-  return { ok: true, sink: 'state', key, value: stored };
+  return { ok: true, sink: 'state', key, value: stored, invalidatedConfirmation };
 }
 
 export function skipAnswer(
   workspaceDir: string,
   key: string
-): { ok: true; sink: 'state' | 'config'; key: string; skipped: true } | InterviewError {
+): { ok: true; sink: 'state' | 'config'; key: string; skipped: true; invalidatedConfirmation?: boolean } | InterviewError {
   const bank = loadQuestionBank();
   const spec = bankSpec(bank, key);
   if (!spec) {
@@ -339,13 +342,15 @@ export function skipAnswer(
   if (!read.ok) return read;
   const state = read.state;
   state.answers[key] = { value: '', set_at: new Date().toISOString(), skipped: true };
+  // Same [A8] invalidation-surfacing as setAnswer.
+  const invalidatedConfirmation = state.confirmed !== undefined;
   delete state.confirmed;
   try {
     writeInterviewState(workspaceDir, state);
   } catch (e) {
     return { ok: false, code: 'io_error', message: `could not write interview state: ${(e as Error).message}` };
   }
-  return { ok: true, sink: 'state', key, skipped: true };
+  return { ok: true, sink: 'state', key, skipped: true, invalidatedConfirmation };
 }
 
 // ---------------------------------------------------------------------------

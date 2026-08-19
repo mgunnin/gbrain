@@ -11,11 +11,13 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   buildClaudeHookCommand,
+  claudeCommittedSettingsPath,
   claudeSettingsPath,
   registerClaudeMcp,
   registerCodexMcp,
   removeClaudeHooks,
   writeClaudeHooks,
+  writeCommittedClaudeHooks,
 } from '../src/core/bootstrap/hooks.ts';
 import {
   CLAUDE_CODE_SPEC_ID,
@@ -64,15 +66,16 @@ describe('host-specs [ENG-7]', () => {
     }
     expect(TARGETS[CLAUDE_CODE_SPEC_ID].status).toBe('verified');
     expect(TARGETS[CLAUDE_CODE_SPEC_ID].references.join(' ')).toContain('code.claude.com');
-    // Codex mcp-add shape is docs-derived, not live-host-verified.
-    expect(TARGETS[CODEX_SPEC_ID].status).toBe('provisional');
-    // The v1 "no TOML writer" decision is recorded where the format lives.
+    // Verified against codex-cli 0.147.0 (#4043: serde field scan + live
+    // inline bearer_token wiring); the fired CX2-17 revisit is recorded
+    // where the format lives, and 'TOML' stays the load-bearing word.
+    expect(TARGETS[CODEX_SPEC_ID].status).toBe('verified');
     expect(TARGETS[CODEX_SPEC_ID].note).toContain('TOML');
   });
 });
 
 describe('writeClaudeHooks [G5, CX2-17]', () => {
-  test('fresh workspace: all four events wired with marker + env + timeout', () => {
+  test('fresh workspace: all five events wired with marker + env + timeout', () => {
     const dir = ws();
     const res = writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV });
     expect(res.settingsPath).toBe(claudeSettingsPath(dir));
@@ -94,6 +97,8 @@ describe('writeClaudeHooks [G5, CX2-17]', () => {
     expect(markerEntries(settings, 'SessionStart')[0].command).toContain('hook session-start');
     expect(markerEntries(settings, 'Stop')[0].command).toContain('hook stop');
     expect(markerEntries(settings, 'SessionEnd')[0].command).toContain('hook session-end');
+    // v0.45.7 ambient recall: PreCompact banks standing entities pre-compaction.
+    expect(markerEntries(settings, 'PreCompact')[0].command).toContain('hook compact');
   });
 
   test('timeoutSecs override + GBRAIN_HOME env embedding', () => {
@@ -166,18 +171,18 @@ describe('writeClaudeHooks [G5, CX2-17]', () => {
     expect(bak).toEqual({ permissions: { allow: ['X'] } });
   });
 
-  test('broken JSON: original backed up aside, loud note, clean file written', () => {
+  test('broken JSON: write ABORTS fail-closed, file untouched, fix named', () => {
+    // A parse-broken settings.local.json may carry permissions/allowlist
+    // entries gbrain cannot see — rewriting it (the old backup-and-start-clean
+    // behavior) silently dropped them from the live file. The write path now
+    // matches removeClaudeHooks: refuse, name the fix, change nothing.
     const dir = ws();
     mkdirSync(join(dir, '.claude'), { recursive: true });
-    writeFileSync(claudeSettingsPath(dir), '{ definitely broken json !!!');
-    const res = writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV });
-    expect(res.brokenBackupPath).not.toBeNull();
-    expect(existsSync(res.brokenBackupPath!)).toBe(true);
-    expect(readFileSync(res.brokenBackupPath!, 'utf8')).toContain('definitely broken');
-    expect(res.notes.join(' ')).toContain('not valid JSON');
-    // Fresh file is valid and carries our hooks.
-    const settings = readSettings(dir);
-    expect(markerEntries(settings, 'SessionStart')).toHaveLength(1);
+    const original = '{ definitely broken json !!!';
+    writeFileSync(claudeSettingsPath(dir), original);
+    expect(() => writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV })).toThrow(/not valid JSON.*re-run/s);
+    // Byte-identical after the refused write — nothing moved, nothing rewritten.
+    expect(readFileSync(claudeSettingsPath(dir), 'utf8')).toBe(original);
   });
 
   test('relative gbrainBin refused (GUI hosts inherit no PATH)', () => {
@@ -287,5 +292,114 @@ describe('buildClaudeHookCommand', () => {
     expect(cmd).toBe(
       `env GBRAIN_SOURCE=plain-slug 'GBRAIN_HOME=/has space/dir' ${BIN} hook user-prompt`,
     );
+  });
+});
+
+// ── committed hook carrier [D12] ────────────────────────────────────────────
+//
+// Cloud sessions clone fresh and snapshot hook config at session start — only
+// the repo-COMMITTED .claude/settings.json exists there. These tests pin the
+// portable command shape (PATH-resolved, fail-open, NO absolute paths) and
+// the dedupe invariant (one event never fires from both carriers).
+
+describe('writeCommittedClaudeHooks [D12]', () => {
+  test('portable commands: PATH-resolved gbrain, fail-open guard, marker present, no absolute binary path', () => {
+    const dir = ws();
+    const r = writeCommittedClaudeHooks(dir, { env: ENV });
+    expect(r.settingsPath).toBe(claudeCommittedSettingsPath(dir));
+    expect(r.installed).toHaveLength(CLAUDE_HOOK_EVENTS.length);
+    const parsed = JSON.parse(readFileSync(r.settingsPath, 'utf8')) as {
+      hooks: Record<string, Array<{ hooks: Array<Record<string, unknown>> }>>;
+    };
+    for (const event of CLAUDE_HOOK_EVENTS) {
+      const entry = parsed.hooks[event]![0]!.hooks[0]!;
+      const cmd = entry.command as string;
+      expect(cmd).toContain('command -v gbrain');
+      expect(cmd).toContain('|| exit 0');           // fail-open where gbrain is absent
+      expect(cmd).toContain('GBRAIN_SOURCE=workspace');
+      expect(cmd).not.toContain(BIN);                // never a machine path
+      expect(cmd).not.toContain('/opt/');
+      expect(entry[GBRAIN_HOOK_MARKER_KEY]).toBe(GBRAIN_HOOK_MARKER_VALUE);
+    }
+  });
+
+  test('dedupe: committed carrier strips existing LOCAL entries so nothing double-fires', () => {
+    const dir = ws();
+    writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV });
+    expect(readFileSync(claudeSettingsPath(dir), 'utf8')).toContain(GBRAIN_HOOK_MARKER_VALUE);
+    const r = writeCommittedClaudeHooks(dir, { env: ENV });
+    expect(r.notes.join(' ')).toContain('committed carrier owns the events');
+    // Local file no longer carries any gbrain entry.
+    const local = readFileSync(claudeSettingsPath(dir), 'utf8');
+    expect(local).not.toContain(GBRAIN_HOOK_MARKER_VALUE);
+  });
+
+  test('dedupe: local writer SKIPS events the committed file carries (and reports it)', () => {
+    const dir = ws();
+    writeCommittedClaudeHooks(dir, { env: ENV });
+    const r = writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV });
+    expect(r.installed).toHaveLength(0); // every event carried by the committed file
+    expect(r.notes.some((n) => n.includes('carried by the committed'))).toBe(true);
+    const localRaw = readFileSync(claudeSettingsPath(dir), 'utf8');
+    expect(localRaw).not.toContain(GBRAIN_HOOK_MARKER_VALUE);
+  });
+
+  test('removeClaudeHooks cleans BOTH carriers', () => {
+    const dir = ws();
+    writeCommittedClaudeHooks(dir, { env: ENV });
+    // Seed a REAL local gbrain entry directly (bypassing the dedupe-aware
+    // writer) — the pre-dedupe-install shape a mixed-binary machine can hold.
+    writeFileSync(
+      claudeSettingsPath(dir),
+      JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: `${BIN} hook stop`, [GBRAIN_HOOK_MARKER_KEY]: GBRAIN_HOOK_MARKER_VALUE }] }] },
+      }),
+    );
+    const r = removeClaudeHooks(dir);
+    expect(r.removed).toBe(CLAUDE_HOOK_EVENTS.length + 1); // 4 committed + 1 local
+    expect(readFileSync(claudeCommittedSettingsPath(dir), 'utf8')).not.toContain(GBRAIN_HOOK_MARKER_VALUE);
+    expect(readFileSync(claudeSettingsPath(dir), 'utf8')).not.toContain(GBRAIN_HOOK_MARKER_VALUE);
+  });
+
+  test('foreign keys in the committed file survive byte-for-byte structurally', () => {
+    const dir = ws();
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(
+      claudeCommittedSettingsPath(dir),
+      JSON.stringify({ permissions: { allow: ['Bash(ls:*)'] }, hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo user-hook' }] }] } }, null, 2),
+    );
+    writeCommittedClaudeHooks(dir, { env: ENV });
+    const parsed = JSON.parse(readFileSync(claudeCommittedSettingsPath(dir), 'utf8')) as Record<string, unknown>;
+    expect(parsed.permissions).toEqual({ allow: ['Bash(ls:*)'] });
+    const stop = (parsed.hooks as Record<string, Array<{ hooks: Array<{ command?: string }> }>>).Stop!;
+    expect(stop.some((g) => g.hooks.some((h) => h.command === 'echo user-hook'))).toBe(true);
+  });
+});
+
+describe('committed-carrier guards [S7/DM6]', () => {
+  test('GBRAIN_HOME is refused in the committed carrier (machine paths must not travel)', () => {
+    const dir = ws();
+    expect(() => writeCommittedClaudeHooks(dir, { env: { GBRAIN_SOURCE: 'workspace', GBRAIN_HOME: '/Users/someone/.g' } }))
+      .toThrow(/machine-specific/);
+  });
+
+  test('control characters are refused in the committed carrier too', () => {
+    const dir = ws();
+    expect(() => writeCommittedClaudeHooks(dir, { env: { GBRAIN_SOURCE: 'a\nb' } }))
+      .toThrow(/control characters/);
+  });
+
+  test('[S7] a foreign marker-tagged entry with a NON-gbrain command does not suppress the local install', () => {
+    const dir = ws();
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+    writeFileSync(
+      claudeCommittedSettingsPath(dir),
+      JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'curl evil.example.com', [GBRAIN_HOOK_MARKER_KEY]: GBRAIN_HOOK_MARKER_VALUE }] }] },
+      }),
+    );
+    const r = writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV });
+    // All four events install locally — the fake carried entry is not trusted.
+    expect(r.installed).toHaveLength(CLAUDE_HOOK_EVENTS.length);
   });
 });

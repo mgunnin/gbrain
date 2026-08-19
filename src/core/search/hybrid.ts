@@ -11,7 +11,14 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
-import type { SearchResult, SearchOpts, HybridSearchMeta } from '../types.ts';
+import type {
+  SearchResult,
+  SearchOpts,
+  HybridSearchMeta,
+  DegradedStage,
+  DegradedStageEntry,
+  DegradedReason,
+} from '../types.ts';
 import { embed, embedQuery } from '../embedding.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
 import { resolveEmbeddingColumn, isCacheSafe } from './embedding-column.ts';
@@ -33,7 +40,7 @@ import { isTitlePhraseMatch } from './title-match.ts';
 import { normalizeAlias } from './alias-normalize.ts';
 import { stampEvidence } from './evidence.ts';
 import { expandAnchors, hydrateChunks } from './two-pass.ts';
-import { enforceTokenBudget } from './token-budget.ts';
+import { enforceTokenBudget, searchSalvageEnabled, type TokenBudgetMeta } from './token-budget.ts';
 import { warnOncePerProcess } from '../utils.ts';
 import { recordSearchTelemetry } from './telemetry.ts';
 import {
@@ -806,6 +813,21 @@ export interface HybridSearchOpts extends SearchOpts {
   _queryEmbedDeadline?: QueryEmbedDeadline;
 
   /**
+   * Hermetic eval canaries/CI — non-semantic embeddings. When set, the query
+   * embedding for the TEXT vector arm comes from this function (e.g. qrels
+   * basis vectors) INSTEAD of the gateway's query-embed path, and the
+   * no-embedding-provider keyword-only short-circuit is bypassed — so the
+   * vector arm runs with no provider key configured at all. Never set on
+   * production paths; when absent, behavior is byte-for-byte unchanged.
+   *
+   * Cache note: bare `hybridSearch` neither reads nor writes the semantic
+   * query cache by construction — both the lookup and the store live only in
+   * `hybridSearchCached` — so a deterministic-embedding eval run through this
+   * seam cannot poison `query_cache` for production queries.
+   */
+  queryEmbedFn?: (text: string) => Float32Array | Promise<Float32Array>;
+
+  /**
    * INTERNAL — cache-consult outcome threaded from `hybridSearchCached` into
    * the inner `hybridSearch` so the ONE telemetry record per search (emitted
    * by the inner function) carries the cache classification: 'miss' when the
@@ -920,6 +942,41 @@ export function resolveDateBoundary(
   throw new Error(
     `Invalid ${boundary} value "${s}" — expected ISO-8601 (YYYY-MM-DD or timestamp) or a relative duration like '7d', '2w', '1y'.`,
   );
+}
+
+/**
+ * WP2/T3 — classify an embed/vector failure as a timeout vs a provider
+ * error for the enumerated degraded[] reason codes (D6). Matches both the
+ * embedQueryBounded deadline rejection and AbortSignal.timeout's
+ * TimeoutError/AbortError. The raw error text never rides the wire — it
+ * goes to stderr via warnOncePerProcess only.
+ */
+function isTimeoutError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (/deadline \d+ms exceeded/.test(err.message)) return true;
+  return err.name === 'TimeoutError' || err.name === 'AbortError';
+}
+
+/** WP2/T3 — append a degraded stage once (stages are set-like per response). */
+function pushDegraded(
+  list: DegradedStageEntry[],
+  stage: DegradedStage,
+  reason?: DegradedReason,
+): void {
+  if (list.some((d) => d.stage === stage)) return;
+  list.push(reason ? { stage, reason } : { stage });
+}
+
+/**
+ * WP2/T3 — budget-stage stamp shared by the enforceTokenBudget call sites.
+ * Two distinct stages so consumers can tell "empty" from "clipped":
+ * budget_truncated when the minKeep failsafe kept one truncated copy
+ * (results non-empty); budget_dropped_all when the strict packer returned
+ * [] (kept 0 with drops, under GBRAIN_SEARCH_SALVAGE=off).
+ */
+function stampBudgetStage(list: DegradedStageEntry[], meta: TokenBudgetMeta): void {
+  if (meta.truncated) pushDegraded(list, 'budget_truncated', 'first_result_truncated');
+  else if (meta.kept === 0 && meta.dropped > 0) pushDegraded(list, 'budget_dropped_all');
 }
 
 export async function hybridSearch(
@@ -1039,12 +1096,27 @@ export async function hybridSearch(
     // Direct searchKeyword consumers (countMentions, link-extraction, eval)
     // do NOT set this and keep the strict-AND contract.
     orFallback: true,
+    // v0.46.15: collect searchVector's bounded-escalation exhaustion signal —
+    // engines have no telemetry sink (R2-10); hybrid owns the meta emit.
+    // ACCUMULATES across vector calls (adversarial F8): expansion runs N
+    // sub-queries through this one opts object — last-write-wins would
+    // under-report multi-query exhaustion. Keep the max-escalations event.
+    onVectorPoolMeta: (m) => {
+      if (!vectorPoolUnderfill || m.escalations >= vectorPoolUnderfill.escalations) {
+        vectorPoolUnderfill = { escalations: m.escalations, innerLimit: m.innerLimit };
+      }
+    },
   };
+  let vectorPoolUnderfill: { escalations: number; innerLimit: number } | undefined;
   // Track what actually ran for the optional onMeta callback (v0.25.0).
   // Caller leaves onMeta undefined → these flags are computed but never
   // surfaced. Capture wrapper passes a closure to receive the meta and
   // threads it into the eval_candidates row.
   let expansionApplied = false;
+  // WP2/T3 — degradation stamp accumulated across stages. Emitted on EVERY
+  // return path (empty array = clean run) so cache rows always carry the
+  // stamp and a served row can prove its cleanliness (ENG-5/cache_prestamp).
+  const degraded: DegradedStageEntry[] = [];
 
   // A throwing user callback must never break the search hot path — onMeta
   // is a public surface (gbrain/search/hybrid) so a third-party closure bug
@@ -1218,7 +1290,10 @@ export async function hybridSearch(
       earlyModality === 'both' ||
       mayEscalateToMultimodal) &&
     isAvailable('embedding', multimodalProviderProbe);
-  if (!isAvailable('embedding', providerProbe) && !willTryMultimodal) {
+  // Hermetic eval canaries/CI: a caller-supplied queryEmbedFn produces the
+  // vector-arm query embedding without the gateway, so provider
+  // availability is irrelevant — skip the keyword-only short-circuit.
+  if (!opts?.queryEmbedFn && !isAvailable('embedding', providerProbe) && !willTryMultimodal) {
     // v0.43 — fuse the relational arm with keyword so typed-edge answers
     // survive on the no-embedding-provider path (the relational win is most
     // valuable exactly when vector is unavailable). The title arm fuses here
@@ -1245,13 +1320,21 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
-    stampEvidence(noEmbedHopped);
+    stampEvidence(noEmbedHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
     const noEmbedSliced = noEmbedHopped.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, noEmbedBudgeted);
     lastResultsCount = noEmbedBudgeted.length;
     lastRank1Score = noEmbedBudgeted[0] ? (noEmbedBudgeted[0].base_score ?? noEmbedBudgeted[0].score) : undefined;
+    // WP2/T3 — no silent bypass: the keyword-only-config branch names why
+    // vector didn't run, and whether the keyword arm itself came up empty
+    // (skipped-by-modality is not a keyword miss, hence the image gate).
+    pushDegraded(degraded, 'embed_unavailable', 'no_provider');
+    if (keywordResults.length === 0 && earlyModality !== 'image') {
+      pushDegraded(degraded, 'keyword_zero');
+    }
+    stampBudgetStage(degraded, noEmbedBudgetMeta);
     emitMeta({
       vector_enabled: false,
       detail_resolved: detailResolved,
@@ -1259,6 +1342,8 @@ export async function hybridSearch(
       intent: suggestions.intent,
       mode: resolvedMode.resolved_mode,
       embedding_column: resolvedCol.name,
+      degraded: [...degraded],
+      retrieved_count: noEmbedSliced.length,
       ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
         ? { token_budget: noEmbedBudgetMeta }
         : {}),
@@ -1327,8 +1412,10 @@ export async function hybridSearch(
       if (queries.length === 0) queries = [query];
       // "Applied" = produced variants beyond the original, not just called.
       expansionApplied = queries.length > 1;
-    } catch {
-      // Expansion failure is non-fatal
+    } catch (err) {
+      // Expansion failure is non-fatal — original query proceeds alone,
+      // stamped so the consumer knows the multi-query recall arm was lost.
+      pushDegraded(degraded, 'expansion_failed', isTimeoutError(err) ? 'timeout' : 'provider_error');
     }
   }
 
@@ -1383,6 +1470,8 @@ export async function hybridSearch(
         `[cross-modal] unified_multimodal embed failed; falling back to dual-column path. reason=${reason}`,
       );
       crossModalFellOpen = true;
+      // WP2/T3 — the configured unified arm fell over; dual-column carried it.
+      pushDegraded(degraded, 'vector_arm_failed', isTimeoutError(err) ? 'timeout' : 'provider_error');
     }
   }
 
@@ -1414,6 +1503,9 @@ export async function hybridSearch(
         `[cross-modal] image-side embed failed for modality=${effectiveModality}; falling back to text-only. reason=${reason}`,
       );
       crossModalFellOpen = true;
+      // WP2/T3 — the image-search branch is no silent bypass: the fell-open
+      // arm is named in the meta the surviving text path emits.
+      pushDegraded(degraded, 'vector_arm_failed', isTimeoutError(err) ? 'timeout' : 'provider_error');
     }
   }
 
@@ -1431,32 +1523,122 @@ export async function hybridSearch(
     // the global default. Empty embeddingModel falls back to gateway
     // default — preserves pre-v0.36 behavior for the builtin 'embedding'
     // column.
-    try {
-      const embedOpts = resolvedCol.embeddingModel
-        ? { embeddingModel: resolvedCol.embeddingModel, dimensions: resolvedCol.dimensions }
-        : undefined;
-      // v0.42.20.0 (Fix 3) — bound the query embed. Reuse the shared deadline
-      // threaded from hybridSearchCached (so the cache-lookup embed + this one
-      // share one ~6s budget); direct callers get a fresh deadline. On timeout
-      // the embed throws → the catch below falls back to keyword-only.
-      const embedDl = opts?._queryEmbedDeadline ?? makeQueryEmbedDeadline();
-      const embeddings = await Promise.all(queries.map(q => embedQueryBounded(q, embedOpts, embedDl)));
-      queryEmbedding = embeddings[0];
-      const textLists = await Promise.all(
-        embeddings.map(emb => engine.searchVector(emb, searchOpts)),
-      );
-      for (const list of textLists) {
-        for (const r of list) {
-          r.modality = r.modality ?? 'text';
+    const embedOpts = resolvedCol.embeddingModel
+      ? { embeddingModel: resolvedCol.embeddingModel, dimensions: resolvedCol.dimensions }
+      : undefined;
+    // v0.42.20.0 (Fix 3) — bound the query embed. Reuse the shared deadline
+    // threaded from hybridSearchCached (so the cache-lookup embed + this one
+    // share one ~6s budget); direct callers get a fresh deadline. On timeout
+    // the embed rejects → salvage below (or keyword-only when all reject).
+    const embedDl = opts?._queryEmbedDeadline ?? makeQueryEmbedDeadline();
+    // Hermetic eval canaries/CI: queryEmbedFn (non-semantic deterministic
+    // embeddings) replaces the gateway query-embed for the text vector arm.
+    // No deadline needed — it's a synchronous-ish local computation with no
+    // network. Absent queryEmbedFn, the bounded gateway path is unchanged.
+    const embedOneQuery = (q: string): Promise<Float32Array> =>
+      opts?.queryEmbedFn
+        ? Promise.resolve(opts.queryEmbedFn(q))
+        : embedQueryBounded(q, embedOpts, embedDl);
+    if (!searchSalvageEnabled()) {
+      // ENG-7 kill switch (GBRAIN_SEARCH_SALVAGE=off): pre-wave
+      // all-or-nothing fan-outs — one variant's failure abandons every
+      // embedding and falls back to keyword-only.
+      try {
+        const embeddings = await Promise.all(queries.map(q => embedOneQuery(q)));
+        queryEmbedding = embeddings[0];
+        const textLists = await Promise.all(
+          embeddings.map(emb => engine.searchVector(emb, searchOpts)),
+        );
+        for (const list of textLists) {
+          for (const r of list) {
+            r.modality = r.modality ?? 'text';
+          }
+        }
+        vectorLists = textLists;
+        // 'both' mode: also include the image-side list as another input to RRF.
+        if (effectiveModality === 'both' && imageVectorList !== null) {
+          vectorLists = [...vectorLists, imageVectorList];
+        }
+      } catch (err) {
+        // Embedding failure is non-fatal, fall back to keyword-only —
+        // stamped with an enumerated code; raw text to stderr only (D6).
+        const timedOut = isTimeoutError(err);
+        pushDegraded(degraded, timedOut ? 'embed_timeout' : 'embed_unavailable', timedOut ? 'timeout' : 'provider_error');
+        warnOncePerProcess(
+          'search-embed-fanout-failed',
+          `[gbrain] query embed/vector fan-out failed (keyword fallback): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else {
+      // WP2/T3 (ENG-15) salvage fan-outs: allSettled on BOTH the embed
+      // fan-out and the searchVector fan-out so one variant's failure no
+      // longer abandons the survivors (the query-vs-search asymmetry fix).
+      const settled = await Promise.allSettled(queries.map(q => embedOneQuery(q)));
+      const okEmbeds: Float32Array[] = [];
+      const embedFailures: unknown[] = [];
+      for (const s of settled) {
+        if (s.status === 'fulfilled') okEmbeds.push(s.value);
+        else embedFailures.push(s.reason);
+      }
+      if (embedFailures.length > 0) {
+        warnOncePerProcess(
+          'search-embed-fanout-failed',
+          `[gbrain] ${embedFailures.length}/${settled.length} query embeds failed (salvaging survivors): ` +
+            `${embedFailures[0] instanceof Error ? (embedFailures[0] as Error).message : String(embedFailures[0])}`,
+        );
+      }
+      if (okEmbeds.length === 0) {
+        // Every embed failed → keyword-only fallback below, honestly staged.
+        const allTimeouts = embedFailures.every(isTimeoutError);
+        pushDegraded(degraded, allTimeouts ? 'embed_timeout' : 'embed_unavailable', allTimeouts ? 'timeout' : 'provider_error');
+      } else {
+        const originalOk = settled[0].status === 'fulfilled';
+        if (embedFailures.length > 0) {
+          // Mixed outcome — only reachable when expansion produced variants.
+          pushDegraded(degraded, 'expansion_partial', originalOk ? 'variant_embed_failed' : 'original_embed_failed');
+        }
+        if (originalOk) {
+          queryEmbedding = (settled[0] as PromiseFulfilledResult<Float32Array>).value;
+        } else {
+          // Registry refinement: variant lists are salvaged, but the cosine
+          // re-score needs the ORIGINAL query's vector — skip it rather than
+          // re-score in a variant's embedding space.
+          queryEmbedding = null;
+          pushDegraded(degraded, 'rescore_skipped', 'original_embed_failed');
+        }
+        const vSettled = await Promise.allSettled(okEmbeds.map(emb => engine.searchVector(emb, searchOpts)));
+        const okLists: SearchResult[][] = [];
+        let vFirstErr: unknown;
+        let vFailed = 0;
+        for (const s of vSettled) {
+          if (s.status === 'fulfilled') okLists.push(s.value);
+          else {
+            if (vFailed === 0) vFirstErr = s.reason;
+            vFailed += 1;
+          }
+        }
+        if (vFailed > 0) {
+          pushDegraded(degraded, 'vector_arm_failed', isTimeoutError(vFirstErr) ? 'timeout' : 'provider_error');
+          warnOncePerProcess(
+            'search-vector-arm-failed',
+            `[gbrain] ${vFailed}/${vSettled.length} searchVector arms failed (salvaging survivors): ` +
+              `${vFirstErr instanceof Error ? vFirstErr.message : String(vFirstErr)}`,
+          );
+        }
+        for (const list of okLists) {
+          for (const r of list) {
+            r.modality = r.modality ?? 'text';
+          }
+        }
+        vectorLists = okLists;
+        // 'both' mode: also include the image-side list as another input to
+        // RRF — only when a text arm survived, matching the pre-wave shape
+        // (a total text failure falls back to keyword-only either way).
+        if (vectorLists.length > 0 && effectiveModality === 'both' && imageVectorList !== null) {
+          vectorLists = [...vectorLists, imageVectorList];
         }
       }
-      vectorLists = textLists;
-      // 'both' mode: also include the image-side list as another input to RRF.
-      if (effectiveModality === 'both' && imageVectorList !== null) {
-        vectorLists = [...vectorLists, imageVectorList];
-      }
-    } catch {
-      // Embedding failure is non-fatal, fall back to keyword-only
     }
   }
 
@@ -1487,13 +1669,20 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
-    stampEvidence(kwHopped);
+    stampEvidence(kwHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
     const kwSliced = kwHopped.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, kwBudgeted);
     lastResultsCount = kwBudgeted.length;
     lastRank1Score = kwBudgeted[0] ? (kwBudgeted[0].base_score ?? kwBudgeted[0].score) : undefined;
+    // WP2/T3 — the embed/vector failure that emptied vectorLists already
+    // pushed its stage above; add the keyword-arm outcome (skipped-by-
+    // modality is not a keyword miss, hence the image gate).
+    if (keywordResults.length === 0 && earlyModality !== 'image') {
+      pushDegraded(degraded, 'keyword_zero');
+    }
+    stampBudgetStage(degraded, kwBudgetMeta);
     emitMeta({
       vector_enabled: false,
       detail_resolved: detailResolved,
@@ -1501,6 +1690,8 @@ export async function hybridSearch(
       intent: suggestions.intent,
       mode: resolvedMode.resolved_mode,
       embedding_column: resolvedCol.name,
+      degraded: [...degraded],
+      retrieved_count: kwSliced.length,
       ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
         ? { token_budget: kwBudgetMeta }
         : {}),
@@ -1678,7 +1869,7 @@ export async function hybridSearch(
   // decision keys off WHY a page matched, not a raw blended score. Stamp on
   // the full alias-hopped set before any adaptive trim so the kept results
   // carry evidence regardless of where the cap lands.
-  stampEvidence(aliasHopped);
+  stampEvidence(aliasHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
 
   // v0.42 — intent-aware adaptive return-sizing (opt-in, default off). Trim
   // the ranked candidate set to an intent-driven cap BEFORE the limit slice,
@@ -1693,7 +1884,12 @@ export async function hybridSearch(
   let returnPool = aliasHopped;
   let adaptiveDecision: AdaptiveReturnDecision | undefined;
   if (adaptiveCfg.enabled && offset === 0) {
-    const r = applyAdaptiveReturn(aliasHopped, suggestions.intent, adaptiveCfg);
+    // v0.46.15: 'concept' maps to the recall-preserving 'general' cap for
+    // adaptive return — the narrower AdaptiveQueryIntent union predates the
+    // concept intent, and concept queries are exactly the ones that want
+    // breadth (widening the union is the adaptive-ablation wave's call).
+    const adaptiveIntent = suggestions.intent === 'concept' ? 'general' : suggestions.intent;
+    const r = applyAdaptiveReturn(aliasHopped, adaptiveIntent, adaptiveCfg);
     returnPool = r.kept;
     adaptiveDecision = r.decision;
   }
@@ -1714,7 +1910,9 @@ export async function hybridSearch(
     const r = applyAutocut(
       returnPool,
       (x) => x.rerank_score,
-      { enabled: true, jumpRatio: resolvedMode.autocut_jump, minKeep: 1 },
+      // v0.46.15 (#1863): minTopScore is the weak-top floor — below it the
+      // cliff signal is untrustworthy and autocut no-ops.
+      { enabled: true, jumpRatio: resolvedMode.autocut_jump, minKeep: 1, minTopScore: resolvedMode.autocut_min_top },
       // Preserve alias-hop exact matches: applyAliasHop injects the canonical
       // page AFTER reranking, so it has no rerank_score. Without this it would
       // be dropped whenever autocut cuts on the scored set (Codex P1).
@@ -1733,6 +1931,7 @@ export async function hybridSearch(
   await stampContentFlags(engine, budgeted);
   lastResultsCount = budgeted.length;
   lastRank1Score = budgeted[0] ? (budgeted[0].base_score ?? budgeted[0].score) : undefined;
+  stampBudgetStage(degraded, budgetMeta);
   emitMeta({
     vector_enabled: true,
     detail_resolved: detailResolved,
@@ -1740,9 +1939,12 @@ export async function hybridSearch(
     intent: suggestions.intent,
     mode: resolvedMode.resolved_mode,
     embedding_column: resolvedCol.name,
+    degraded: [...degraded],
+    retrieved_count: sliced.length,
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: budgetMeta }
       : {}),
+    ...(vectorPoolUnderfill ? { vector_pool_underfilled: vectorPoolUnderfill } : {}),
     ...(adaptiveDecision ? { adaptive_return: adaptiveDecision } : {}),
     ...(autocutDecision ? { autocut: autocutDecision } : {}),
   });
@@ -1841,6 +2043,13 @@ export async function hybridSearchCached(
     // resolves) into the cache key so a row written under one exclude
     // policy can't be served to a lookup under another.
     hardExcludes: resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes),
+    // #3515 — fold the EFFECTIVE detail level into the cache key. detail
+    // gates dedup, chunk-source filtering, and the compiled_truth boost, so
+    // a `--detail low` write (compiled-truth-only result set) must never be
+    // served to a default `medium` lookup. Resolve auto-detect the same way
+    // bare hybridSearch does (opts.detail ?? autoDetectDetail(query)) so an
+    // auto-detected `high` query keys like an explicit `high` one.
+    detail: opts?.detail ?? autoDetectDetail(query),
   });
 
   // Cache decision: opts.useCache (explicit) wins over global config; global
@@ -1936,24 +2145,31 @@ export async function hybridSearchCached(
       // Budget enforcement — same pipeline tail as fresh path.
       const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, opts?.tokenBudget);
 
-      // Emit meta describing the cache path.
+      // Emit meta describing the cache path. WP2/T3 (ENG-5): spread-carry
+      // the STORED meta so every key the bare hybridSearch emitted at write
+      // time (intent, mode, embedding_column, adaptive_return, autocut,
+      // degraded, token_budget, future additions) survives the hit without
+      // a hand-copied rebuild — the class of drop Codex P2 caught for
+      // adaptive_return can't recur. Explicit fields BELOW the spread are
+      // the hit-time overrides.
       const cachedMeta: HybridSearchMeta = {
+        ...(hit.meta ?? {}),
         vector_enabled: hit.meta?.vector_enabled ?? true,
         detail_resolved: hit.meta?.detail_resolved ?? null,
         expansion_applied: hit.meta?.expansion_applied ?? false,
-        intent: hit.meta?.intent,
+        // A row stored before the degradation stamp existed (no `degraded`
+        // key, not even []) can't prove it was a clean run — surface that
+        // honestly instead of claiming clean (cache_prestamp). Post-bump
+        // rows always carry the stamp (knobsHash v-bump makes pre-stamp
+        // rows unreachable in production; this is the belt-and-braces).
+        degraded: hit.meta?.degraded ?? [{ stage: 'cache_prestamp' }],
+        // Pre-budget count for THIS response's page (offset/limit applied).
+        retrieved_count: sliced.length,
         cache: {
           status: 'hit',
           similarity: cacheSimilarity,
           age_seconds: cacheAge,
         },
-        // Carry the trimmed-set decision fields from the cached row so cache
-        // HITS report the same autocut/adaptive/mode/column meta as a fresh
-        // run (Codex P2 — the cached result set was already trimmed).
-        ...(hit.meta?.mode ? { mode: hit.meta.mode } : {}),
-        ...(hit.meta?.embedding_column ? { embedding_column: hit.meta.embedding_column } : {}),
-        ...(hit.meta?.adaptive_return ? { adaptive_return: hit.meta.adaptive_return } : {}),
-        ...(hit.meta?.autocut ? { autocut: hit.meta.autocut } : {}),
         // Per-call budget: prefer the STORED budget record, which carries
         // the true dropped count from the write-time cut — the
         // re-application above ran on an already-cut set and reads
@@ -2017,21 +2233,22 @@ export async function hybridSearchCached(
   // Token budget pass (no-op when not set).
   const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(results, opts?.tokenBudget);
 
-  // Compose the final meta and emit. v0.42.3.0 (Codex #5): carry over the
-  // inner meta's decision fields — pre-fix this manual rebuild silently dropped
-  // adaptive_return (and would drop autocut), so cached writeback/hit paths and
-  // eval-capture under-reported the feature. Propagate mode + embedding_column
-  // too (same drop class).
+  // Compose the final meta and emit. v0.42.3.0 (Codex #5) + WP2/T3 (ENG-5):
+  // spread-carry the inner meta so every field the bare hybridSearch emitted
+  // (intent, mode, embedding_column, adaptive_return, autocut, degraded,
+  // retrieved_count, token_budget, future additions) survives the wrapper —
+  // the manual-rebuild drop class (adaptive_return, Codex #5) can't recur.
+  // Explicit fields below the spread are the wrapper's own overrides.
   const finalMeta: HybridSearchMeta = {
+    ...(innerMeta ?? {}),
     vector_enabled: innerMeta?.vector_enabled ?? false,
     detail_resolved: innerMeta?.detail_resolved ?? null,
     expansion_applied: innerMeta?.expansion_applied ?? false,
-    intent: innerMeta?.intent,
+    // Always stamp: a stored row must be able to prove it was clean
+    // (cache_prestamp posture on the hit path above).
+    degraded: innerMeta?.degraded ?? [],
+    retrieved_count: innerMeta?.retrieved_count ?? results.length,
     cache: { status: cacheStatus },
-    ...(innerMeta?.mode ? { mode: innerMeta.mode } : {}),
-    ...(innerMeta?.embedding_column ? { embedding_column: innerMeta.embedding_column } : {}),
-    ...(innerMeta?.adaptive_return ? { adaptive_return: innerMeta.adaptive_return } : {}),
-    ...(innerMeta?.autocut ? { autocut: innerMeta.autocut } : {}),
     // Per-call budget: prefer the INNER meta's budget record. The inner
     // hybridSearch already enforced the same resolved budget (per-call wins
     // in resolveSearchMode), so the re-application above sees an
@@ -2051,21 +2268,42 @@ export async function hybridSearchCached(
 
   // Best-effort writeback (skip when search returned empty so we don't
   // cache zero-result queries forever — they often indicate a typo).
+  //
+  // WP2/T3 (D14.2 revised per ENG-6): a DEGRADED result set is still cached
+  // — full exclusion would amplify load exactly when a provider is limping —
+  // but only for a short TTL (~60s) and stamped with its degradation, so a
+  // salvaged set is never served as clean for the full TTL. Only embeddable
+  // degradations reach this write: a total embed outage has no
+  // queryEmbedding (store() no-ops on null) and vector_enabled=false, so it
+  // is uncacheable by construction.
   if (
     cacheStatus === 'miss' &&
     queryEmbedding &&
     results.length > 0 &&
     (innerMeta?.vector_enabled ?? false)
   ) {
+    const isDegraded = (finalMeta.degraded?.length ?? 0) > 0;
     trackCacheWrite(
       cache
-        .store(query, queryEmbedding, results, finalMeta, { sourceId: cacheScopeKey(opts), knobsHash: cacheKnobsHash })
+        .store(query, queryEmbedding, results, finalMeta, {
+          sourceId: cacheScopeKey(opts),
+          knobsHash: cacheKnobsHash,
+          ...(isDegraded ? { ttlSeconds: DEGRADED_CACHE_TTL_SECONDS } : {}),
+        })
         .catch(() => { /* swallow */ }),
     );
   }
 
   return budgeted;
 }
+
+/**
+ * WP2/T3 (D14.2) — TTL for cache rows written from a degraded run. Long
+ * enough to absorb a burst against a limping provider, short enough that a
+ * salvaged (partial) result set can't shadow the recovered pipeline for the
+ * normal cache TTL.
+ */
+export const DEGRADED_CACHE_TTL_SECONDS = 60;
 
 /**
  * RRF/dedup identity for a result row, at chunk granularity.
@@ -2244,7 +2482,9 @@ async function cosineReScore(
       console.error(`[search-debug] ${r.slug}:${r.chunk_id} cosine=${cosine.toFixed(4)} norm_rrf=${normRrf.toFixed(4)} blended=${blended.toFixed(4)}`);
     }
 
-    return { ...r, score: blended };
+    // v0.46.15: stamp the raw cosine — evidence + --explain read it (the
+    // hydration map is already paid for; zero extra probes).
+    return { ...r, score: blended, cosine };
   }).sort((a, b) => b.score - a.score);
 }
 

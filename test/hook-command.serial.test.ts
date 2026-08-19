@@ -8,7 +8,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
   copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync,
-  rmSync, utimesSync, writeFileSync,
+  rmSync, statSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import net from 'node:net';
 import { execFileSync } from 'node:child_process';
@@ -23,8 +23,10 @@ import {
   HEARTBEAT_MAX_LINES,
   DIGEST_MEMORY_CAP_BYTES,
   memoryDigest,
+  PUSH_ANNOUNCE_REFIRE_MS,
   type HookHeartbeatEntry,
 } from '../src/commands/hook.ts';
+import { pushStatusPathForRoot } from '../src/core/workspace-push.ts';
 import {
   ensureIpcSecret,
   resolveSocketPath,
@@ -36,7 +38,12 @@ import { writeReceipt } from '../src/core/bootstrap/format.ts';
 import type { RepoReceipt } from '../src/core/bootstrap/repo.ts';
 
 const FIXTURE = join(import.meta.dir, 'fixtures', 'conversation-formats', 'claude-code.jsonl');
-const ENV_KEYS = ['GBRAIN_HOME', 'DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_SOURCE', 'GBRAIN_HOOKS'] as const;
+const ENV_KEYS = [
+  'GBRAIN_HOME', 'DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_SOURCE', 'GBRAIN_HOOKS',
+  // stop-push [D3/D17/D20] + banner [D5] + cloud detection knobs
+  'GBRAIN_STOP_PUSH', 'GBRAIN_STOP_PUSH_DEBOUNCE_MIN', 'CLAUDE_CODE_REMOTE',
+  'CLAUDE_CODE_REMOTE_SESSION_ID', 'GH_TOKEN', 'GITHUB_TOKEN',
+] as const;
 
 let tmp: string;
 let saved: Record<string, string | undefined>;
@@ -127,6 +134,103 @@ describe('dispatch', () => {
     const out = collectStdout();
     expect(await runHook(['--help'], out.io)).toBe(0);
     expect(out.get()).toContain('session-start');
+  });
+
+  test('harness lane yields to a workspace bootstrap install: exit 0, no output, no heartbeat (#4043 C6)', async () => {
+    // Claude Code merges user- and project-scope hook settings; a harness
+    // (user-scope) entry plus a workspace bootstrap-v1 entry would fire the
+    // same event twice. The workspace install wins — the harness lane must
+    // yield SILENTLY on every event.
+    process.env.GBRAIN_HOOK_LANE = 'harness';
+    try {
+      const ws = mkdtempSync(join(tmpdir(), 'gb-lane-ws-'));
+      mkdirSync(join(ws, '.claude'), { recursive: true });
+      // A real workspace install wires all five events — the guard is now
+      // PER-EVENT (an event the workspace does not wire must run normally),
+      // so the fixture mirrors the full install.
+      const entry = (sub: string) => [
+        { hooks: [{ type: 'command', command: `env GBRAIN_SOURCE=ws /opt/g hook ${sub}`, _gbrain: 'bootstrap-v1' }] },
+      ];
+      writeFileSync(
+        join(ws, '.claude', 'settings.local.json'),
+        JSON.stringify({
+          hooks: {
+            SessionStart: entry('session-start'),
+            UserPromptSubmit: entry('user-prompt'),
+            Stop: entry('stop'),
+            SessionEnd: entry('session-end'),
+            PreCompact: entry('compact'),
+          },
+        }),
+      );
+      for (const event of ['session-start', 'user-prompt', 'stop', 'session-end', 'compact']) {
+        const out = collectStdout();
+        expect(await runHook([event], { ...out.io, stdin: '{}', cwd: ws })).toBe(0);
+        expect(out.get()).toBe('');
+      }
+      expect(existsSync(join(home(), 'integrations', 'hooks', 'heartbeat.jsonl'))).toBe(false);
+    } finally {
+      delete process.env.GBRAIN_HOOK_LANE;
+    }
+  });
+
+  test('harness lane runs normally when the cwd has no workspace install (fail-open both ways)', async () => {
+    process.env.GBRAIN_HOOK_LANE = 'harness';
+    try {
+      // plain dir: no .claude/settings.local.json at all
+      const plain = mkdtempSync(join(tmpdir(), 'gb-lane-plain-'));
+      const out = collectStdout();
+      // session-start in a plain dir runs the normal handler (exit 0, and it
+      // WRITES a heartbeat — proof the guard did not swallow the event).
+      expect(await runHook(['session-start'], { ...out.io, stdin: '', cwd: plain })).toBe(0);
+      expect(existsSync(join(home(), 'integrations', 'hooks', 'heartbeat.jsonl'))).toBe(true);
+
+      // harness-marker-only settings (its OWN entries) must NOT trigger the
+      // yield — only the workspace bootstrap-v1 marker does.
+      const harnessOnly = mkdtempSync(join(tmpdir(), 'gb-lane-harness-'));
+      mkdirSync(join(harnessOnly, '.claude'), { recursive: true });
+      writeFileSync(
+        join(harnessOnly, '.claude', 'settings.local.json'),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [{ hooks: [{ type: 'command', command: 'env GBRAIN_SOURCE=default /opt/g hook session-start', _gbrain: 'bootstrap-harness-v1' }] }],
+          },
+        }),
+      );
+      const out2 = collectStdout();
+      expect(await runHook(['session-start'], { ...out2.io, stdin: '', cwd: harnessOnly })).toBe(0);
+      // still ran: a fresh heartbeat line was appended for this invocation
+      const hb = readFileSync(join(home(), 'integrations', 'hooks', 'heartbeat.jsonl'), 'utf8').trim().split('\n');
+      expect(hb.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      delete process.env.GBRAIN_HOOK_LANE;
+    }
+  });
+
+  test('harness lane yields to the COMMITTED settings.json carrier too ([D12] — local strips carried events)', async () => {
+    // A D12 workspace can carry its bootstrap-v1 hooks ONLY in the committed
+    // .claude/settings.json (the local writer skips carried events). Checking
+    // settings.local.json alone would double-fire those events against the
+    // user-scope harness wiring.
+    process.env.GBRAIN_HOOK_LANE = 'harness';
+    try {
+      const ws = mkdtempSync(join(tmpdir(), 'gb-lane-committed-'));
+      mkdirSync(join(ws, '.claude'), { recursive: true });
+      writeFileSync(
+        join(ws, '.claude', 'settings.json'),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [{ hooks: [{ type: 'command', command: 'gbrain hook session-start', _gbrain: 'bootstrap-v1' }] }],
+          },
+        }),
+      );
+      const out = collectStdout();
+      expect(await runHook(['session-start'], { ...out.io, stdin: '{}', cwd: ws })).toBe(0);
+      expect(out.get()).toBe('');
+      expect(existsSync(join(home(), 'integrations', 'hooks', 'heartbeat.jsonl'))).toBe(false);
+    } finally {
+      delete process.env.GBRAIN_HOOK_LANE;
+    }
   });
 });
 
@@ -272,7 +376,7 @@ describe('user-prompt', () => {
     expect(prior.split('pages/dup').length - 1).toBeLessThanOrEqual(1);
   });
 
-  test('--harness codex flags the channel; unknown values fall back to the default', async () => {
+  test('--harness codex/opencode flags the channel; unknown values fall back to the default', async () => {
     const dataDir = join(tmp, 'data');
     writePgliteConfig(dataDir);
     const seen: TurnContextRequest[] = [];
@@ -282,13 +386,21 @@ describe('user-prompt', () => {
       ...out.io,
       stdin: JSON.stringify({ prompt: 'hello Acme' }),
     });
+    // opencode widening (v0.45.x): pins the hook.ts flag parse — a regression
+    // there silently rebadges opencode deliveries as claude-code (the wire
+    // guard half is pinned in volunteer-events-delivery.test.ts).
+    await runHook(['user-prompt', '--harness', 'opencode'], {
+      ...out.io,
+      stdin: JSON.stringify({ prompt: 'hello Acme' }),
+    });
     await runHook(['user-prompt', '--harness', 'vim'], {
       ...out.io,
       stdin: JSON.stringify({ prompt: 'hello Acme' }),
     });
-    expect(seen).toHaveLength(2);
+    expect(seen).toHaveLength(3);
     expect(seen[0].channel).toBe('codex');
-    expect(seen[1].channel).toBe('claude-code'); // fail-open to the default
+    expect(seen[1].channel).toBe('opencode');
+    expect(seen[2].channel).toBe('claude-code'); // fail-open to the default
   });
 
   test('hook ∈ STARTUP_HOOK_SKIP_COMMANDS (source grep — maybeEmitUpdateMarker no-ops under NODE_ENV=test, so no runtime test can pin this)', () => {
@@ -906,6 +1018,275 @@ describe('bootstrap push gate [G4]', () => {
   });
 });
 
+// ── stop-hook per-turn push [D3/D17/D20] ────────────────────────────────────
+//
+// SessionEnd never fires on /exit and a cloud VM can be reclaimed between
+// turns; the Stop boundary is the only always-runs cadence. These tests pin:
+// the security gate (same as session-end), per-root debounce isolation, the
+// kill switch, the failing-status bypass, and fail-open state handling.
+
+function stopIo(repo: string, spawned: string[]) {
+  return {
+    write: () => {},
+    spawnPush: (root: string) => { spawned.push(root); },
+    stdin: JSON.stringify({ session_id: 'sess-stop-push', cwd: repo }),
+  };
+}
+
+function bootRepo(name: string, opts: { repoPhase?: boolean; clean?: boolean } = {}): string {
+  const repo = join(tmp, name);
+  initGitRepoWithDirtyTree(repo);
+  writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+  if (opts.repoPhase !== false) markRepoPhaseComplete(repo);
+  if (opts.clean) {
+    execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { stdio: 'ignore' });
+    // Model a FULLY-PUSHED clean repo: origin/<branch> == HEAD, so treeNeedsPush
+    // measures zero commits ahead (a committed-but-never-pushed repo correctly
+    // reports needs-push under the new origin-ref-based measure).
+    const branch = execFileSync('git', ['-C', repo, 'branch', '--show-current'], { encoding: 'utf8' }).trim();
+    const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    execFileSync('git', ['-C', repo, 'update-ref', `refs/remotes/origin/${branch}`, head], { stdio: 'ignore' });
+  }
+  return repo;
+}
+
+const stopPushStateFiles = () => {
+  try {
+    return readdirSync(join(home(), 'bootstrap')).filter((n) => n.startsWith('stop-push-'));
+  } catch {
+    return [];
+  }
+};
+
+describe('stop-hook per-turn push [D3]', () => {
+  test('dirty initialized workspace: stop spawns the detached push, records per-root state (0600), heartbeat push_spawned', async () => {
+    const repo = bootRepo('stop-boot');
+    const spawned: string[] = [];
+    expect(await runHook(['stop'], stopIo(repo, spawned))).toBe(0);
+    expect(spawned).toHaveLength(1);
+    expect((await lastHeartbeat())?.reason).toBe('push_spawned');
+    const states = stopPushStateFiles();
+    expect(states).toHaveLength(1);
+    const mode = statSync(join(home(), 'bootstrap', states[0]!)).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  test('second stop inside the debounce window: push_debounced, no second spawn', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '5';
+    const repo = bootRepo('stop-debounce');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(1);
+    expect((await lastHeartbeat())?.reason).toBe('push_debounced');
+  });
+
+  test('GBRAIN_STOP_PUSH_DEBOUNCE_MIN=0 pushes every turn', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '0';
+    const repo = bootRepo('stop-zero');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(2);
+  });
+
+  test('cloud-sandbox default is debounce 0 (CLAUDE_CODE_REMOTE=true, no explicit knob) [D17]', async () => {
+    process.env.CLAUDE_CODE_REMOTE = 'true';
+    const repo = bootRepo('stop-cloud');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(2);
+  });
+
+  test('GBRAIN_STOP_PUSH=0 disables the per-turn push (buffer append still runs)', async () => {
+    process.env.GBRAIN_STOP_PUSH = '0';
+    const repo = bootRepo('stop-disabled');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_disabled');
+  });
+
+  test('non-bootstrap git repo: never spawns (same security boundary as session-end)', async () => {
+    const repo = join(tmp, 'stop-plain');
+    initGitRepoWithDirtyTree(repo);
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_skipped_not_bootstrap');
+  });
+
+  test('repo phase pending (no repo_url): defers, never publishes to an unverified origin', async () => {
+    const repo = bootRepo('stop-pending', { repoPhase: false });
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_deferred_repo_pending');
+  });
+
+  test('clean tree with nothing ahead: push_clean, no spawn (CRITICAL regression: buffer append unchanged)', async () => {
+    const repo = bootRepo('stop-clean', { clean: true });
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_clean');
+    // the live-buffer append still happened (stop's original contract)
+    const bufDir = join(home(), 'transcripts', 'live');
+    expect(readdirSync(bufDir).some((n) => n.includes('sess-stop-push'))).toBe(true);
+  });
+
+  test('corrupt per-root state file is treated as due (fail-open)', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '5';
+    const repo = bootRepo('stop-corrupt');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    const state = stopPushStateFiles()[0]!;
+    writeFileSync(join(home(), 'bootstrap', state), 'not json');
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(2);
+  });
+
+  test('[D20] a failing push-status bypasses the debounce (retry next turn)', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '60';
+    const repo = bootRepo('stop-retry');
+    const toplevel = execFileSync('git', ['-C', repo, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(1);
+    // Simulate the detached child recording a refusal for THIS root.
+    writeFileSync(
+      pushStatusPathForRoot(toplevel),
+      JSON.stringify({ ts: new Date().toISOString(), ok: false, reason: 'refused_visibility', repoRoot: toplevel }) + '\n',
+      { mode: 0o600 },
+    );
+    // Inside the 60s failing-retry floor: still debounced (no spawn storm)…
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(1);
+    // …but once the floor passes, the failing status bypasses the 60-MINUTE
+    // debounce window (age the state file past the floor).
+    const stateFile = join(home(), 'bootstrap', stopPushStateFiles()[0]!);
+    const aged = JSON.parse(readFileSync(stateFile, 'utf8')) as { ts: string; root: string };
+    writeFileSync(stateFile, JSON.stringify({ ...aged, ts: new Date(Date.now() - 90_000).toISOString() }) + '\n');
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(2); // floor passed → failing status bypassed the 60min window
+  });
+
+  test('[D3] two workspaces debounce independently (per-root state, no clobber)', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '60';
+    const a = bootRepo('stop-ws-a');
+    const b = join(tmp, 'stop-ws-b');
+    initGitRepoWithDirtyTree(b);
+    writeFileSync(join(b, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+    // B gets its own receipt? One receipt per home — markRepoPhaseComplete
+    // overwrites. Root-binding means only the receipt's workspace pushes; the
+    // OTHER workspace must be treated as repo-phase-pending, not crash.
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(a, spawned));
+    expect(spawned).toHaveLength(1);
+    await runHook(['stop'], stopIo(b, spawned));
+    expect(spawned).toHaveLength(1); // b defers (no receipt binding) — and does NOT clobber a's state
+    expect((await lastHeartbeat())?.reason).toBe('push_deferred_repo_pending');
+    await runHook(['stop'], stopIo(a, spawned));
+    expect(spawned).toHaveLength(1); // a still debounced — b's activity didn't reset a
+    expect((await lastHeartbeat())?.reason).toBe('push_debounced');
+  });
+});
+
+// ── push-failure banner [D5/D13/D19] ────────────────────────────────────────
+
+describe('user-prompt push-failure banner [D5]', () => {
+  // repoRoot must EXIST on disk: entries for deleted workspaces are ghosts
+  // the reader filters out by design (they could never be cleared).
+  const bannerRoot = () => {
+    const r = join(tmp, 'banner-brain');
+    mkdirSync(r, { recursive: true });
+    return r;
+  };
+  const failingStatus = (root: string, ts = new Date().toISOString()) => {
+    mkdirSync(join(home(), 'bootstrap'), { recursive: true });
+    writeFileSync(
+      pushStatusPathForRoot(root),
+      JSON.stringify({ ts, ok: false, reason: 'refused_visibility: origin unverifiable', repoRoot: root }) + '\n',
+      { mode: 0o600 },
+    );
+  };
+
+  test('failing push-status → banner-only payload on a degraded path, with BOTH additionalContext and systemMessage', async () => {
+    const root = bannerRoot();
+    failingStatus(root);
+    const out = collectStdout();
+    // No config at all → degraded no_pglite_path; the banner must still land.
+    expect(await runHook(['user-prompt'], { ...out.io, stdin: JSON.stringify({ prompt: 'hi' }) })).toBe(0);
+    const payload = JSON.parse(out.get()) as {
+      hookSpecificOutput?: { additionalContext?: string };
+      systemMessage?: string;
+    };
+    expect(payload.hookSpecificOutput?.additionalContext).toContain('FAILING');
+    expect(payload.hookSpecificOutput?.additionalContext).toContain('banner-brain');
+    expect(payload.systemMessage).toContain('NOT on GitHub');
+  });
+
+  test('banner announces once per failure ts, then stays quiet [D19]', async () => {
+    const root = bannerRoot();
+    failingStatus(root);
+    const first = collectStdout();
+    await runHook(['user-prompt'], { ...first.io, stdin: JSON.stringify({ prompt: 'hi' }) });
+    expect(first.get()).toContain('FAILING');
+    const second = collectStdout();
+    await runHook(['user-prompt'], { ...second.io, stdin: JSON.stringify({ prompt: 'hi again' }) });
+    expect(second.get()).toBe(''); // announced — no re-fire inside the floor
+  });
+
+  test('a NEW failure ts re-announces immediately; a persisting one re-fires after the 30-min floor [D19]', async () => {
+    const root = bannerRoot();
+    failingStatus(root, '2026-08-12T00:00:00.000Z');
+    const first = collectStdout();
+    await runHook(['user-prompt'], { ...first.io, stdin: JSON.stringify({ prompt: 'x' }) });
+    expect(first.get()).toContain('FAILING');
+    // Same ts + fresh announce → quiet. Age the announce past the floor → re-fires.
+    const announced = `${pushStatusPathForRoot(root)}.announced`;
+    const state = JSON.parse(readFileSync(announced, 'utf8')) as { announced_ts: string };
+    writeFileSync(
+      announced,
+      JSON.stringify({ announced_ts: state.announced_ts, last_announce_at: new Date(Date.now() - PUSH_ANNOUNCE_REFIRE_MS - 60_000).toISOString() }) + '\n',
+    );
+    const third = collectStdout();
+    await runHook(['user-prompt'], { ...third.io, stdin: JSON.stringify({ prompt: 'z' }) });
+    expect(third.get()).toContain('FAILING');
+  });
+
+  test('CRITICAL regression: ok push-status → NO banner, stdout empty on degraded paths', async () => {
+    mkdirSync(join(home(), 'bootstrap'), { recursive: true });
+    const okRoot = bannerRoot();
+    writeFileSync(
+      pushStatusPathForRoot(okRoot),
+      JSON.stringify({ ts: new Date().toISOString(), ok: true, repoRoot: okRoot }) + '\n',
+    );
+    const out = collectStdout();
+    await runHook(['user-prompt'], { ...out.io, stdin: JSON.stringify({ prompt: 'hi' }) });
+    expect(out.get()).toBe('');
+  });
+
+  test('banner rides INSIDE the main context payload when serve answers (one JSON doc, systemMessage present)', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, blockText: 'BRAIN CONTEXT BLOCK' });
+    const root = bannerRoot();
+    failingStatus(root);
+    const out = collectStdout();
+    await runHook(['user-prompt'], { ...out.io, stdin: JSON.stringify({ prompt: 'hi', session_id: 'sess-banner' }) });
+    const payload = JSON.parse(out.get()) as {
+      hookSpecificOutput?: { additionalContext?: string };
+      systemMessage?: string;
+    };
+    expect(payload.hookSpecificOutput?.additionalContext).toContain('FAILING');
+    expect(payload.hookSpecificOutput?.additionalContext).toContain('BRAIN CONTEXT BLOCK');
+    expect(payload.systemMessage).toContain('FAILING');
+  });
+});
+
 // ── user-prompt deadline degradation [D5/ENG-1] ─────────────────────────────
 
 describe('user-prompt deadline', () => {
@@ -935,5 +1316,201 @@ describe('user-prompt deadline', () => {
     expect(hb?.event).toBe('user-prompt');
     expect(hb?.outcome).toBe('degraded');
     expect(hb?.reason).toBe('deadline');
+  });
+});
+
+// ── compact segment lane + session-end remainder [cathedral 5] ──────────────
+
+const boundaryLine = () =>
+  JSON.stringify({ type: 'system', subtype: 'compact_boundary', content: 'conversation compacted' });
+
+describe('compact segment lane (cathedral 5)', () => {
+  const corpus = () => join(home(), 'transcripts', 'corpus');
+
+  test('banks a content-addressed since-last-boundary segment + ledger; heartbeat carries the code', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'c.jsonl', [
+      userLine('OLD-WINDOW-TEXT before the prior boundary'),
+      boundaryLine(),
+      userLine('NEW-WINDOW-TEXT after the prior boundary'),
+      assistantLine('assistant reply in the new window'),
+    ]);
+    expect(
+      await runHook(['compact'], {
+        stdin: JSON.stringify({ session_id: 'sess-seg', transcript_path: transcript }),
+        transcriptRoot: projRoot,
+      }),
+    ).toBe(0);
+    const files = readdirSync(corpus()).filter((f) => f.startsWith('sess-seg.seg-') && f.endsWith('.txt'));
+    expect(files).toHaveLength(1);
+    const body = readFileSync(join(corpus(), files[0]), 'utf8');
+    expect(body).toContain('NEW-WINDOW-TEXT');
+    expect(body).not.toContain('OLD-WINDOW-TEXT');
+    const ledger = JSON.parse(readFileSync(join(corpus(), 'sess-seg.ledger.json'), 'utf8')) as Array<{ hash: string }>;
+    expect(ledger).toHaveLength(1);
+    expect(files[0]).toContain(ledger[0].hash);
+    const hb = await lastHeartbeat();
+    expect(hb?.event).toBe('compact');
+    expect(hb?.segment).toBe('segment_banked');
+    // No serve configured in this test home — the banking IPC degrades AFTER
+    // the segment was durably written (durability-first ordering).
+    expect(hb?.outcome).toBe('degraded');
+    expect(hb?.reason).toBe('no_pglite_path');
+  });
+
+  test('identical retry is idempotent: same file, segment_dup, single ledger entry', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'd.jsonl', [
+      userLine('window content that will retry'),
+    ]);
+    const io = {
+      stdin: JSON.stringify({ session_id: 'sess-dup2', transcript_path: transcript }),
+      transcriptRoot: projRoot,
+    };
+    await runHook(['compact'], io);
+    await runHook(['compact'], { ...io });
+    const files = readdirSync(corpus()).filter((f) => f.startsWith('sess-dup2.seg-'));
+    expect(files).toHaveLength(1);
+    const ledger = JSON.parse(readFileSync(join(corpus(), 'sess-dup2.ledger.json'), 'utf8')) as unknown[];
+    expect(ledger).toHaveLength(1);
+    expect((await lastHeartbeat())?.segment).toBe('segment_dup');
+  });
+
+  test('transcript ending AT a boundary ⇒ empty_window, no segment written', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'e.jsonl', [
+      userLine('everything is before the boundary'),
+      boundaryLine(),
+    ]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-empty', transcript_path: transcript }),
+      transcriptRoot: projRoot,
+    });
+    expect(readdirSync(corpus()).filter((f) => f.startsWith('sess-empty.seg-'))).toEqual([]);
+    expect((await lastHeartbeat())?.segment).toBe('empty_window');
+  });
+
+  test('deadline below the scan budget ⇒ deadline_scan, nothing written (never unscanned)', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'f.jsonl', [userLine('some window text')]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-dl', transcript_path: transcript }),
+      transcriptRoot: projRoot,
+      compactDeadlineMs: 500, // < SEGMENT_MIN_BUDGET_MS(600) ⇒ deterministic deadline_scan
+    });
+    expect(existsSync(join(corpus(), 'sess-dl.ledger.json'))).toBe(false);
+    expect(readdirSync(existsSync(corpus()) ? corpus() : tmp).filter((f) => f.startsWith('sess-dl.seg-'))).toEqual([]);
+    expect((await lastHeartbeat())?.segment).toBe('deadline_scan');
+  });
+
+  test('segment content is secret-scanned at write time', async () => {
+    const projRoot = join(tmp, 'projects');
+    const planted = 'sk-' + 'FAKEfakeFAKEfake1234567890';
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'g.jsonl', [
+      userLine(`the key is ${planted} in the compact window`),
+    ]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-red2', transcript_path: transcript }),
+      transcriptRoot: projRoot,
+    });
+    const files = readdirSync(corpus()).filter((f) => f.startsWith('sess-red2.seg-'));
+    expect(files).toHaveLength(1);
+    const body = readFileSync(join(corpus(), files[0]), 'utf8');
+    expect(body).not.toContain(planted);
+    expect(body).toContain('<REDACTED:openai>');
+  });
+});
+
+describe('session-end remainder (cathedral 5 dedup contract)', () => {
+  const corpus = () => join(home(), 'transcripts', 'corpus');
+
+  test('remainder-only when the compact-banked segment covers the boundary window', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    // 1. Compact fires BEFORE the boundary is written: window = w1.
+    const preCompact = seedTranscript(join(projRoot, 'p1'), 'r1.jsonl', [
+      userLine('W1-ONLY-TEXT first window'),
+    ]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-rem', transcript_path: preCompact }),
+      transcriptRoot: projRoot,
+    });
+    expect((await lastHeartbeat())?.segment).toBe('segment_banked');
+    // 2. The harness appends the boundary + the post-compaction turns.
+    const full = seedTranscript(join(projRoot, 'p1'), 'r1.jsonl', [
+      userLine('W1-ONLY-TEXT first window'),
+      boundaryLine(),
+      userLine('REMAINDER-TEXT second window'),
+    ]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-rem', transcript_path: full, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const body = readFileSync(join(corpus(), 'sess-rem.txt'), 'utf8');
+    expect(body).toContain('REMAINDER-TEXT');
+    expect(body).not.toContain('W1-ONLY-TEXT'); // already segment-banked — not re-written
+    expect((await lastHeartbeat())?.segment).toBe('remainder');
+  });
+
+  test('no ledger coverage ⇒ full-transcript fallback exactly as before', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    const full = seedTranscript(join(projRoot, 'p1'), 'r2.jsonl', [
+      userLine('W1-TEXT'),
+      boundaryLine(),
+      userLine('W2-TEXT'),
+    ]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-fb', transcript_path: full, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const body = readFileSync(join(corpus(), 'sess-fb.txt'), 'utf8');
+    expect(body).toContain('W1-TEXT');
+    expect(body).toContain('W2-TEXT');
+    expect((await lastHeartbeat())?.segment).toBe('full_fallback');
+  });
+
+  test('covered with empty remainder ⇒ skip_covered, no session corpus file written', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    const preCompact = seedTranscript(join(projRoot, 'p1'), 'r3.jsonl', [
+      userLine('ALL-BANKED-TEXT'),
+    ]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-skip', transcript_path: preCompact }),
+      transcriptRoot: projRoot,
+    });
+    const full = seedTranscript(join(projRoot, 'p1'), 'r3.jsonl', [
+      userLine('ALL-BANKED-TEXT'),
+      boundaryLine(),
+    ]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-skip', transcript_path: full, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    expect(existsSync(join(corpus(), 'sess-skip.txt'))).toBe(false);
+    expect((await lastHeartbeat())?.segment).toBe('skip_covered');
+  });
+
+  test('orphaned sidecars are GC-ed at session-end; live pairs kept', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(corpus(), { recursive: true });
+    writeFileSync(join(corpus(), 'gone.txt.ingested'), '');
+    writeFileSync(join(corpus(), 'live.txt'), 'x');
+    writeFileSync(join(corpus(), 'live.txt.in-progress'), '');
+    const t1 = seedTranscript(join(projRoot, 'p1'), 'r4.jsonl', [userLine('gc trigger content')]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-gc', transcript_path: t1, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const names = readdirSync(corpus());
+    expect(names).not.toContain('gone.txt.ingested');
+    expect(names).toContain('live.txt');
+    expect(names).toContain('live.txt.in-progress');
   });
 });

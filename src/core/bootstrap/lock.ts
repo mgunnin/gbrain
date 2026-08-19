@@ -57,6 +57,10 @@ export type BootstrapErrorCode =
   /** Privacy verify could not complete (rate limit / 5xx) — refuse and name
    * the reason, never fail-open; the fix is re-running, not panic [G8]. */
   | 'VERIFY_UNAVAILABLE'
+  /** Cloud sandbox: a repo created mid-session is never attached to the
+   * session's GitHub proxy scope (REST 403, push denied) — creation must
+   * happen outside; the session is opened ON the repo, then attach [D-cloud]. */
+  | 'CLOUD_SANDBOX_REPO'
   /** No agent.json — not an agent workspace. */
   | 'NOT_A_WORKSPACE'
   /** agent.json says `initialized: false` — an unrendered template clone [CX2-1]. */

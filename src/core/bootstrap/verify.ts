@@ -35,12 +35,13 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { operations, type Operation, type OperationContext } from '../operations.ts';
 import { loadConfigFileOnly, type GBrainConfig } from '../config.ts';
+import { detectExecutionEnvironment } from '../execution-env.ts';
 import { resolveGbrainHome } from '../gbrain-home.ts';
 import { realpathOrResolve } from '../path-confine.ts';
 import { runMaintenanceSweep } from '../sweep.ts';
 import { detectCapabilities, renderCapabilityReport, type CapabilityReport } from '../capability.ts';
 import { loadWorkspaceAllowlist, matchesGlob, scanFiles, type SecretFinding } from '../secret-scan.ts';
-import { PUSH_DENY_GLOBS, verifyRemotePrivacy, pushStatusPath } from '../workspace-push.ts';
+import { PUSH_DENY_GLOBS, verifyRemotePrivacy, readPushStatuses, summarizePushStatuses } from '../workspace-push.ts';
 import { FACTS_DEFAULT_VISIBILITY_KEY } from '../facts/visibility.ts';
 import { byteFloors } from './render.ts';
 import { BOOTSTRAP_TEMPLATES, loadQuestionBank } from './assets.ts';
@@ -74,6 +75,9 @@ export interface VerifyReport {
   capability: CapabilityReport;
   /** The three scripted first-run prompts [D3.6/A4]. */
   tour: string[];
+  /** The OOBE hand-off lines (ownership + the cold-start next action) —
+   *  unconditional in the shape like `tour`; printed in the report on PASS. */
+  handoff: string[];
 }
 
 export interface VerifyOpts {
@@ -96,11 +100,15 @@ export const VERIFY_PROBE_ENTITY_SLUG = 'wiki/bootstrap-verify-probe-entity';
 /** Deterministic magic-moment token the fence fact carries [CX-P0.5]. */
 export const VERIFY_MAGIC_TOKEN = 'verify-lighthouse-passphrase';
 
-/** The three scripted first-run prompts [D3.6] — pinned by the A4 snapshot test. */
+/** The three scripted first-run prompts [D3.6] — pinned by the A4 snapshot test.
+ *  Exactly three (the count is copy-pinned here, in BOOTSTRAP_FOR_AGENTS.md,
+ *  and the A4 plan). Prompt 3 must be TRUE on day one — the brain is empty at
+ *  install, so "everything ingested so far" would be an anticlimax; the
+ *  round-trip fact from prompt 2 is the honest day-one payoff. */
 export const FIRST_RUN_TOUR: readonly string[] = [
   '"Who am I to you?" — identity from SOUL.md/USER.md, no lookup needed.',
-  '"Remember that <one small true fact>." Then restart the session and ask me about it — that round-trip is the whole product.',
-  '"What do you know about this project?" — brain recall over everything ingested so far.',
+  '"Remember that <one small true fact>." — it lands in the brain, not this chat.',
+  '"What do you remember about me?" — asked in the NEW session: on day one that is the fact from prompt 2, recalled from the brain. Every session after this adds more. That round-trip is the whole product.',
 ];
 
 // ---------------------------------------------------------------------------
@@ -317,19 +325,105 @@ function checkDenyGlobs(ws: string): VerifyCheck {
   }
 }
 
-function checkRepoPrivacy(ws: string): VerifyCheck {
+/** Self-repair channel for existing installs [B8]: a git-TRACKED .mcp.json
+ * carries an absolute machine-specific binary path into the private repo.
+ * Fresh renders gitignore it; this warn heals pre-fix installs. Never gates. */
+function checkMcpJsonHygiene(ws: string): VerifyCheck {
+  const id = 'mcp_json_hygiene';
+  try {
+    if (!existsSync(join(ws, '.mcp.json'))) return { id, ok: true, detail: 'no .mcp.json in the workspace' };
+    try {
+      execFileSync('git', ['-C', ws, 'ls-files', '--error-unmatch', '.mcp.json'], {
+        stdio: 'ignore', timeout: 5_000,
+      });
+    } catch {
+      return { id, ok: true, detail: '.mcp.json present but untracked (gitignored) — correct' };
+    }
+    return {
+      id,
+      ok: true, // warn-only: informational, never gating
+      detail:
+        'WARN: machine-specific .mcp.json is COMMITTED to the repo — run `git rm --cached .mcp.json` ' +
+        '(bootstrap now gitignores it; it regenerates via `claude mcp add` / `bootstrap hooks --repair`)',
+    };
+  } catch (e) {
+    return { id, ok: true, detail: `mcp.json hygiene probe failed (${(e as Error).message})` };
+  }
+}
+
+/** [D12 upgrade-path guard]: an event carried by BOTH hook files double-fires
+ * every turn (possible when the committed carrier arrives via git pull onto a
+ * machine whose local file predates the dedupe-aware writers). Warn-only. */
+function checkHookCarrierOverlap(ws: string): VerifyCheck {
+  const id = 'hook_carrier_overlap';
+  try {
+    const events = (['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd'] as const).filter((event) => {
+      const has = (rel: string): boolean => {
+        try {
+          const parsed = JSON.parse(readFileSync(join(ws, rel), 'utf8')) as { hooks?: Record<string, unknown> };
+          const groups = parsed?.hooks?.[event];
+          return Array.isArray(groups) && JSON.stringify(groups).includes('"_gbrain"');
+        } catch {
+          return false;
+        }
+      };
+      return has(join('.claude', 'settings.json')) && has(join('.claude', 'settings.local.json'));
+    });
+    if (events.length === 0) return { id, ok: true, detail: 'no event fires from both hook carriers' };
+    return {
+      id,
+      ok: true, // warn-only self-repair channel
+      detail: `WARN: ${events.join(', ')} fire from BOTH .claude/settings.json and settings.local.json (double-fire) — run \`gbrain bootstrap hooks --repair\` to dedupe`,
+    };
+  } catch (e) {
+    return { id, ok: true, detail: `carrier overlap probe failed (${(e as Error).message})` };
+  }
+}
+
+async function checkRepoPrivacy(ws: string): Promise<VerifyCheck> {
   const id = 'repo_privacy';
   try {
     const origin = gitOriginUrl(ws);
     if (!origin) {
       return { id, ok: true, detail: 'local-only (no origin remote) — run `gbrain bootstrap repo` any time to add the private body' };
     }
-    const verdict = verifyRemotePrivacy(ws);
+    const verdict = await verifyRemotePrivacy(ws);
     if (verdict.verdict === 'private') return { id, ok: true, detail: `origin verified private (${origin})` };
     if (verdict.verdict === 'not_private') return { id, ok: false, detail: `origin is NOT private: ${verdict.detail} — make it private before pushing workspace contents` };
     return { id, ok: false, detail: `origin visibility unverifiable (${verdict.detail}) — refusing to bless an unverified remote [G8]; re-run once gh works` };
   } catch (e) {
     return { id, ok: false, detail: `repo privacy check failed: ${(e as Error).message}` };
+  }
+}
+
+/** Informational, NEVER gating [D-cloud]: name the detected execution
+ * environment and its expected degradations so an installing agent (and the
+ * pasted verify report) states them as facts instead of rediscovering them
+ * as mystery failures. */
+function checkExecutionEnvironment(): VerifyCheck {
+  const id = 'execution_env';
+  try {
+    const env = detectExecutionEnvironment();
+    if (env === 'cloud-sandbox') {
+      return {
+        id,
+        ok: true,
+        detail:
+          'cloud sandbox detected — expected degradations: no crontab (scheduled pull skipped; per-turn/session-end pushes cover it); ' +
+          'GitHub GraphQL always blocked and REST scoped to session-attached repos (privacy verification falls back to git protocol); ' +
+          'pushes restricted to the session\'s working branch; only repo-committed files carry into the next session',
+      };
+    }
+    if (env === 'ephemeral-container') {
+      return {
+        id,
+        ok: true,
+        detail: 'container detected — no reliable scheduler (scheduled pull skipped); event-driven pushes cover persistence',
+      };
+    }
+    return { id, ok: true, detail: 'local machine — full persistence surface available' };
+  } catch (e) {
+    return { id, ok: true, detail: `environment detection failed (${(e as Error).message}) — treated as local` };
   }
 }
 
@@ -391,15 +485,32 @@ function checkMcpSurface(): VerifyCheck {
 }
 
 /**
+ * Pure, engine-free derivation of the collision-fallback source_id for a
+ * workspace — a deterministic hash of the workspace's real path, no DB
+ * lookup involved. `resolveSourceIdCollision` (below) is the only thing that
+ * decides WHETHER this id is actually needed (that half requires the engine,
+ * since the sources registry lives only in the DB) — but the id itself is
+ * safe to preview from an engine-free phase. `bootstrap hooks` does exactly
+ * that, so a human has the fallback id in hand before they ever hand-register
+ * a source, instead of discovering it only after an FK error + a corrective
+ * `verify` run.
+ */
+export function deriveWorkspaceSourceId(ws: string): string {
+  const hash = createHash('sha256').update(realpathOrResolve(ws)).digest('hex').slice(0, 8);
+  return `workspace-${hash}`;
+}
+
+/**
  * source_id collision resolution [engine seam]. Render is ENGINE-FREE and the
  * sources registry lives ONLY in the DB (no registry file exists), so verify —
  * the one bootstrap subcommand holding an engine — is where a manifest
  * source_id already registered to a DIFFERENT checkout is detected. On
- * collision it derives a stable `workspace-<8char-path-hash>` id, persists it
- * to agent.json (render preserves it on re-render), and names the re-register
- * steps; every consumer (hooks GBRAIN_SOURCE env, verify, status hints,
- * attach, repo persistence) reads manifest.source_id, so the derived id
- * propagates. Returns a sourceId ONLY when it derived one.
+ * collision it derives a stable `workspace-<8char-path-hash>` id (via
+ * `deriveWorkspaceSourceId`), persists it to agent.json (render preserves it
+ * on re-render), and names the re-register steps; every consumer (hooks
+ * GBRAIN_SOURCE env, verify, status hints, attach, repo persistence) reads
+ * manifest.source_id, so the derived id propagates. Returns a sourceId ONLY
+ * when it derived one.
  */
 async function resolveSourceIdCollision(
   engine: BrainEngine,
@@ -419,8 +530,7 @@ async function resolveSourceIdCollision(
     if (realpathOrResolve(registered) === realpathOrResolve(brainDir)) {
       return { sourceId: null, check: null }; // same checkout — no collision
     }
-    const hash = createHash('sha256').update(realpathOrResolve(ws)).digest('hex').slice(0, 8);
-    const derived = `workspace-${hash}`;
+    const derived = deriveWorkspaceSourceId(ws);
     writeManifest(ws, { ...state.manifest, source_id: derived });
     return {
       sourceId: derived,
@@ -460,7 +570,6 @@ async function runRoundtrip(
   const putPage = findOp('put_page');
   const getPage = findOp('get_page');
   const queryOp = findOp('query');
-  const deletePage = findOp('delete_page');
 
   await sweepProbeLeftovers(engine, ws, sourceId);
 
@@ -565,10 +674,16 @@ async function runRoundtrip(
   }
 
   // 6. Delete the probes [G13] — failure is a WARNING, never a verify fail.
+  // HARD delete via the engine primitive (same as sweepProbeLeftovers): the
+  // probe is not user content and verify is a trusted local caller. The
+  // delete_page OP is a v0.26.5 SOFT delete (sets deleted_at, row stays in
+  // pages until the 72h purge) — using it here left two probe tombstones in
+  // the user's brain after every verify run, visible to include_deleted
+  // readers and pinned as residue by the Postgres e2e cleanup assertion.
   const deleteWarnings: string[] = [];
   for (const slug of [VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]) {
     try {
-      await deletePage.handler(ctx, { slug });
+      await engine.deletePage(slug, { sourceId });
     } catch (e) {
       deleteWarnings.push(`${slug}: ${(e as Error).message}`);
     }
@@ -692,11 +807,19 @@ async function checkHooksSmoke(engine: BrainEngine, ws: string, sourceId: string
 function checkPushProbe(ws: string): VerifyCheck {
   const id = 'push_probe';
   try {
-    const p = pushStatusPath();
-    if (existsSync(p)) {
-      const s = JSON.parse(readFileSync(p, 'utf8')) as { ts?: string; ok?: boolean; reason?: string };
-      if (s.ok === true) return { id, ok: true, detail: `last workspace push succeeded (${s.ts ?? 'unknown time'})` };
-      return { id, ok: true, warn: true, detail: `last workspace push FAILED (${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown'} — run \`gbrain sources push --path ${ws}\`` };
+    // Read through the shared per-root reader [D8/D13] — a v0.45.8+ push
+    // writes push-status-<roothash>.json, not the legacy single file, so the
+    // old direct read reported "no push recorded" on every fresh install.
+    const entries = readPushStatuses();
+    if (entries.length > 0) {
+      const { failing } = summarizePushStatuses(entries);
+      if (failing.length > 0) {
+        const s = failing[0]!;
+        const rest = failing.length > 1 ? ` [+${failing.length - 1} more]` : '';
+        return { id, ok: true, warn: true, detail: `last workspace push FAILED (${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown'}${rest} — run \`gbrain sources push --path ${s.repoRoot ?? ws}\`` };
+      }
+      const ok = entries.find((e) => e.ok === true);
+      return { id, ok: true, detail: `last workspace push succeeded (${ok?.ts ?? 'unknown time'})` };
     }
     const origin = gitOriginUrl(ws);
     if (origin) return { id, ok: true, warn: true, detail: 'origin exists but no push recorded yet — run `gbrain sources push` once to prove the persistence path' };
@@ -813,7 +936,10 @@ export async function verifyWorkspace(
   checks.push(checkByteFloors(ws));
   checks.push(checkSecretScan(ws));
   checks.push(checkDenyGlobs(ws));
-  checks.push(checkRepoPrivacy(ws));
+  checks.push(await checkRepoPrivacy(ws));
+  checks.push(checkExecutionEnvironment());
+  checks.push(checkMcpJsonHygiene(ws));
+  checks.push(checkHookCarrierOverlap(ws));
 
   // Round-trip family only makes sense on a reachable engine.
   if (engineHealthy) {
@@ -834,9 +960,11 @@ export async function verifyWorkspace(
 
   checks.push(checkPushProbe(ws));
   checks.push(checkInertSkills(ws, caps));
-  checks.push({ id: 'first_run_tour', ok: true, detail: 'three scripted prompts appended to the report [D3.6]' });
+  const tourCheck = { id: 'first_run_tour', ok: true, detail: 'three scripted prompts appended to the report' };
+  checks.push(tourCheck);
 
   const ok = checks.every((c) => c.ok || c.warn === true);
+  if (!ok) tourCheck.detail = 'tour withheld — prints on PASS';
 
   const ts = new Date().toISOString();
   persistVerifyRun(gbrainHomeDir, { ts, ok, checks });
@@ -850,8 +978,57 @@ export async function verifyWorkspace(
   lines.push('');
   lines.push(renderCapabilityReport(caps));
   lines.push('');
-  lines.push('First-run tour — hand these three prompts to your human, in order:');
-  FIRST_RUN_TOUR.forEach((p, i) => lines.push(`  ${i + 1}. ${p}`));
+  // The tour celebrates a WORKING install — under a FAIL banner it reads as
+  // a mixed signal ("broken, but go enjoy it"). Gate the report lines on ok;
+  // the returned `tour` array (and --json field) stays unconditional so
+  // machine consumers keep a stable shape.
+  const handoff = buildHandoff(ws);
+  if (ok) {
+    lines.push('First-run tour — have your human RESTART the session first');
+    lines.push('(a fresh session proves the files and the brain, not this chat),');
+    lines.push('then try these three prompts in order:');
+    FIRST_RUN_TOUR.forEach((p, i) => lines.push(`  ${i + 1}. ${p}`));
+    lines.push('');
+    for (const h of handoff) lines.push(h);
+  } else {
+    lines.push('Fix the FAIL checks above and re-run — the first-run tour prints on PASS.');
+  }
 
-  return { ok, checks, report: lines.join('\n'), capability: caps, tour: [...FIRST_RUN_TOUR] };
+  return { ok, checks, report: lines.join('\n'), capability: caps, tour: [...FIRST_RUN_TOUR], handoff };
+}
+
+/**
+ * The post-tour hand-off block [OOBE]: the two things a fresh user must walk
+ * away UNDERSTANDING, in priority order —
+ *   1. OWNERSHIP: the brain is markdown in a repo THEY own (or local-only,
+ *      with the one command that gives it a durable home). Ownership is the
+ *      trust story; say the URL, say what owning it means.
+ *   2. THE ONE NEXT ACTION: run the cold-start skill. An empty brain is a
+ *      database; every flagship skill (book-mirror, briefings, meeting prep)
+ *      only becomes magical once the brain holds the user's real life —
+ *      cold-start is the designed filler (Gmail/calendar/contacts via
+ *      ClawVisor, or offline archives), one consented phase at a time.
+ * Returned unconditionally in the machine shape (like `tour`); printed in
+ * the report only on PASS. Relay it to the human verbatim.
+ */
+export function buildHandoff(ws: string): string[] {
+  const origin = gitOriginUrl(ws);
+  const ownership = origin
+    ? [
+        `What you own: every memory your agent keeps is a markdown file in YOUR private repo — ${origin}.`,
+        'Read it any time, take it to a second machine (`gbrain bootstrap attach`), or delete it and the brain is gone. It is yours.',
+      ]
+    : [
+        'What you own: your agent\'s memory is markdown on this machine only (no remote yet).',
+        'Run `gbrain bootstrap repo` any time to give it a private GitHub home you own — readable, portable, deletable.',
+      ];
+  return [
+    ...ownership,
+    '',
+    'Fill it next: an empty brain is a database; a filled one is a memory.',
+    'Ask your agent to run the cold-start skill — it imports your real life',
+    '(Gmail, calendar, contacts via ClawVisor, an OAuth vault so the agent never',
+    'holds raw tokens; or offline archives like Google Takeout), one consented',
+    'phase at a time. Each phase is independently valuable — stop whenever.',
+  ];
 }

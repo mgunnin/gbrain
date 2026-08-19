@@ -54,8 +54,9 @@ export interface FactsBackstopCtx {
    *   - 'mcp:extract_facts'  — explicit MCP op (inline mode)
    *   - 'file_upload'        — file_upload import path
    *   - 'code_import'        — code import path
+   *   - 'hook:compact'       — compaction-boundary checkpoint harvest (cathedral 5)
    */
-  source: 'sync:import' | 'mcp:put_page' | 'mcp:extract_facts' | 'file_upload' | 'code_import';
+  source: 'sync:import' | 'mcp:put_page' | 'mcp:extract_facts' | 'file_upload' | 'code_import' | 'hook:compact';
   /** Execution mode — D8. Default 'queue' (fire-and-forget). */
   mode?: 'queue' | 'inline';
   /** Notability filter — D4. Default 'all'; sync uses 'high-only'. */
@@ -78,7 +79,7 @@ export type FactsBackstopResult =
       mode: 'queue';
       enqueued: boolean;
       queueDepth: number;
-      skipped?: 'extraction_disabled' | 'queue_overflow' | 'queue_shutdown' | `eligibility_failed:${string}`;
+      skipped?: 'extraction_disabled' | 'extraction_unavailable' | 'queue_overflow' | 'queue_shutdown' | `eligibility_failed:${string}`;
     }
   | {
       mode: 'inline';
@@ -86,7 +87,9 @@ export type FactsBackstopResult =
       duplicate: number;
       superseded: number;
       fact_ids: number[];
-      skipped?: 'extraction_disabled' | `eligibility_failed:${string}`;
+      skipped?: 'extraction_disabled' | 'extraction_unavailable' | `eligibility_failed:${string}`;
+      /** Set when the LLM extraction step failed non-transport-fatally (see runPipelineWithBody). */
+      skipped_reason?: import('./extract.ts').ExtractFailureReason;
     };
 
 interface ParsedPageInput {
@@ -125,6 +128,90 @@ export function __resetBackstopWarningsForTests(): void {
 }
 
 /**
+ * ONE sentence for every keyless-extraction surface (backstop note, doctor's
+ * facts_extraction_health) — a future provider addition edits it here only.
+ */
+export const KEYLESS_EXTRACTION_GUIDANCE =
+  'memory comes from agent-authored `## Facts` fences and the `remember` verb. ' +
+  'One optional key enables automatic extraction (OpenAI or Anthropic).';
+
+const KEYLESS_NOTE =
+  `[facts] keyless: automatic fact extraction off — ${KEYLESS_EXTRACTION_GUIDANCE}`;
+
+/**
+ * Classify a chat_unavailable extraction failure: an EXPECTED keyless state
+ * (calm — one stderr note, no ingest_log row) vs a keyed-but-failing state
+ * (visible — absorb-log row + fix hint). Keyless means: the resolved model's
+ * provider has no usable key AND no chat-capable provider key exists at all
+ * (merged file-plane + process env). Computed from the RESOLVED model, never
+ * the engine-blind detectCapabilities() — a servable DB-plane override must
+ * never classify as keyless (CX1).
+ */
+export async function classifyUnavailable(model: string | undefined): Promise<'keyless' | 'keyed'> {
+  const { mergedProviderEnv } = await import('../ai/provider-env.ts');
+  const { providerKeyReady, PROVIDER_TIER_DEFAULTS } = await import('../model-config.ts');
+  let cfg = null;
+  try {
+    const { loadConfig } = await import('../config.ts');
+    cfg = loadConfig();
+  } catch {
+    // Fail toward RETRY, not calm consumption (loadConfig swallows file
+    // errors itself, so this only fires on pathological import failures).
+    return 'keyed';
+  }
+  const merged = mergedProviderEnv(cfg, process.env);
+  if (model && providerKeyReady(model, merged)) return 'keyed';
+  const anyChatKey = PROVIDER_TIER_DEFAULTS.some((e) => !!merged[e.envKey]);
+  if (!anyChatKey) {
+    // Before declaring keyless, check for a config file that EXISTS but
+    // yielded nothing (EACCES, disk error, corrupt JSON — loadConfig returns
+    // null for all of them, indistinguishable from "no config"). That file
+    // may hold the only key this worker has; classifying it keyless would
+    // calmly consume a job that a retry after repair would have served.
+    try {
+      const { loadConfigFileOnly, configPath } = await import('../config.ts');
+      const { existsSync } = await import('node:fs');
+      if (loadConfigFileOnly() === null && existsSync(configPath())) return 'keyed';
+    } catch {
+      return 'keyed';
+    }
+  }
+  return anyChatKey ? 'keyed' : 'keyless';
+}
+
+/**
+ * Shared visibility for a non-transport extraction failure: keyless stays a
+ * calm one-line note with NO log row (expected state); keyed-but-failing
+ * writes one ingest_log row (doctor's facts_extraction_health reads it) plus
+ * a once-per-process fix hint.
+ */
+async function surfaceExtractionFailure(
+  engine: BrainEngine,
+  ref: string,
+  reason: import('./absorb-log.ts').FactsAbsorbReason,
+  model: string | undefined,
+  sourceId: string,
+): Promise<void> {
+  if (reason === 'chat_unavailable' && (await classifyUnavailable(model)) === 'keyless') {
+    warnOnce('facts-keyless', KEYLESS_NOTE);
+    return;
+  }
+  const { writeFactsAbsorbLog } = await import('./absorb-log.ts');
+  await writeFactsAbsorbLog(
+    engine,
+    ref,
+    reason,
+    `extraction ${reason}${model ? ` (model=${model})` : ''}`,
+    sourceId,
+  );
+  warnOnce(
+    `facts-extract-fail-${reason}`,
+    `[facts] extraction ${reason}${model ? ` (model=${model})` : ''}. ` +
+    `Fix: set the provider's API key, or \`gbrain config set facts.extraction_model <provider:model>\`.`,
+  );
+}
+
+/**
  * Run the facts pipeline for one page write. See module docstring for
  * the full lifecycle and mode semantics.
  *
@@ -154,6 +241,35 @@ export async function runFactsBackstop(
       ? { mode: 'queue', enqueued: false, queueDepth: 0, skipped }
       : { mode: 'inline', inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], skipped };
   }
+
+  // --- Extraction availability gate (engine-aware, EXECUTION-process only) ---
+  // Resolves the ACTUAL extraction model (facts.extraction_model /
+  // models.default / tier config / GBRAIN_MODEL / key-aware tier default) and
+  // asks the gateway whether it's servable. Deliberately NOT
+  // detectCapabilities(): that probe is engine-blind and would permanently
+  // drop work for installs whose DB-plane override IS servable.
+  //
+  // CRITICAL placement rule: this gate only fires in the process that will
+  // EXECUTE the extraction — the in-process queue lane and the inline lane
+  // (which includes the durable facts-absorb handler running in the jobs
+  // worker). It must NOT fire before the short-lived-CLI durable submit: the
+  // submitting process's env can differ from the worker's (launchers neuter
+  // keys in hook subprocesses — the #1249 class — while the worker holds the
+  // real key and even re-folds file-plane keys per job), so an enqueue-time
+  // skip there would silently drop work a keyed worker could execute.
+  // Returns the resolved model on pass (threaded into the pipeline so
+  // extraction does NOT re-resolve it — the resolve is up to 3 sequential
+  // engine.getConfig round-trips per page write), or null on gate failure.
+  const availabilityGate = async (): Promise<string | null> => {
+    const { getFactsExtractionModel } = await import('./extract.ts');
+    const { isAvailable } = await import('../ai/gateway.ts');
+    const extractionModel = ctx.model ?? (await getFactsExtractionModel(ctx.engine));
+    if (isAvailable('chat', extractionModel)) return extractionModel;
+    await surfaceExtractionFailure(
+      ctx.engine, parsedPage.slug, 'chat_unavailable', extractionModel, ctx.sourceId,
+    );
+    return null;
+  };
 
   // --- Mode dispatch ---
   if (mode === 'queue') {
@@ -194,7 +310,14 @@ export async function runFactsBackstop(
             // Content-hash key: re-submits after edits, dedups rapid
             // identical writes (idempotent ON CONFLICT returns existing row).
             idempotency_key: `facts-absorb:${ctx.sourceId}:${parsedPage.slug}:${contentHash}`,
-            max_attempts: 3,
+            // 5 attempts at a 60s exponential base (not the 3×1s default):
+            // execution-time chat_unavailable is config drift the operator
+            // fixes on a human timescale — 3 attempts in ~seconds would
+            // exhaust before any fix lands. On exhaustion the job parks as a
+            // VISIBLE failure (`gbrain jobs list --status failed`,
+            // re-runnable), never a silent consume.
+            max_attempts: 5,
+            backoff_delay: 60_000,
             timeout_ms: 180_000,
           },
         );
@@ -207,6 +330,12 @@ export async function runFactsBackstop(
         );
       }
     }
+    // In-process queue lane: THIS process executes the extraction — gate here.
+    const queueModel = await availabilityGate();
+    if (!queueModel) {
+      return { mode: 'queue', enqueued: false, queueDepth: 0, skipped: 'extraction_unavailable' };
+    }
+    ctx = { ...ctx, model: queueModel };
     const { getFactsQueue } = await import('./queue.ts');
     const queue = getFactsQueue();
     const enqueued = queue.enqueue(async (signal) => {
@@ -246,7 +375,14 @@ export async function runFactsBackstop(
   // (the explicit-call contract). Unlike queue mode, we don't absorb-log
   // here because the caller decides whether the failure is interesting
   // enough to record (vs. retry, vs. surface directly to the user).
-  const r = await runPipeline(parsedPage, ctx, ctx.abortSignal);
+  // Inline executes in THIS process — gate here (this is also the durable
+  // facts-absorb handler's execution-time gate in the jobs worker; the
+  // handler converts a keyed skip into a retryable failure).
+  const inlineModel = await availabilityGate();
+  if (!inlineModel) {
+    return { mode: 'inline', inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], skipped: 'extraction_unavailable' };
+  }
+  const r = await runPipeline(parsedPage, { ...ctx, model: inlineModel }, ctx.abortSignal);
   return { mode: 'inline', ...r };
 }
 
@@ -270,10 +406,28 @@ export async function runFactsBackstop(
 export async function runFactsPipeline(
   turnText: string,
   ctx: FactsBackstopCtx,
-): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[] }> {
+): Promise<{
+  inserted: number;
+  duplicate: number;
+  superseded: number;
+  fact_ids: number[];
+  /**
+   * Cathedral 5 (additive): DISTINCT resolved entity slugs of facts that were
+   * INSERTED via the fence-write path this run — i.e. slugs whose entity page
+   * is known to exist with the new fact fenced onto it. Duplicates (old
+   * provenance), legacy DB-only inserts (no fenceable page), and
+   * stub-guard-blocked facts are EXCLUDED — a checkpoint manifest link built
+   * from this list is truthful by construction (link candidates only; the
+   * harvest re-verifies each via source-scoped getPage before banking).
+   */
+  entity_slugs: string[];
+  /** Set when the LLM extraction step failed non-transport-fatally (see runPipelineWithBody). */
+  skipped_reason?: import('./extract.ts').ExtractFailureReason;
+}> {
   return runPipelineWithBody({
     turnText,
     isDreamGenerated: false,
+    ref: ctx.sessionId ?? 'inline',
   }, ctx, ctx.abortSignal);
 }
 
@@ -290,11 +444,12 @@ async function runPipeline(
   parsedPage: ParsedPageInput,
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
-): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[] }> {
+): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
   return runPipelineWithBody(
     {
       turnText: parsedPage.compiled_truth,
       isDreamGenerated: false,  // eligibility check already rejected dream pages
+      ref: parsedPage.slug,
     },
     ctx,
     abortSignal,
@@ -328,20 +483,20 @@ async function runPipeline(
  * fallback regardless of local_path.
  */
 async function runPipelineWithBody(
-  input: { turnText: string; isDreamGenerated: boolean },
+  input: { turnText: string; isDreamGenerated: boolean; ref?: string },
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
-): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[] }> {
-  const { extractFactsFromTurn } = await import('./extract.ts');
+): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
+  const { extractFactsFromTurnWithOutcome, FactsExtractionError } = await import('./extract.ts');
   const { resolveEntitySlug } = await import('../entities/resolve.ts');
   const { cosineSimilarity } = await import('./classify.ts');
   const { writeFactsToFence, lookupSourceLocalPath } = await import('./fence-write.ts');
 
   if (abortSignal?.aborted) {
-    return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [] };
+    return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], entity_slugs: [] };
   }
 
-  const facts = await extractFactsFromTurn({
+  const outcome = await extractFactsFromTurnWithOutcome({
     turnText: input.turnText,
     sessionId: ctx.sessionId,
     entityHints: ctx.entityHints,
@@ -351,6 +506,30 @@ async function runPipelineWithBody(
     abortSignal,
     model: ctx.model,
   });
+
+  if (!outcome.ok) {
+    // Transport-class failures PROPAGATE as a typed error: the queue-mode
+    // catch maps them to precise absorb-log codes, the durable facts-absorb
+    // minion gets retry/backoff, and the inline extract_facts op surfaces a
+    // real error instead of lying `inserted: 0`.
+    if (outcome.reason === 'provider_error' || outcome.reason === 'truncated_output') {
+      throw new FactsExtractionError(outcome.reason, outcome.model, outcome.error);
+    }
+    // Everything else (chat_unavailable / refusal / content_filter /
+    // malformed_output / non_terminal_stop) returns zero counts with the
+    // reason attached — keyless stays a calm expected state, keyed failures
+    // land one ingest_log row + a once-per-process fix hint.
+    await surfaceExtractionFailure(
+      ctx.engine,
+      input.ref ?? ctx.sessionId ?? 'turn',
+      outcome.reason,
+      outcome.model,
+      ctx.sourceId,
+    );
+    return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], entity_slugs: [], skipped_reason: outcome.reason };
+  }
+
+  const facts = outcome.facts;
 
   const filter = ctx.notabilityFilter ?? 'all';
   // [ENG-8] Explicit ctx.visibility wins; unset resolves the operator-set
@@ -362,6 +541,8 @@ async function runPipelineWithBody(
   let duplicate = 0;
   let superseded = 0;
   const fact_ids: number[] = [];
+  // Cathedral 5: slugs whose fence-write actually inserted a fact this run.
+  const fencedSlugs = new Set<string>();
 
   // Phase 1: per-fact filter + dedup. Surviving facts (no dedup hit)
   // get grouped by entity_slug for the fence-write phase below.
@@ -414,7 +595,7 @@ async function runPipelineWithBody(
   }
 
   if (survived.length === 0) {
-    return { inserted, duplicate, superseded, fact_ids };
+    return { inserted, duplicate, superseded, fact_ids, entity_slugs: [] };
   }
 
   // Phase 2: group survived facts by resolved entity_slug. Facts with
@@ -471,8 +652,9 @@ async function runPipelineWithBody(
   }
 
   if (localPath === null) {
-    // All went through legacy bucket; nothing left to fence.
-    return { inserted, duplicate, superseded, fact_ids };
+    // All went through legacy bucket; nothing left to fence — DB-only
+    // inserts have no fence-written page, so entity_slugs stays empty.
+    return { inserted, duplicate, superseded, fact_ids, entity_slugs: [] };
   }
 
   // Phase 5: fence-write per entity. writeFactsToFence handles the
@@ -546,7 +728,8 @@ async function runPipelineWithBody(
 
     inserted += result.inserted;
     fact_ids.push(...result.ids);
+    if (result.inserted > 0) fencedSlugs.add(slug);
   }
 
-  return { inserted, duplicate, superseded, fact_ids };
+  return { inserted, duplicate, superseded, fact_ids, entity_slugs: [...fencedSlugs] };
 }

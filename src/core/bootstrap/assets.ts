@@ -36,6 +36,8 @@ import T_ACCESS from '../../../templates/bootstrap/ACCESS_POLICY.md.template' wi
 import T_MEMORY_README from '../../../templates/bootstrap/memory-README.md.template' with { type: 'file' };
 // @ts-ignore
 import T_GITIGNORE from '../../../templates/bootstrap/gitignore.template' with { type: 'file' };
+// @ts-ignore
+import T_CLOUD_SETUP from '../../../templates/bootstrap/cloud-setup-script.sh' with { type: 'file' };
 
 /** Where each rendered file lands, relative to the workspace root. */
 export interface BootstrapTemplate {
@@ -45,6 +47,14 @@ export interface BootstrapTemplate {
   dest: string;
   /** Group for `render --only`. */
   group: 'identity' | 'contract' | 'scaffold';
+}
+
+/** The cloud environment setup script [D16] — NOT a rendered template (it is
+ * pasted into the cloud env config, never written into the workspace). Lives
+ * as a template file deliberately: inline script strings in src modules would
+ * bleed their dashed tokens into the CLI flag registry. */
+export function loadCloudSetupScript(): string {
+  return readFileSync(T_CLOUD_SETUP as unknown as string, 'utf8');
 }
 
 export const BOOTSTRAP_TEMPLATES: BootstrapTemplate[] = [

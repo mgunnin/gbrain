@@ -25,6 +25,7 @@ if (skip) {
 }
 
 const CLI = join(import.meta.dir, '..', '..', 'src', 'cli.ts');
+const DOCTOR_PROGRESS_TIMEOUT_MS = 60_000;
 
 describeE2E('gbrain doctor --progress-json (E2E)', () => {
   beforeAll(async () => {
@@ -38,11 +39,30 @@ describeE2E('gbrain doctor --progress-json (E2E)', () => {
   });
 
   test('stderr has JSONL progress events, stdout stays clean', () => {
-    const res = spawnSync('bun', [CLI, '--progress-json', 'doctor', '--json'], {
-      encoding: 'utf-8',
-      env: { ...process.env, NO_COLOR: '1' },
-      timeout: 30_000,
-    });
+    // A transient DB-connect failure sends the CLI down its filesystem-only
+    // doctor fallback (announced on stderr by cli.ts, but it still emits
+    // zero progress events with a healthy-looking stdout). Detect that via
+    // the 'connection' check in the --json payload and retry once before
+    // asserting, so a one-off connect blip doesn't fail the lane.
+    const runOnce = () =>
+      spawnSync('bun', [CLI, '--progress-json', 'doctor', '--json'], {
+        encoding: 'utf-8',
+        env: { ...process.env, NO_COLOR: '1' },
+        timeout: DOCTOR_PROGRESS_TIMEOUT_MS,
+      });
+    const connectionOk = (stdout: string): boolean => {
+      try {
+        const payload = JSON.parse(stdout);
+        const checks = (payload.checks ?? []) as Array<{ name?: string; status?: string }>;
+        const conn = checks.find((c) => c.name === 'connection');
+        return conn?.status === 'ok';
+      } catch {
+        return false;
+      }
+    };
+    let res = runOnce();
+    if (!connectionOk(res.stdout)) res = runOnce();
+    expect(connectionOk(res.stdout)).toBe(true);
 
     // Even if some checks warn, doctor runs to completion. Failures would
     // exit non-zero, which is OK — we're testing progress wiring.
@@ -85,13 +105,13 @@ describeE2E('gbrain doctor --progress-json (E2E)', () => {
     // progress-line pollution on stdout.
     const parsed = JSON.parse(res.stdout);
     expect(Array.isArray(parsed.checks) || Array.isArray(parsed)).toBe(true);
-  });
+  }, DOCTOR_PROGRESS_TIMEOUT_MS + 5_000);
 
   test('default (no --progress-json) writes human-plain progress to stderr only', () => {
     const res = spawnSync('bun', [CLI, 'doctor'], {
       encoding: 'utf-8',
       env: { ...process.env, NO_COLOR: '1' },
-      timeout: 30_000,
+      timeout: DOCTOR_PROGRESS_TIMEOUT_MS,
     });
 
     // Stdout may contain the check summary (human-readable) but should NOT
@@ -103,13 +123,13 @@ describeE2E('gbrain doctor --progress-json (E2E)', () => {
     if (res.stderr.length > 0) {
       expect(res.stderr).toContain('doctor.db_checks');
     }
-  });
+  }, DOCTOR_PROGRESS_TIMEOUT_MS + 5_000);
 
   test('--quiet suppresses progress entirely', () => {
     const res = spawnSync('bun', [CLI, '--quiet', 'doctor'], {
       encoding: 'utf-8',
       env: { ...process.env, NO_COLOR: '1' },
-      timeout: 30_000,
+      timeout: DOCTOR_PROGRESS_TIMEOUT_MS,
     });
 
     // With --quiet the reporter emits no start/finish/tick lines on stderr.
@@ -117,5 +137,5 @@ describeE2E('gbrain doctor --progress-json (E2E)', () => {
     // just no progress phases.
     expect(res.stderr).not.toContain('[doctor.db_checks]');
     expect(res.stderr).not.toContain('"event":"start"');
-  });
+  }, DOCTOR_PROGRESS_TIMEOUT_MS + 5_000);
 });

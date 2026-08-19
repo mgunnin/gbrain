@@ -8,6 +8,8 @@ import { loadConfig, gbrainPath } from '../core/config.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import {
+  hasMalformedPathSegment,
+  sanitizePathForDisplay,
   isCodeFilePath,
   isMarkdownFilePath,
   isImageFilePath as isImageFilePathFromSync,
@@ -25,6 +27,34 @@ import {
   resumeFilter,
 } from '../core/import-checkpoint.ts';
 
+/**
+ * Records one failed file against the run's error-grouping state and
+ * returns the running count for its group plus an unredacted sample
+ * message for display.
+ *
+ * `key` groups structurally-identical errors (e.g. the same failure
+ * across many files) so a single noisy failure mode doesn't produce
+ * thousands of near-duplicate warning lines — quoted substrings (typically
+ * a per-file slug or path) are blanked for the GROUPING key only. The
+ * printed `sample` is always a real, unredacted occurrence of the error
+ * (the first one seen for that key), so identifying details that are
+ * constant across the whole group — a Postgres table or constraint name,
+ * for instance — survive into what actually gets shown to the user.
+ * Pre-fix, the redacted key itself was printed, so e.g. a `pages_source_id_fkey`
+ * foreign-key violation surfaced as `table "" violates foreign key constraint ""`.
+ */
+export function recordImportFailure(
+  errorCounts: Record<string, number>,
+  errorSamples: Record<string, string>,
+  msg: string,
+): { key: string; count: number; sample: string } {
+  const key = msg.replace(/"[^"]*"/g, '""');
+  const count = (errorCounts[key] ?? 0) + 1;
+  errorCounts[key] = count;
+  if (!(key in errorSamples)) errorSamples[key] = msg;
+  return { key, count, sample: errorSamples[key] };
+}
+
 function defaultWorkers(): number {
   const cpuCount = cpus().length;
   const memGB = totalmem() / (1024 ** 3);
@@ -36,6 +66,27 @@ function defaultWorkers(): number {
   return Math.min(byPool, byCpu, byMem);
 }
 
+/**
+ * W0 fix-wave (Tier-1 #5): typed abort for runImport's preflight/argv
+ * failures. Pre-fix these five sites called process.exit(1) directly —
+ * correct for the CLI, but runImport is ALSO invoked in-process by the
+ * sync_brain MCP op (via performFullSync), the autopilot daemon, and the
+ * minion sync handler, so a first sync with unconfigured embedding
+ * credentials TERMINATED the MCP server / daemon / worker mid-call. The
+ * user-facing messages are printed BEFORE the throw (byte-identical CLI
+ * output); the CLI dispatch site maps this error back to exit(exitCode).
+ */
+export class ImportAbortError extends Error {
+  readonly exitCode: number;
+  /** True: the user-facing message was already printed at the throw site. */
+  readonly alreadyReported = true;
+  constructor(reason: string, exitCode = 1) {
+    super(`import aborted: ${reason}`);
+    this.name = 'ImportAbortError';
+    this.exitCode = exitCode;
+  }
+}
+
 /** Bug 9 — surface per-file failures so callers (performFullSync) can gate state advances. */
 export interface RunImportResult {
   imported: number;
@@ -43,6 +94,10 @@ export interface RunImportResult {
   errors: number;
   chunksCreated: number;
   failures: Array<{ path: string; error: string }>;
+  /** Files dropped by the malformed-filename gate (walker + per-file defense). */
+  malformedSkipped?: number;
+  /** Aggregated alias/undeclared explicit-type warnings (schema.type_warnings). */
+  type_warnings?: Array<{ kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string; count: number }>;
 }
 
 export async function runImport(
@@ -101,7 +156,7 @@ export async function runImport(
     } catch (e) {
       console.error(`\n${e instanceof Error ? e.message : e}`);
       console.error('Tip: run `gbrain import <dir> --no-embed` to import without embedding now.');
-      process.exit(1);
+      throw new ImportAbortError('embedding disabled (deferred-setup sentinel)');
     }
 
     // v0.41.6.0 D1: preflight embedding credentials. Closes the bug class
@@ -119,14 +174,14 @@ export async function runImport(
           console.error(e.userMessage);
           console.error('');
         }
-        process.exit(1);
+        throw new ImportAbortError('embedding credentials missing');
       }
       throw e;
     }
   }
   // v0.39 T1.5: load active pack ONCE at runImport entry; thread to every
   // per-file importFile call below. Codex perf finding #7 — never per-file.
-  let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
+  let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> } | undefined;
   try {
     const { loadActivePack } = await import('../core/schema-pack/load-active.ts');
     const { loadConfig } = await import('../core/config.ts');
@@ -193,7 +248,7 @@ export async function runImport(
     workerCount = parseWorkers(workersArg ?? undefined) ?? 1;
   } catch (e) {
     console.error(e instanceof Error ? e.message : String(e));
-    process.exit(1);
+    throw new ImportAbortError('invalid --workers value');
   }
   // Find dir: first non-flag arg that isn't a value for --workers
   const flagValues = new Set<number>();
@@ -203,7 +258,7 @@ export async function runImport(
 
   if (!dirArg) {
     console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--include-gitignored] [--json]');
-    process.exit(1);
+    throw new ImportAbortError('no import directory given');
   }
   // #1728: capture the import target ONCE as an absolute real path. Every
   // downstream consumer of `dir` (collection, checkpoint load/save, resume
@@ -216,7 +271,7 @@ export async function runImport(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`Import target is not readable: ${dirArg} (${msg})`);
-    process.exit(1);
+    throw new ImportAbortError(`import target not readable: ${dirArg}`);
   }
 
   // v0.31.2: collect under the right strategy. Pre-fix this called
@@ -226,10 +281,22 @@ export async function runImport(
   const strategy: SyncStrategy = opts.strategy ?? 'markdown';
   const _walkT0 = Date.now();
   console.error(`[gbrain phase] import.collect_files start dir=${dir} strategy=${strategy}`);
-  let allFiles = collectSyncableFiles(dir, { strategy, includeGitignored });
+  const malformedExcluded: string[] = [];
+  let allFiles = collectSyncableFiles(dir, {
+    strategy, includeGitignored,
+    onExcluded: (rel) => { malformedExcluded.push(rel); },
+  });
   console.error(
     `[gbrain phase] import.collect_files done ${Date.now() - _walkT0}ms files=${allFiles.length}`,
   );
+  if (malformedExcluded.length > 0) {
+    console.error(
+      `[gbrain import] ${malformedExcluded.length} file(s) skipped: malformed filename ` +
+      `(brackets/control chars; rename to import): ` +
+      malformedExcluded.slice(0, 20).map(sanitizePathForDisplay).join(', ') +
+      (malformedExcluded.length > 20 ? `, … (+${malformedExcluded.length - 20} more)` : ''),
+    );
+  }
   const fileTypeLabel = strategy === 'code' ? 'code'
     : strategy === 'auto' ? 'syncable' : 'markdown';
   // #753/#774: apply --exclude glob patterns (threaded by performFullSync).
@@ -278,6 +345,9 @@ export async function runImport(
   let imported = 0;
   let skipped = 0;
   let errors = 0;
+  // Per-file malformed skips (defense-in-depth hits inside importFromFile);
+  // the walker-level exclusions are counted separately via malformedExcluded.
+  let malformedFileSkips = 0;
   let processed = 0;
   // Time-based checkpoint floor (see the save site below). Chunking cost scales
   // with paragraph count, not bytes, so a single reference-style file can take
@@ -288,7 +358,23 @@ export async function runImport(
   let chunksCreated = 0;
   const importedSlugs: string[] = [];
   const errorCounts: Record<string, number> = {};
+  const errorSamples: Record<string, string> = {};
   const failures: Array<{ path: string; error: string }> = []; // Bug 9
+  // Alias-footgun visibility: aggregate per-file type_warning results once
+  // per distinct type per run (same surface `gbrain sync` carries).
+  const typeWarningCounts = new Map<string, import('../core/schema-pack/type-usage.ts').TypeWarningCount>();
+  const noteTypeWarning = (w: { kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string } | undefined): void => {
+    if (!w) return;
+    const key = `${w.kind}\t${w.type}`;
+    const cur = typeWarningCounts.get(key);
+    if (cur) cur.count++;
+    else typeWarningCounts.set(key, { ...w, count: 1 });
+  };
+  // #3839: paths that succeeded (imported OR unchanged) this run, keyed the
+  // same way as `failures` above (importRelPath) so a path that failed on a
+  // prior run and now succeeds clears its ledger row instead of staying
+  // `open` forever.
+  const succeededPaths: string[] = [];
   const startTime = Date.now();
 
   // Progress on stderr so stdout stays clean for the final summary / --json payload.
@@ -318,6 +404,7 @@ export async function runImport(
       const result = isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
         : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack });
+      noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning);
       const _fileMs = Date.now() - _fileT0;
       if (_fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
@@ -328,9 +415,16 @@ export async function runImport(
         importedSlugs.push(result.slug);
         // v0.33.2: path-based checkpoint — record only on success.
         completed.add(relativePath);
+        succeededPaths.push(importRelPath); // #3839
       } else {
         skipped++;
-        if (result.error && result.error !== 'unchanged') {
+        if (result.skip_reason === 'malformed_path') {
+          // Informational skip (bracket/control-char filename): never a
+          // failure-ledger row, and stable across runs — checkpoint as done.
+          console.error(`  Skipped (malformed filename — rename to import): ${sanitizePathForDisplay(relativePath)}`);
+          malformedFileSkips++;
+          completed.add(relativePath);
+        } else if (result.error && result.error !== 'unchanged') {
           console.error(`  Skipped ${relativePath}: ${result.error}`);
           // Bug 9 — non-"unchanged" skips carry a real error reason.
           // #774: ledger paths use the slug base so an incremental sync's
@@ -340,16 +434,16 @@ export async function runImport(
           // 'unchanged' or no-error skip: content_hash matched a prior
           // successful import, so this file IS done for checkpoint purposes.
           completed.add(relativePath);
+          succeededPaths.push(importRelPath); // #3839
         }
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      const errorKey = msg.replace(/"[^"]*"/g, '""');
-      errorCounts[errorKey] = (errorCounts[errorKey] || 0) + 1;
-      if (errorCounts[errorKey] <= 5) {
+      const { count, sample } = recordImportFailure(errorCounts, errorSamples, msg);
+      if (count <= 5) {
         console.error(`  Warning: skipped ${relativePath}: ${msg}`);
-      } else if (errorCounts[errorKey] === 6) {
-        console.error(`  (suppressing further "${errorKey.slice(0, 60)}..." errors)`);
+      } else if (count === 6) {
+        console.error(`  (suppressing further "${sample.slice(0, 60)}..." errors)`);
       }
       errors++;
       skipped++;
@@ -450,9 +544,9 @@ export async function runImport(
   progress.finish();
 
   // Error summary
-  for (const [err, count] of Object.entries(errorCounts)) {
+  for (const [key, count] of Object.entries(errorCounts)) {
     if (count > 5) {
-      console.error(`  ${count} files failed: ${err.slice(0, 100)}`);
+      console.error(`  ${count} files failed: ${errorSamples[key].slice(0, 100)}`);
     }
   }
 
@@ -535,6 +629,22 @@ export async function runImport(
     }
   }
 
+  // Alias/undeclared explicit-type warnings (schema.type_warnings, default on).
+  let typeWarningsEnabled = true;
+  if (typeWarningCounts.size > 0) {
+    try {
+      const v = await engine.getConfig('schema.type_warnings');
+      typeWarningsEnabled = !(v === 'false' || v === '0' || v === 'off');
+    } catch { /* config unavailable → default on */ }
+    if (typeWarningsEnabled) {
+      const { renderTypeWarningSummary } = await import('../core/schema-pack/type-usage.ts');
+      for (const line of renderTypeWarningSummary([...typeWarningCounts.values()])) {
+        console.error(`  ${line}`);
+      }
+      console.error(`  (silence with: gbrain config set schema.type_warnings false)`);
+    }
+  }
+
   // Log the ingest
   await engine.logIngest({
     source_type: 'directory',
@@ -545,8 +655,9 @@ export async function runImport(
 
   // Import → sync continuity: write sync checkpoint if this is a git repo.
   // Bug 9 — gate last_commit on "no failures" so import doesn't silently
-  // stomp on the sync bookmark when parsing broke. We still write
-  // last_run + repo_path either way (those are progress indicators).
+  // stomp on the sync bookmark when parsing broke. last_run + repo_path are
+  // written alongside it, but ONLY when this import owns the globals (#2114
+  // guard below) — a foreign directory must not repoint the brain repo.
   let gitHead: string | null = null;
   try {
     if (existsSync(join(dir, '.git'))) {
@@ -568,20 +679,59 @@ export async function runImport(
       const { recordFailures } = await import('../core/sync.ts');
       recordFailures(opts.sourceId ?? 'default', failures, gitHead);
     }
-    if (failures.length === 0) {
-      await engine.setConfig('sync.last_commit', gitHead);
-    } else {
+
+    // #3839: a path that failed on a prior run and succeeded (imported or
+    // unchanged) this run must clear its ledger row — pre-fix, clearFailures
+    // existed but had no caller anywhere, so `open` rows never healed short
+    // of a manual `gbrain sync --skip-failed`. Runs on every non-empty
+    // success list regardless of whether this SAME run also had failures,
+    // so a stale row from an earlier run gets cleared even if today's run
+    // is only partially clean.
+    if (succeededPaths.length > 0) {
+      const { clearFailures } = await import('../core/sync.ts');
+      clearFailures(opts.sourceId ?? 'default', succeededPaths);
+    }
+
+    // #2114 guard: the global sync.* keys describe THE brain repo (the
+    // default source's working tree). Pre-fix this block rewrote them on
+    // every git-repo import, silently repointing put_page write-through
+    // and poisoning the incremental sync anchor. Ownership + the bootstrap
+    // rule live in ownsGlobalSyncAnchor (shared with writeSyncAnchor's
+    // legacy branch in sync.ts, so the two layers cannot drift).
+    const { ownsGlobalSyncAnchor } = await import('../core/sync.ts');
+    const { owns, configured } = await ownsGlobalSyncAnchor(engine, sourceId, dir);
+
+    if (owns) {
+      if (failures.length === 0) {
+        await engine.setConfig('sync.last_commit', gitHead);
+      } else {
+        console.error(
+          `\nImport completed with ${failures.length} failure(s). ` +
+          `sync.last_commit NOT advanced — re-run 'gbrain sync' to retry, or ` +
+          `'gbrain sync --skip-failed' to acknowledge and move past them.`,
+        );
+      }
+      await engine.setConfig('sync.last_run', new Date().toISOString());
+      await engine.setConfig('sync.repo_path', dir);
+    } else if ((sourceId ?? 'default') === 'default') {
       console.error(
-        `\nImport completed with ${failures.length} failure(s). ` +
-        `sync.last_commit NOT advanced — re-run 'gbrain sync' to retry, or ` +
-        `'gbrain sync --skip-failed' to acknowledge and move past them.`,
+        `\n[import] sync.repo_path stays at ${configured ?? '(unset)'} — NOT repointing to "${dir}". ` +
+        `Sync bookmarks were not advanced. If this directory IS your brain repo, run: ` +
+        `gbrain config set sync.repo_path "${dir}"`,
       );
     }
-    await engine.setConfig('sync.last_run', new Date().toISOString());
-    await engine.setConfig('sync.repo_path', dir);
+    // Non-default sources: deliberately silent no-op — the globals are not
+    // this import's to move (its sync anchors live on the `sources` row).
   }
 
-  return { imported, skipped, errors, chunksCreated, failures };
+  const totalMalformed = malformedExcluded.length + malformedFileSkips;
+  return {
+    imported, skipped, errors, chunksCreated, failures,
+    ...(totalMalformed > 0 ? { malformedSkipped: totalMalformed } : {}),
+    ...(typeWarningCounts.size > 0 && typeWarningsEnabled
+      ? { type_warnings: [...typeWarningCounts.values()] }
+      : {}),
+  };
 }
 
 /**
@@ -603,6 +753,13 @@ function resolveMaxWalkDepth(): number {
 interface CollectOpts {
   strategy?: SyncStrategy;
   includeGitignored?: boolean;
+  /**
+   * Invoked (with the repo-relative path) for each file dropped by the
+   * malformed-filename gate, on BOTH collection routes. Without this,
+   * directory imports and full syncs silently succeed while omitting the
+   * file — no rename guidance, no skipped count (structured-review finding).
+   */
+  onExcluded?: (relPath: string) => void;
 }
 
 /**
@@ -637,6 +794,11 @@ function isCollectibleForWalker(
   // check pruneDir already applied there — no behavior change on that route.)
   const segments = path.split('/');
   if (segments.some((seg) => !pruneDir(seg))) return false;
+
+  // Malformed filenames (brackets / control chars — markdown-link syntax as a
+  // literal filename) are rejected on BOTH collection routes, same as
+  // incremental sync's classifySync. Full and incremental must agree.
+  if (hasMalformedPathSegment(path)) return false;
 
   // Metafiles are directory scaffolding (READMEs / index / log / schema /
   // resolver), not typed brain pages — same exclusion `sync`'s `isSyncable`
@@ -675,6 +837,7 @@ function gitListSyncableFiles(
   dir: string,
   strategy: SyncStrategy,
   multimodalOn: boolean,
+  onExcluded?: (relPath: string) => void,
 ): string[] | null {
   let stdout: string;
   try {
@@ -689,6 +852,10 @@ function gitListSyncableFiles(
   const files: string[] = [];
   for (const rel of stdout.split('\0')) {
     if (!rel) continue;
+    // Malformed check FIRST (separately from the collectible gate) so the
+    // exclusion is reportable — other filters (strategy, prune, metafile)
+    // are silent by design; this one hides renameable content.
+    if (hasMalformedPathSegment(rel)) { onExcluded?.(rel); continue; }
     if (!isCollectibleForWalker(rel, strategy, multimodalOn)) continue;
     const full = join(dir, rel);
     let st;
@@ -734,7 +901,7 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
   // PLUS untracked-not-ignored, so uncommitted source is still indexed. Non-git
   // dirs (or git unavailable) fall through to the FS walk below.
   if (!opts.includeGitignored) {
-    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn);
+    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn, opts.onExcluded);
     if (gitFiles) return gitFiles;
   }
 
@@ -759,6 +926,14 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
       // from it. Skips hidden dirs (`.git`, `.raw`, etc.), `node_modules`,
       // `vendor`, `dist`, `build`, `venv` (#2020), `ops`, and git submodules.
       if (!pruneDir(entry, d)) continue;
+      // Control-char SEGMENT check at descent time (never legitimate). The
+      // bracket check moved to the per-file RELATIVE-path test below: a
+      // bracket-named DIRECTORY must still be descended for code strategies
+      // (`app/[id]/page.tsx` is ubiquitous framework layout), while markdown
+      // files under it are excluded per-file — mirroring classifySync so full
+      // and incremental sync agree (cross-model adversarial finding).
+      // eslint-disable-next-line no-control-regex
+      if (/[\x00-\x1f]/.test(entry)) continue;
 
       const full = join(d, entry);
       let stat;
@@ -783,6 +958,11 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
         visitedInodes.set(inodeKey, true);
         walk(full, depth + 1);
       } else if (stat.isFile()) {
+        // Malformed check on the RELATIVE path (this route's
+        // isCollectibleForWalker only sees the basename, which can't catch a
+        // bracket directory segment above a clean-named markdown file).
+        const rel = relative(dir, full);
+        if (hasMalformedPathSegment(rel)) { opts.onExcluded?.(rel); continue; }
         if (!isCollectibleForWalker(entry, strategy, multimodalOn)) continue;
         files.push(full);
       }

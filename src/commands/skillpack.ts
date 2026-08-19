@@ -15,31 +15,23 @@
  */
 
 import { existsSync, readFileSync } from 'fs';
-import { isAbsolute, resolve as resolvePath, join } from 'path';
+import { join } from 'path';
 
 import {
   bundledSkillSlugs,
-  findGbrainRoot,
   loadBundleManifest,
   BundleError,
 } from '../core/skillpack/bundle.ts';
 import { runScaffold, ScaffoldError } from '../core/skillpack/scaffold.ts';
-import { runReference, runReferenceAll, runReferenceApply } from '../core/skillpack/reference.ts';
 import { runMigrateFence } from '../core/skillpack/migrate-fence.ts';
 import { runScrubLegacy } from '../core/skillpack/scrub-legacy.ts';
 import { runHarvest, HarvestError } from '../core/skillpack/harvest.ts';
-import { autoDetectSkillsDir } from '../core/repo-root.ts';
-import {
-  RemoteSourceError,
-  classifySpec,
-  resolveSource,
-} from '../core/skillpack/remote-source.ts';
-import {
-  ScaffoldThirdPartyError,
-  runScaffoldThirdParty,
-} from '../core/skillpack/scaffold-third-party.ts';
-import { SkillpackManifestError } from '../core/skillpack/manifest-v1.ts';
-import { VERSION } from '../version.ts';
+import { computeSkillCurrency } from '../core/skillpack/skill-currency.ts';
+import { parseSkillFrontmatter } from '../core/skill-frontmatter.ts';
+import { parsePrecondition, type Precondition } from '../core/skillpack/preconditions.ts';
+import { resolveAbs, findGbrainOrDie, resolveWorkspace } from './skillpack/shared.ts';
+import { cmdScaffold } from './skillpack/scaffold.ts';
+import { cmdReference } from './skillpack/reference.ts';
 
 const HELP_TOP = `gbrain skillpack <subcommand> [options]
 
@@ -51,11 +43,28 @@ Subcommands:
                              overwrite. Third-party sources: owner/repo,
                              https://...git, ./local-dir, ./local.tgz.
   scaffold --all             Scaffold every bundled skill (gbrain only).
+  scaffold --harness <h>     Install a persona-curated set into a harness's
+                             native skills dir (claude-code | openclaw |
+                             codex | opencode). --persona/--skill curate;
+                             --stub installs cold-pull pointers (gated).
 
   reference <name>           Read-only: diff gbrain's bundle vs your local copy.
   reference --all            Sweep over every bundled skill.
   reference <n> --apply-clean-hunks
                              Two-way diff, auto-apply non-conflicting hunks.
+  reference --harness <h>    Diff a harness install (stub-aware; splits
+                             local_edit vs upstream_drift).
+
+  remove --harness <h>       Remove files the harness bridge wrote (ledger-
+                             owned only — never your own files).
+
+  status                     Install currency (new/drifted/current) + which
+                             installed skills declare preconditions.
+  sync                       Scaffold NEW bundled skills only; report drift.
+                             Never overwrites your files. --dry-run to preview.
+  setup [<slug>]             Print declared preconditions + static hints for a
+                             skill (or all that declare them). Verify live with
+                             \`gbrain doctor\`.
 
   migrate-fence              One-shot conversion from the old managed-block
                              model. Strips fence comments, preserves rows.
@@ -114,6 +123,15 @@ export async function runSkillpack(args: string[]): Promise<void> {
     case 'reference':
       await cmdReference(rest);
       return;
+    case 'status':
+      await cmdStatus(rest);
+      return;
+    case 'sync':
+      await cmdSync(rest);
+      return;
+    case 'setup':
+      await cmdSetup(rest);
+      return;
     case 'migrate-fence':
       await cmdMigrateFence(rest);
       return;
@@ -153,6 +171,11 @@ export async function runSkillpack(args: string[]): Promise<void> {
     case 'endorse':
       await cmdEndorse(rest);
       return;
+    case 'remove': {
+      const { cmdRemove } = await import('./skillpack/harness.ts');
+      await cmdRemove(rest);
+      return;
+    }
     case 'install':
       console.error(
         "Error: 'gbrain skillpack install' was removed in v0.33. Use 'gbrain skillpack scaffold <name>' instead.\n" +
@@ -171,30 +194,6 @@ export async function runSkillpack(args: string[]): Promise<void> {
       console.error(HELP_TOP);
       process.exit(2);
   }
-}
-
-function resolveAbs(p: string): string {
-  return isAbsolute(p) ? p : resolvePath(process.cwd(), p);
-}
-
-function findGbrainOrDie(): string {
-  const root = findGbrainRoot();
-  if (!root) {
-    console.error('Error: could not find gbrain repo root.');
-    process.exit(2);
-  }
-  return root;
-}
-
-function resolveWorkspace(opts: { workspace?: string | null; skillsDir?: string | null }): string {
-  if (opts.workspace) return resolveAbs(opts.workspace);
-  if (opts.skillsDir) return resolvePath(resolveAbs(opts.skillsDir), '..');
-  const detected = autoDetectSkillsDir();
-  if (detected.dir) return resolvePath(detected.dir, '..');
-  console.error(
-    'Error: could not auto-detect a target workspace. Pass --workspace <path> or set $OPENCLAW_WORKSPACE.',
-  );
-  process.exit(2);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,35 +238,70 @@ async function cmdList(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// scaffold
+// status — install currency + which installed skills declare preconditions
 // ---------------------------------------------------------------------------
 
-async function cmdScaffold(args: string[]): Promise<void> {
+/**
+ * Read every bundled skill's SKILL.md frontmatter and collect the slugs that
+ * declare a non-empty `requires:` list, paired with the raw tokens. Engine-
+ * free (frontmatter only); live checks are `gbrain doctor`'s job.
+ */
+function collectDeclaredPreconditions(gbrainRoot: string): Array<{ slug: string; requires: string[] }> {
+  const manifest = loadBundleManifest(gbrainRoot);
+  const slugs = bundledSkillSlugs(manifest);
+  const out: Array<{ slug: string; requires: string[] }> = [];
+  for (const slug of slugs) {
+    const skillMd = join(gbrainRoot, 'skills', slug, 'SKILL.md');
+    if (!existsSync(skillMd)) continue;
+    const fm = parseSkillFrontmatter(readFileSync(skillMd, 'utf-8'));
+    if (fm?.requires && fm.requires.length > 0) {
+      out.push({ slug, requires: fm.requires });
+    }
+  }
+  return out;
+}
+
+/**
+ * Static (engine-free) remediation hint per precondition kind, phrased to
+ * mirror preconditions.ts's live `checkOne` remediation strings. The live
+ * check needs an engine (`gbrain doctor` owns that); this is the paste-ready
+ * "what must be true" line for setup planning.
+ */
+function staticPreconditionHint(pre: Precondition): string {
+  switch (pre.kind) {
+    case 'source':
+      return pre.arg
+        ? `add or ingest source '${pre.arg}' first (gbrain sources add ${pre.arg} / gbrain sync --source ${pre.arg}), then re-run`
+        : 'ingest a corpus first (gbrain sync / gbrain import), then re-run';
+    case 'dir':
+      return pre.arg
+        ? `populate ${pre.arg} (>=1 page), then re-run`
+        : 'specify a directory: dir:<path> — see skillpack/preconditions.ts vocabulary';
+    case 'config':
+      return pre.arg
+        ? `set it: gbrain config set ${pre.arg} <value>`
+        : 'specify a config key: config:<key> — see skillpack/preconditions.ts vocabulary';
+    case 'pages':
+      return pre.arg
+        ? `the brain needs >=${pre.arg} pages; ingest more first`
+        : 'specify a page count: pages:<n> — see skillpack/preconditions.ts vocabulary';
+    case 'unknown':
+    default:
+      return `unrecognized precondition '${pre.raw}' — see skillpack/preconditions.ts vocabulary`;
+  }
+}
+
+async function cmdStatus(args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) {
     console.log(
-      'gbrain skillpack scaffold <name> | <source> | --all [--workspace PATH] [--dry-run] [--trust] [--no-cache] [--json]\n\n' +
-      '<name>   — bundled skill slug (e.g. `book-mirror`)\n' +
-      '<source> — third-party skillpack source. Accepted shapes:\n' +
-      '             owner/repo                (expands to https://github.com/owner/repo)\n' +
-      '             https://...git            (verbatim https URL)\n' +
-      '             ./local/dir/              (local pack root)\n' +
-      '             ./local/pack.tgz          (local tarball)\n' +
-      '\nFlags:\n' +
-      '  --workspace PATH    Target workspace (default: auto-detected)\n' +
-      '  --all               Scaffold every bundled skill (gbrain only)\n' +
-      '  --dry-run           Validate + report; no writes\n' +
-      '  --trust             Skip first-install confirm prompt (CI / unattended agents)\n' +
-      '  --no-cache          Force fresh clone/extract for third-party sources\n' +
-      '  --json              Stable JSON envelope for agent consumption',
+      'gbrain skillpack status [--workspace PATH] [--json]\n\n' +
+        'Report install currency (new / drifted / current) for every bundled\n' +
+        'skill, plus which installed skills declare machine-checkable\n' +
+        'preconditions. Read-only. Verify preconditions live with `gbrain doctor`.',
     );
     process.exit(0);
   }
   const json = args.includes('--json');
-  const dryRun = args.includes('--dry-run');
-  const all = args.includes('--all');
-  const trustFlag = args.includes('--trust');
-  const noCache = args.includes('--no-cache');
-  let name: string | null = null;
   let workspace: string | null = null;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -276,88 +310,114 @@ async function cmdScaffold(args: string[]): Promise<void> {
       i++;
     } else if (a?.startsWith('--workspace=')) {
       workspace = a.slice('--workspace='.length) || null;
-    } else if (a && !a.startsWith('--') && !name) {
-      name = a;
     }
-  }
-  if (!all && !name) {
-    console.error('Error: pass a skill name, third-party source, or --all.');
-    process.exit(2);
-  }
-
-  // Disambiguate bundled-skill name vs third-party source.
-  //
-  // Routing rules (in priority order):
-  //   1. `--all`                                       → bundled --all sweep
-  //   2. Spec contains `/` / `://` / ends in .tgz      → third-party direct
-  //   3. Bare kebab AND matches a bundled-skill slug   → bundled (v0.36 path)
-  //   4. Bare kebab AND NOT a bundled-skill slug       → third-party via registry
-  const targetWorkspace = resolveWorkspace({ workspace });
-
-  const isThirdPartyShape = !all && name !== null && /[\/:]|\.(tgz|tar\.gz)$/.test(name);
-
-  if (!all && name !== null && !isThirdPartyShape) {
-    // Check if the kebab name matches a bundled-skill slug.
-    const gbrainRoot = findGbrainRoot();
-    if (gbrainRoot) {
-      try {
-        const manifest = loadBundleManifest(gbrainRoot);
-        const slugs = bundledSkillSlugs(manifest);
-        if (!slugs.includes(name)) {
-          // Not a bundled slug — try the registry.
-          await runThirdPartyScaffold({
-            spec: name,
-            targetWorkspace,
-            dryRun,
-            trustFlag,
-            noCache,
-            json,
-          });
-          return;
-        }
-      } catch {
-        // Fall through to the bundled path; it'll surface a clearer error.
-      }
-    }
-  } else if (isThirdPartyShape) {
-    await runThirdPartyScaffold({
-      spec: name!,
-      targetWorkspace,
-      dryRun,
-      trustFlag,
-      noCache,
-      json,
-    });
-    return;
   }
 
   const gbrainRoot = findGbrainOrDie();
+  const targetWorkspace = resolveWorkspace({ workspace });
+
   try {
-    const result = runScaffold({
-      gbrainRoot,
-      targetWorkspace,
-      skillSlug: all ? null : name!,
-      dryRun,
-    });
+    const currency = computeSkillCurrency({ gbrainRoot, targetWorkspace });
+    const preconditions = collectDeclaredPreconditions(gbrainRoot);
+    const { collectBridgesStatus, printBridgesStatus } = await import('./skillpack/harness.ts');
+
     if (json) {
-      console.log(JSON.stringify({ ok: true, dryRun: result.dryRun, summary: result.summary, files: result.files }, null, 2));
-    } else {
+      console.log(JSON.stringify({ currency, preconditions, bridges: collectBridgesStatus(gbrainRoot) }, null, 2));
+      process.exit(0);
+    }
+
+    const c = currency.counts;
+    console.log(`new: ${c.new}  drifted: ${c.drifted}  current: ${c.current}  (${c.total} total)`);
+
+    const newSlugs = currency.skills.filter(s => s.status === 'new').map(s => s.slug);
+    const driftedSlugs = currency.skills.filter(s => s.status === 'drifted').map(s => s.slug);
+
+    if (newSlugs.length) {
+      console.log('\nNew skills available (run `gbrain skillpack sync`):');
+      for (const slug of newSlugs) console.log(`  ${slug}`);
+    }
+    if (driftedSlugs.length) {
+      console.log('\nDrifted from bundle (run `gbrain skillpack reference <slug>`):');
+      for (const slug of driftedSlugs) console.log(`  ${slug}`);
+    }
+    if (preconditions.length) {
+      console.log('\nSkills with declared preconditions (verify with `gbrain doctor`):');
+      for (const p of preconditions) console.log(`  ${p.slug}: ${p.requires.join(', ')}`);
+    }
+    printBridgesStatus(gbrainRoot);
+    process.exit(0);
+  } catch (err) {
+    if (err instanceof BundleError) {
+      console.error(`skillpack status: ${err.message}`);
+      process.exit(2);
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// sync — scaffold NEW skills only; report drift; never overwrite
+// ---------------------------------------------------------------------------
+
+async function cmdSync(args: string[]): Promise<void> {
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(
+      'gbrain skillpack sync [--workspace PATH] [--dry-run] [--json]\n\n' +
+        'Bring the install up to date by scaffolding NEW bundled skills only.\n' +
+        'Drifted skills are reported, never overwritten — you own those files\n' +
+        '(run `gbrain skillpack reference <slug>` to review). --dry-run lists\n' +
+        'what would be scaffolded without writing.',
+    );
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  const dryRun = args.includes('--dry-run');
+  let workspace: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--workspace') {
+      workspace = args[i + 1] ?? null;
+      i++;
+    } else if (a?.startsWith('--workspace=')) {
+      workspace = a.slice('--workspace='.length) || null;
+    }
+  }
+
+  const gbrainRoot = findGbrainOrDie();
+  const targetWorkspace = resolveWorkspace({ workspace });
+
+  try {
+    const currency = computeSkillCurrency({ gbrainRoot, targetWorkspace });
+    const newSlugs = currency.skills.filter(s => s.status === 'new').map(s => s.slug);
+    const driftedSlugs = currency.skills.filter(s => s.status === 'drifted').map(s => s.slug);
+
+    // Scaffold NEW skills only. runScaffold refuses to overwrite any existing
+    // file by design, so drifted/current files are never touched — the
+    // ownership model. In --dry-run nothing is written.
+    const scaffolded: string[] = [];
+    for (const slug of newSlugs) {
+      runScaffold({ gbrainRoot, targetWorkspace, skillSlug: slug, dryRun });
+      scaffolded.push(slug);
+    }
+
+    if (json) {
+      console.log(JSON.stringify({ scaffolded, drifted: driftedSlugs, dryRun }, null, 2));
+      process.exit(0);
+    }
+
+    const verb = dryRun ? 'Would scaffold' : 'Scaffolded';
+    console.log(
+      `${verb} ${scaffolded.length} new skill(s)${scaffolded.length ? ': ' + scaffolded.join(', ') : ''}`,
+    );
+    if (driftedSlugs.length) {
       console.log(
-        `${dryRun ? 'scaffold --dry-run' : 'scaffold'}: ${result.summary.wroteNew} wrote, ${result.summary.skippedExisting} skipped (already present), ${result.summary.pairedSourcesWritten} paired source(s)`,
+        `${driftedSlugs.length} skill(s) drifted from the bundle — run \`gbrain skillpack reference <slug>\` to review (not overwritten).`,
       );
-      // Next-action hint for the agent + the operator. Print only on
-      // actual writes (re-runs that just skip are noise-quieter).
-      if (!dryRun && result.summary.wroteNew > 0) {
-        const onboardingPath = join(targetWorkspace, 'skills', '_AGENT_README.md');
-        console.log(
-          `\nNext: your agent walks \`skills/*/SKILL.md\` frontmatter \`triggers:\` for routing.\nIf this is a fresh install, read ${onboardingPath} for the agent contract.\nWhen gbrain ships an update later, run \`gbrain skillpack reference --all\` to sweep.`,
-        );
-      }
     }
     process.exit(0);
   } catch (err) {
     if (err instanceof ScaffoldError || err instanceof BundleError) {
-      console.error(`skillpack scaffold: ${(err as Error).message}`);
+      console.error(`skillpack sync: ${(err as Error).message}`);
       process.exit(2);
     }
     throw err;
@@ -365,292 +425,56 @@ async function cmdScaffold(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// scaffold — third-party source path (new in v0.37)
+// setup — declared preconditions + static paste-ready hints (engine-free)
 // ---------------------------------------------------------------------------
 
-interface ThirdPartyScaffoldOptions {
-  spec: string;
-  targetWorkspace: string;
-  dryRun: boolean;
-  trustFlag: boolean;
-  noCache: boolean;
-  json: boolean;
-}
-
-async function runThirdPartyScaffold(opts: ThirdPartyScaffoldOptions): Promise<void> {
-  // Step 1: resolve the source. Kebab names get a registry lookup first;
-  // everything else hits the direct resolveSource() path.
-  let resolved;
-  let registryTier: 'endorsed' | 'community' | 'experimental' | 'dead' | undefined;
-  try {
-    const cls = classifySpec(opts.spec);
-    if (cls.kind === 'kebab') {
-      // Registry path: load catalog, find pack, follow to URL.
-      const { loadRegistry, findPackWithTier } = await import('../core/skillpack/registry-client.ts');
-      const loaded = await loadRegistry({});
-      const found = findPackWithTier(loaded, cls.normalized);
-      if (!found) {
-        console.error(
-          `Error: no skillpack named "${cls.normalized}" in the registry (${loaded.registry_url}).\n` +
-            `Run \`gbrain skillpack search ${cls.normalized}\` for matches, or pass a full source (owner/repo, https URL, ./path, ./*.tgz).`,
-        );
-        process.exit(2);
-      }
-      registryTier = found.tier;
-      resolved = resolveSource(found.entry.source.url, { noCache: opts.noCache });
-    } else {
-      resolved = resolveSource(opts.spec, { noCache: opts.noCache });
-    }
-  } catch (err) {
-    if (err instanceof RemoteSourceError) {
-      console.error(`skillpack scaffold: ${err.message}`);
-      process.exit(2);
-    }
-    throw err;
-  }
-
-  // Step 2: orchestrator handles manifest validation, trust prompt, copy,
-  // state.json update, and bootstrap display.
-  try {
-    const result = await runScaffoldThirdParty(
-      {
-        resolved,
-        targetWorkspace: opts.targetWorkspace,
-        trustFlag: opts.trustFlag,
-        dryRun: opts.dryRun,
-        tier: registryTier,
-      },
-      VERSION,
-    );
-
-    if (opts.json) {
-      console.log(
-        JSON.stringify(
-          {
-            ok: result.status !== 'aborted_no_trust',
-            status: result.status,
-            pack: {
-              name: result.manifest.name,
-              version: result.manifest.version,
-              author: result.manifest.author,
-            },
-            source: result.resolved.source,
-            source_kind: result.resolved.kind,
-            pinned_commit: result.resolved.pinned_commit,
-            tarball_sha256: result.resolved.tarball_sha256,
-            cache_hit: result.resolved.cache_hit,
-            trust: { trusted: result.trustDecision.trusted, reason: result.trustDecision.reason },
-            copy: result.copy?.summary ?? null,
-            bootstrap_shown: result.bootstrap.shown,
-          },
-          null,
-          2,
-        ),
-      );
-    } else {
-      if (result.status === 'aborted_no_trust') {
-        console.error(
-          `skillpack scaffold: aborted (trust decision: ${result.trustDecision.reason}). No files written.`,
-        );
-        process.exit(1);
-      }
-      const m = result.manifest;
-      const summary = result.copy?.summary;
-      console.log(
-        `${opts.dryRun ? 'scaffold (dry-run)' : 'scaffold'}: ${m.name}@${m.version} by ${m.author}` +
-          (summary
-            ? ` — ${summary.wroteNew} wrote, ${summary.skippedExisting} skipped`
-            : ''),
-      );
-      if (result.resolved.kind !== 'local') {
-        console.log(
-          `Source: ${result.resolved.source}` +
-            (result.resolved.pinned_commit ? ` @ ${result.resolved.pinned_commit.slice(0, 12)}` : ''),
-        );
-      }
-      if (result.bootstrap.shown) {
-        // Bootstrap framing on stderr so stdout stays clean for the agent contract.
-        process.stderr.write('\n' + result.bootstrap.text + '\n');
-      }
-      if (!opts.dryRun && summary && summary.wroteNew > 0) {
-        console.log(
-          `\nNext: your agent walks skills/*/SKILL.md frontmatter triggers: for routing.\n` +
-            `Run \`gbrain skillpack reference ${m.name}\` later if upstream changes.`,
-        );
-      }
-    }
-    process.exit(result.status === 'aborted_no_trust' ? 1 : 0);
-  } catch (err) {
-    if (err instanceof ScaffoldThirdPartyError || err instanceof SkillpackManifestError) {
-      console.error(`skillpack scaffold: ${(err as Error).message}`);
-      process.exit(2);
-    }
-    throw err;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// reference (+ --apply-clean-hunks)
-// ---------------------------------------------------------------------------
-
-async function cmdReference(args: string[]): Promise<void> {
+async function cmdSetup(args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) {
     console.log(
-      'gbrain skillpack reference <name> | --all [--workspace PATH] [--apply-clean-hunks] [--since <version>] [--dry-run] [--json]\n\n' +
-        '  --since <version>   With --all, restrict the sweep to skills whose source\n' +
-        '                      changed in gbrain between <version> and HEAD. Useful\n' +
-        '                      after `gbrain upgrade` to see only what moved.',
+      'gbrain skillpack setup [<slug>] [--json]\n\n' +
+        'Print the declared preconditions + static remediation hints for a skill\n' +
+        '(or, with no slug, every bundled skill that declares preconditions).\n' +
+        "Static/engine-free — live verification is `gbrain doctor`'s job.",
     );
     process.exit(0);
   }
   const json = args.includes('--json');
-  const apply = args.includes('--apply-clean-hunks');
-  const dryRun = args.includes('--dry-run');
-  const all = args.includes('--all');
-  let name: string | null = null;
-  let workspace: string | null = null;
-  let since: string | null = null;
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--workspace') {
-      workspace = args[i + 1] ?? null;
-      i++;
-    } else if (a?.startsWith('--workspace=')) {
-      workspace = a.slice('--workspace='.length) || null;
-    } else if (a === '--since') {
-      since = args[i + 1] ?? null;
-      i++;
-    } else if (a?.startsWith('--since=')) {
-      since = a.slice('--since='.length) || null;
-    } else if (a && !a.startsWith('--') && !name) {
-      name = a;
-    }
-  }
-  if (!all && !name) {
-    console.error('Error: pass a skill name or --all.');
-    process.exit(2);
+  let slug: string | null = null;
+  for (const a of args) {
+    if (a && !a.startsWith('--') && !slug) slug = a;
   }
 
   const gbrainRoot = findGbrainOrDie();
-  const targetWorkspace = resolveWorkspace({ workspace });
 
-  try {
-    if (apply) {
-      if (all) {
-        console.error(
-          'Error: --apply-clean-hunks is intentionally NOT supported with --all. Apply one skill at a time.',
-        );
-        process.exit(2);
-      }
-      // Two-way merge warning fires BEFORE the apply. Goes to stderr so
-      // it survives stdout redirection. Suppressed in --json mode so
-      // machine consumers (CI, agent scripts) get a clean envelope; the
-      // human-facing reason for the warning is documented in the JSON
-      // output's `framing` field already, and the docstring on the
-      // command-help covers it.
-      const twoWayWarning =
-        'WARNING: --apply-clean-hunks is a two-way diff against gbrain\'s CURRENT bundle.\n' +
-        '         gbrain does NOT have access to the version you originally scaffolded.\n' +
-        '         Hunks where your LOCAL edits differ from gbrain WILL be aligned to gbrain.\n' +
-        '         If you have intentional local edits, run `gbrain skillpack reference ' + name + '`\n' +
-        '         (read-only) first to inspect, OR pass --dry-run on this command.';
-      if (!dryRun && !json) console.error(twoWayWarning);
+  const targets: string[] = slug
+    ? [slug]
+    : collectDeclaredPreconditions(gbrainRoot).map(p => p.slug);
 
-      const result = runReferenceApply({ gbrainRoot, targetWorkspace, skillSlug: name!, dryRun });
-      if (json) console.log(JSON.stringify(result, null, 2));
-      else {
-        console.log(result.framing);
-        console.log(
-          `reference --apply-clean-hunks: ${result.summary.totalHunksApplied} hunk(s) applied, ${result.summary.totalHunksConflicted} conflict(s)`,
-        );
-        for (const f of result.files) {
-          if (f.status === 'identical') continue;
-          console.log(`  ${f.status.padEnd(15)} ${f.target}`);
-          for (const c of f.conflicts) console.log(`    ${c}`);
-        }
-        if (result.summary.totalHunksConflicted > 0) {
-          console.log(
-            '\nConflicts left in place. Run `gbrain skillpack reference ' + name + '` to inspect\nthe unified diffs and patch by hand. The conflict_missing / conflict_ambiguous\nlabels above indicate WHY the hunk could not be applied automatically.',
-          );
-        }
-      }
-      process.exit(0);
-    }
+  const report = targets.map(s => {
+    const skillMd = join(gbrainRoot, 'skills', s, 'SKILL.md');
+    const fm = existsSync(skillMd) ? parseSkillFrontmatter(readFileSync(skillMd, 'utf-8')) : null;
+    const reqs = fm?.requires ?? [];
+    const preconditions = reqs.map(raw => {
+      const pre = parsePrecondition(raw);
+      return { raw, kind: pre.kind, arg: pre.arg ?? null, hint: staticPreconditionHint(pre) };
+    });
+    return { slug: s, preconditions };
+  });
 
-    if (all) {
-      const result = runReferenceAll({ gbrainRoot, targetWorkspace });
-      // --since filter: keep only skills whose source changed in gbrain
-      // since the given version. Falls back loudly when git can't resolve
-      // the ref (tarball install, missing tag, etc).
-      let sinceFilter: Set<string> | null = null;
-      if (since) {
-        const { changedSlugsSinceVersion } = await import('../core/skillpack/bundle.ts');
-        const slugs = changedSlugsSinceVersion(gbrainRoot, since);
-        if (slugs === null) {
-          console.error(
-            `warn: --since '${since}' could not be resolved (no git checkout, missing tag, or git error). Falling back to full sweep.`,
-          );
-        } else {
-          sinceFilter = new Set(slugs);
-        }
-      }
-      const filteredSkills = sinceFilter
-        ? result.skills.filter(s => sinceFilter!.has(s.slug))
-        : result.skills;
-      const filtered = { ...result, skills: filteredSkills };
-      if (json) console.log(JSON.stringify(filtered, null, 2));
-      else {
-        console.log(result.framing);
-        if (since && sinceFilter) {
-          console.log(`(filtered to ${filteredSkills.length} skill(s) changed since ${since})`);
-        }
-        if (filteredSkills.length === 0) {
-          console.log('  (no skills changed in the requested window)');
-        }
-        for (const s of filteredSkills) {
-          console.log(
-            `  ${s.slug.padEnd(40)} identical:${s.summary.identical} differs:${s.summary.differs} missing:${s.summary.missing}`,
-          );
-        }
-      }
-      process.exit(0);
-    }
-
-    const result = runReference({ gbrainRoot, targetWorkspace, skillSlug: name! });
-    if (json) console.log(JSON.stringify(result, null, 2));
-    else {
-      console.log(result.framing);
-      console.log(
-        `reference: identical:${result.summary.identical} differs:${result.summary.differs} missing:${result.summary.missing}`,
-      );
-      for (const f of result.files) {
-        if (f.status === 'identical') continue;
-        console.log(`\n  ${f.status.padEnd(10)} ${f.target}`);
-        if (f.unifiedDiff) console.log(f.unifiedDiff);
-      }
-      // Per-category action hints for the agent.
-      if (result.summary.missing > 0 || result.summary.differs > 0) {
-        console.log('\nAgent decision policy per file:');
-        if (result.summary.missing > 0) {
-          console.log(
-            '  missing → gbrain has a file you don\'t. Usually safe to `gbrain skillpack scaffold ' + name + '` again to land it.',
-          );
-        }
-        if (result.summary.differs > 0) {
-          console.log(
-            '  differs → was your local edit intentional? Keep it (gbrain is reference, not law).\n            Accidental drift? Patch by hand, or `gbrain skillpack reference ' + name + ' --apply-clean-hunks`\n            (READ the two-way merge warning in that command\'s output first).',
-          );
-        }
-      }
-    }
+  if (json) {
+    console.log(JSON.stringify(report, null, 2));
     process.exit(0);
-  } catch (err) {
-    if (err instanceof BundleError) {
-      console.error(`skillpack reference: ${err.message}`);
-      process.exit(2);
-    }
-    throw err;
   }
+
+  for (const r of report) {
+    if (r.preconditions.length === 0) {
+      console.log(`${r.slug} has no declared preconditions.`);
+      continue;
+    }
+    console.log(`${r.slug} requires:`);
+    for (const p of r.preconditions) console.log(`  - ${p.raw}  → ${p.hint}`);
+  }
+  process.exit(0);
 }
 
 // ---------------------------------------------------------------------------

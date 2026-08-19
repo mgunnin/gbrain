@@ -31,7 +31,10 @@ import { join } from 'node:path';
 
 import { VERSION } from '../../version.ts';
 import { loadConfigFileOnly } from '../config.ts';
+import { binaryOnPath, detectExecutionEnvironment, type ExecutionEnvironment } from '../execution-env.ts';
 import { resolveGbrainHome } from '../gbrain-home.ts';
+import { githubOwnerRepoString, isProxyBlocked403 } from '../repo-visibility.ts';
+
 import { BOOTSTRAP_TEMPLATES } from './assets.ts';
 import {
   readManifest,
@@ -40,7 +43,12 @@ import {
   type ManifestState,
 } from './format.ts';
 import { interviewStatePath, status as interviewStatus } from './interview.ts';
-import { CLAUDE_SETTINGS_FILE_RELPATH, GBRAIN_HOOK_MARKER_KEY, GBRAIN_HOOK_MARKER_VALUE } from './host-specs.ts';
+import {
+  CLAUDE_COMMITTED_SETTINGS_FILE_RELPATH,
+  CLAUDE_SETTINGS_FILE_RELPATH,
+  GBRAIN_HOOK_MARKER_KEY,
+  GBRAIN_HOOK_MARKER_VALUE,
+} from './host-specs.ts';
 
 // ---------------------------------------------------------------------------
 // The phase list [D5] — single TS source of truth
@@ -86,13 +94,6 @@ interface PhaseSpec {
   detect: (ws: string, ctx: DetectCtx) => { state: PhaseState; detail?: string };
 }
 
-function binaryOnPath(name: string): boolean {
-  try {
-    return Bun.which(name) !== null;
-  } catch {
-    return false;
-  }
-}
 
 /** The workspace's `origin` remote URL, or null (not a repo / no origin).
  * Shared with verify.ts's origin-probe sites — one 5s-timeout idiom. */
@@ -119,15 +120,25 @@ export type OriginVisibility =
   | { verdict: 'public'; detail: string }
   | { verdict: 'unknown'; detail: string };
 
-/** Probe an origin's visibility via `gh repo view --json isPrivate` (the same
- * 5s timeout idiom as gitOriginUrl). gh missing / offline / non-GitHub →
- * 'unknown', never an invented answer. */
+/** Probe an origin's visibility via REST — `gh api repos/{owner}/{repo}` —
+ * NEVER `gh repo view` (GraphQL under the hood; cloud sandbox proxies pin
+ * GraphQL to a fixed operation set and 403 it even with a user token). Sync
+ * by contract: this runs inside the sync phase-detect chain, so the full
+ * async ladder lives in verify/push; status keeps the cheap REST answer.
+ * gh missing / offline / non-GitHub / 403 → 'unknown', never an invented
+ * answer; a proxy-shaped 403 names the real fix. */
 export function probeOriginVisibility(origin: string): OriginVisibility {
+  const ownerRepo = githubOwnerRepoString(origin);
+  if (ownerRepo === null) {
+    // Never send a non-github origin string into a REST path — self-hosted
+    // hostnames (or URL-embedded credentials) must not reach api.github.com.
+    return { verdict: 'unknown', detail: 'origin is not a github.com URL — cannot verify via REST' };
+  }
   try {
     // env: process.env — Bun's execFileSync otherwise resolves the binary
     // against the STARTUP env snapshot, making PATH-shimmed test fakes (and
     // any runtime PATH change) invisible (the workspace-push.ts precedent).
-    const out = execFileSync('gh', ['repo', 'view', origin, '--json', 'isPrivate', '--jq', '.isPrivate'], {
+    const out = execFileSync('gh', ['api', `repos/${ownerRepo}`, '--jq', '.private'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 5_000,
       env: process.env,
@@ -138,21 +149,36 @@ export function probeOriginVisibility(origin: string): OriginVisibility {
     if (out === 'false') return { verdict: 'public', detail: `${origin} is PUBLIC` };
     return { verdict: 'unknown', detail: `gh returned unexpected output: ${out.slice(0, 80)}` };
   } catch (e) {
-    const err = e as NodeJS.ErrnoException;
+    const err = e as NodeJS.ErrnoException & { stderr?: Buffer | string };
     if (err?.code === 'ENOENT') {
       return { verdict: 'unknown', detail: 'gh CLI not installed — cannot verify origin visibility' };
     }
-    return { verdict: 'unknown', detail: `gh repo view failed (${(err?.message ?? 'unknown').slice(0, 120)})` };
+    const stderr = (err?.stderr ?? '').toString();
+    if (isProxyBlocked403(stderr)) {
+      return {
+        verdict: 'unknown',
+        detail: 'GitHub REST blocked by this sandbox\'s egress proxy (repo not attached to the session) — push-time verification falls back to git protocol',
+      };
+    }
+    return { verdict: 'unknown', detail: `gh api failed (${(err?.message ?? 'unknown').slice(0, 120)})` };
   }
 }
 
-/** True when `<ws>/.claude/settings.local.json` carries a gbrain hook marker. */
+/** True when either hook carrier — the gitignored `settings.local.json` OR
+ * the committed `.claude/settings.json` [D12] — carries a gbrain marker. */
 export function hooksInstalled(ws: string): boolean {
   try {
-    const raw = readFileSync(join(ws, CLAUDE_SETTINGS_FILE_RELPATH), 'utf8');
-    // Structural probe without a full merge: the marker key/value pair is the
-    // idempotency contract host-specs.ts pins, so a substring check is honest.
-    return raw.includes(`"${GBRAIN_HOOK_MARKER_KEY}"`) && raw.includes(`"${GBRAIN_HOOK_MARKER_VALUE}"`);
+    const probe = (relpath: string): boolean => {
+      try {
+        const raw = readFileSync(join(ws, relpath), 'utf8');
+        // Structural probe without a full merge: the marker key/value pair is
+        // the idempotency contract host-specs.ts pins — substring is honest.
+        return raw.includes(`"${GBRAIN_HOOK_MARKER_KEY}"`) && raw.includes(`"${GBRAIN_HOOK_MARKER_VALUE}"`);
+      } catch {
+        return false;
+      }
+    };
+    return probe(CLAUDE_SETTINGS_FILE_RELPATH) || probe(CLAUDE_COMMITTED_SETTINGS_FILE_RELPATH);
   } catch {
     return false;
   }
@@ -183,7 +209,7 @@ export const PHASES: PhaseSpec[] = [
     title: 'Identity interview (confirmed read-back)',
     resume_hint:
       'gbrain bootstrap interview --init, then --set each answer, then --confirm <hash>. ' +
-      'Claude Code only: also record the MCP scope consent (--set MCP_SCOPE <project|user>) BEFORE --confirm',
+      'Claude Code and opencode: also record the MCP scope consent (--set MCP_SCOPE <project|user>) BEFORE --confirm',
     detect: (ws) => {
       const exists = existsSync(interviewStatePath(ws));
       const st = interviewStatus(ws);
@@ -239,12 +265,27 @@ export const PHASES: PhaseSpec[] = [
     // outside the harness being wired). Advisory prose; the grep pins in
     // scripts/check-bootstrap-templates.sh §(e) are the enforcement.
     resume_hint:
-      'gbrain bootstrap hooks --harness <claude-code|codex> — MCP scope consent is ' +
-      'Claude Code only (recorded during the interview, pre-confirm); Codex registrations are always user-global (no scope flag)',
+      'gbrain bootstrap hooks --harness <claude-code|codex|opencode> — MCP scope consent applies on ' +
+      'Claude Code and opencode (recorded during the interview, pre-confirm; opencode defaults to ' +
+      'user-global — the sharing-safe choice, since it spawns project-config servers with no trust gate); ' +
+      'Codex registrations are always user-global (no scope flag)',
     detect: (ws, ctx) => {
       const regs = ctx.receipt?.registrations ?? [];
       if (regs.length > 0) {
-        return { state: 'done', detail: regs.map((r) => `${r.host} (${r.scope})`).join(', ') };
+        // A registration whose detail carries 'mcp' ('mcp' or 'mcp+hooks')
+        // means MCP actually registered. A 'hooks'-only detail means the host
+        // binary was missing at wire time (hooks landed, MCP did not) — the
+        // phase is PARTIAL, not done, so a resuming agent re-runs it once the
+        // CLI is on PATH instead of trusting a false "done".
+        const mcpRegistered = regs.some((r) => (r.detail ?? '').includes('mcp'));
+        if (mcpRegistered) {
+          return { state: 'done', detail: regs.map((r) => `${r.host} (${r.scope})`).join(', ') };
+        }
+        return {
+          state: 'partial',
+          detail: 'hooks installed but MCP not registered (the harness CLI was not on PATH) — ' +
+            're-run `gbrain bootstrap hooks --harness <claude-code|codex>` once it is',
+        };
       }
       if (hooksInstalled(ws)) return { state: 'done', detail: 'hooks present in .claude/settings.local.json' };
       return { state: 'pending' };
@@ -416,6 +457,11 @@ export interface StatusReport {
   phases: PhaseStatus[];
   /** Resume hint of the first non-done phase; null when everything is done. */
   next: string | null;
+  /** WHERE this install is running [D-cloud]: 'local' | 'cloud-sandbox' |
+   * 'ephemeral-container'. Installing agents branch on this — cron is skipped
+   * in containers, repo creation is redirected in cloud sandboxes, and the
+   * runbook's cloud section keys off it. */
+  execution_environment: ExecutionEnvironment;
   runbookSkew?: RunbookSkew;
   /** Template-door privacy gate: set only for an UNINITIALIZED template clone
    * whose origin exists and is not verifiably private. 'public' is a hard
@@ -491,11 +537,21 @@ export async function statusReport(ws: string, opts: StatusReportOpts = {}): Pro
     }
   }
 
-  // Support blob [B5].
+  // Support blob [B5]. Push status via the shared per-root reader [D8/D13]:
+  // a failing workspace wins over another's success; else the newest record.
   let lastPush: StatusSupport['last_push'] = null;
   try {
-    const p = join(gbrainHomeDir, 'bootstrap', 'push-status.json');
-    if (existsSync(p)) lastPush = JSON.parse(readFileSync(p, 'utf8')) as StatusSupport['last_push'];
+    const { readPushStatuses, summarizePushStatuses } = await import('../workspace-push.ts');
+    const entries = readPushStatuses();
+    const { failing } = summarizePushStatuses(entries);
+    const pick = failing[0] ?? entries.sort((a, b) => Date.parse(b.ts ?? '') - Date.parse(a.ts ?? ''))[0];
+    if (pick) {
+      lastPush = {
+        ...(pick.ts !== undefined ? { ts: pick.ts } : {}),
+        ...(pick.ok !== undefined ? { ok: pick.ok } : {}),
+        ...(pick.reason !== undefined ? { reason: pick.reason } : {}),
+      };
+    }
   } catch {
     lastPush = null;
   }
@@ -533,6 +589,7 @@ export async function statusReport(ws: string, opts: StatusReportOpts = {}): Pro
     workspace: ws,
     phases,
     next,
+    execution_environment: detectExecutionEnvironment(),
     ...(runbookSkew ? { runbookSkew } : {}),
     ...(privacyGate ? { privacy_gate: privacyGate } : {}),
     support,

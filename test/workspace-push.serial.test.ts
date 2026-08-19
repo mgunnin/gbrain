@@ -16,10 +16,12 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync, spawnSync } from 'child_process';
 import {
-  workspacePush, acquirePushLock, pushLockDir, pushStatusPath, verifyRemotePrivacy,
+  workspacePush, acquirePushLock, pushLockDir, pushStatusPath, pushStatusPathForRoot,
+  readPushStatuses, summarizePushStatuses, verifyRemotePrivacy,
   parseGithubOwnerRepo, resolveWorkspaceRoot, PUSH_LOCK_STALE_MS, PUSH_DENY_GLOBS,
 } from '../src/core/workspace-push.ts';
 import { SCAN_ALLOW_FILENAME } from '../src/core/secret-scan.ts';
+import { visibilityCachePath } from '../src/core/repo-visibility.ts';
 
 const T = 60_000; // explicit per-test timeout — bun ignores bunfig.toml's key
 const OPENAI = 'sk-' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4';
@@ -97,14 +99,14 @@ describe('happy path', () => {
     expect(r.ahead).toBe(0);
     expect(originHead(bare)).toBe(git(work, 'rev-parse', 'HEAD'));
     // B4: push-status.json written on success
-    const status = JSON.parse(readFileSync(pushStatusPath(), 'utf-8'));
+    const status = readPushStatuses()[0]!; // [D13] per-root file, via the shared reader
     expect(status.ok).toBe(true);
     expect(status.ahead).toBe(0);
     expect(typeof status.ts).toBe('string');
     // no leftover lock
     expect(existsSync(pushLockDir(work))).toBe(false);
     // status file is not world-readable
-    expect(statSync(pushStatusPath()).mode & 0o077).toBe(0);
+    expect(statSync(readPushStatuses()[0]!.file).mode & 0o077).toBe(0);
   }, T);
 
   test('CX2-3 — a subdirectory target resolves and pushes the repo ROOT', async () => {
@@ -157,7 +159,7 @@ describe('deny-glob backstop [G6]', () => {
     expect(r.reason).toContain('.env');
     expect(originHead(bare)).toBe(before); // nothing pushed
     // B4: status written on failure too
-    const status = JSON.parse(readFileSync(pushStatusPath(), 'utf-8'));
+    const status = readPushStatuses()[0]!;
     expect(status.ok).toBe(false);
   }, T);
 
@@ -214,7 +216,7 @@ describe('secret-scan gate', () => {
     expect(JSON.stringify(r).includes(OPENAI)).toBe(false); // value never surfaces
     expect(lines.join('\n')).toContain('notes.md');
     // B4: failure status written
-    expect(JSON.parse(readFileSync(pushStatusPath(), 'utf-8')).ok).toBe(false);
+    expect(readPushStatuses()[0]!.ok).toBe(false);
 
     // per-finding allowlist override [CX2-15]
     writeFileSync(join(work, SCAN_ALLOW_FILENAME), `${r.findings![0]!.fingerprint}\n`);
@@ -276,7 +278,7 @@ describe('secret-scan gate — fails CLOSED on unscannable staged blobs', () => 
     expect(originHead(bare)).toBe(before);
     expect(git(work, 'diff', '--cached', '--name-only')).toBe('');
     // B4: failure status recorded
-    expect(JSON.parse(readFileSync(pushStatusPath(), 'utf-8')).ok).toBe(false);
+    expect(readPushStatuses()[0]!.ok).toBe(false);
   }, T);
 
   test('an oversized staged blob (> scan cap) BLOCKS the push', async () => {
@@ -374,7 +376,7 @@ describe('commit-first-then-pull [CX2-7]', () => {
     // origin still holds the other clone's commit — nothing force-pushed
     expect(git(bare, 'log', '--format=%s', '-1', 'main')).toBe('remote change');
     // B4: failure status written
-    expect(JSON.parse(readFileSync(pushStatusPath(), 'utf-8')).ok).toBe(false);
+    expect(readPushStatuses()[0]!.ok).toBe(false);
   }, T);
 });
 
@@ -390,20 +392,41 @@ describe('remote-privacy gate [G8]', () => {
     // the commit was made (local durability) but NOTHING left the machine
     expect(r.committed).toBe(true);
     expect(originHead(bare)).toBe(before);
-    expect(JSON.parse(readFileSync(pushStatusPath(), 'utf-8')).ok).toBe(false);
+    expect(readPushStatuses()[0]!.ok).toBe(false);
   }, T);
 
-  test('verifyRemotePrivacy: gh false → not_private; gh true → private (PATH-shimmed gh)', () => {
+  test('verifyRemotePrivacy: gh false → not_private; gh true → private (PATH-shimmed gh, REST rung)', async () => {
     const shim = mkdtempSync(join(root, 'shim-'));
     git(work, 'remote', 'set-url', 'origin', 'https://github.com/acme-example/widget-co.git');
     writeFileSync(join(shim, 'gh'), '#!/bin/sh\necho false\n', { mode: 0o755 });
     process.env.PATH = `${shim}:${saved.PATH}`;
-    expect(verifyRemotePrivacy(work).verdict).toBe('not_private');
+    expect((await verifyRemotePrivacy(work)).verdict).toBe('not_private');
+    // CRITICAL regression guard [D10]: rest-true must reproduce the pre-ladder
+    // verdict exactly (private → push allowed).
     writeFileSync(join(shim, 'gh'), '#!/bin/sh\necho true\n', { mode: 0o755 });
-    expect(verifyRemotePrivacy(work).verdict).toBe('private');
-    writeFileSync(join(shim, 'gh'), '#!/bin/sh\necho "not logged in" >&2\nexit 1\n', { mode: 0o755 });
-    const v = verifyRemotePrivacy(work);
-    expect(v.verdict).toBe('unverifiable'); // unauthed gh = unverifiable, not fail-open
+    expect((await verifyRemotePrivacy(work)).verdict).toBe('private');
+    // The private verdict is cached [D11]; clear it so the next case exercises
+    // the ladder, not the cache.
+    rmSync(visibilityCachePath(), { force: true });
+  }, T);
+
+  test('verifyRemotePrivacy: cached private verdict short-circuits; cache cleared → re-verifies', async () => {
+    const shim = mkdtempSync(join(root, 'shim-'));
+    git(work, 'remote', 'set-url', 'origin', 'https://github.com/acme-example/widget-co.git');
+    writeFileSync(join(shim, 'gh'), '#!/bin/sh\necho true\n', { mode: 0o755 });
+    process.env.PATH = `${shim}:${saved.PATH}`;
+    expect((await verifyRemotePrivacy(work)).verdict).toBe('private');
+    // Break gh entirely: the fresh cache must still answer private...
+    writeFileSync(join(shim, 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    expect((await verifyRemotePrivacy(work)).verdict).toBe('private');
+    // ...and clearing it must force live re-verification. Point origin at a
+    // local path so the git-protocol rungs stay offline-fast: readable via
+    // ls-remote, no https probe surface → unverifiable, never fail-open.
+    rmSync(visibilityCachePath(), { force: true });
+    git(work, 'remote', 'set-url', 'origin', bare);
+    const v = await verifyRemotePrivacy(work);
+    expect(v.verdict).toBe('unverifiable');
+    git(work, 'remote', 'set-url', 'origin', 'https://github.com/acme-example/widget-co.git');
   }, T);
 
   test('parseGithubOwnerRepo handles https/.git/scp forms; non-github → null', () => {
@@ -499,8 +522,83 @@ describe('error paths', () => {
     expect(r.status).toBe('push_failed');
     expect(r.ok).toBe(false);
     expect(r.committed).toBe(true); // commit survives locally
-    const status = JSON.parse(readFileSync(pushStatusPath(), 'utf-8'));
+    const status = readPushStatuses()[0]!;
     expect(status.ok).toBe(false);
     expect(existsSync(pushLockDir(work))).toBe(false);
+  }, T);
+});
+
+describe('unverified-remote escape hatches [D18/S3]', () => {
+  test('env hatch: unverifiable origin + GBRAIN_ALLOW_UNVERIFIED_REMOTE=1 → pushed (WARN path)', async () => {
+    process.env.GBRAIN_ALLOW_UNVERIFIED_REMOTE = '1';
+    try {
+      writeFileSync(join(work, 'note.md'), 'env hatch\n');
+      // file origin → ladder unverifiable; env hatch downgrades it to allowed.
+      const r = await workspacePush({ dir: work, branch: 'main' });
+      expect(r.ok).toBe(true);
+      expect(r.status).toBe('pushed');
+    } finally {
+      delete process.env.GBRAIN_ALLOW_UNVERIFIED_REMOTE;
+    }
+  }, T);
+
+  test('config hatch: push.allow_unverified_remote=true in the file plane → pushed', async () => {
+    mkdirSync(join(process.env.HOME!, '.gbrain'), { recursive: true });
+    writeFileSync(
+      join(process.env.HOME!, '.gbrain', 'config.json'),
+      JSON.stringify({ engine: 'pglite', push: { allow_unverified_remote: true } }),
+    );
+    writeFileSync(join(work, 'note2.md'), 'config hatch\n');
+    const r = await workspacePush({ dir: work, branch: 'main' });
+    expect(r.ok).toBe(true);
+    expect(r.status).toBe('pushed');
+  }, T);
+
+  test('CRITICAL [S3]: a hatch never covers a PROVEN-PUBLIC origin — still refused', async () => {
+    const shim = mkdtempSync(join(root, 'shim-pub-'));
+    writeFileSync(join(shim, 'gh'), '#!/bin/sh\necho false\n', { mode: 0o755 });
+    process.env.PATH = `${shim}:${saved.PATH}`;
+    process.env.GBRAIN_ALLOW_UNVERIFIED_REMOTE = '1';
+    try {
+      git(work, 'remote', 'set-url', 'origin', 'https://github.com/acme-example/widget-co.git');
+      writeFileSync(join(work, 'note3.md'), 'must not leave\n');
+      const r = await workspacePush({ dir: work, branch: 'main' });
+      expect(r.ok).toBe(false);
+      expect(r.status).toBe('refused_visibility');
+      expect(r.reason).toContain('does NOT cover proven-public');
+    } finally {
+      delete process.env.GBRAIN_ALLOW_UNVERIFIED_REMOTE;
+      git(work, 'remote', 'set-url', 'origin', bare);
+    }
+  }, T);
+});
+
+describe('per-root masking [D13]', () => {
+  test('one root failing + another succeeding: the failure is never masked (reader + summarize)', async () => {
+    const otherRoot = mkdtempSync(join(root, 'other-ws-'));
+    mkdirSync(join(process.env.HOME!, '.gbrain', 'bootstrap'), { recursive: true });
+    writeFileSync(
+      pushStatusPathForRoot(otherRoot),
+      JSON.stringify({ ts: new Date().toISOString(), ok: false, reason: 'refused_visibility', repoRoot: otherRoot }) + '\n',
+    );
+    writeFileSync(join(work, 'ok.md'), 'fine\n');
+    const r = await push();
+    expect(r.ok).toBe(true); // this workspace pushed fine…
+    const entries = readPushStatuses();
+    const { failing } = summarizePushStatuses(entries);
+    expect(failing).toHaveLength(1); // …and the OTHER root's failure survives
+    expect(failing[0]!.repoRoot).toBe(otherRoot);
+  }, T);
+
+  test('ghost roots are filtered: a failing record for a DELETED workspace stops feeding the surfaces', async () => {
+    const ghost = mkdtempSync(join(root, 'ghost-ws-'));
+    mkdirSync(join(process.env.HOME!, '.gbrain', 'bootstrap'), { recursive: true });
+    writeFileSync(
+      pushStatusPathForRoot(ghost),
+      JSON.stringify({ ts: new Date().toISOString(), ok: false, reason: 'refused_visibility', repoRoot: ghost }) + '\n',
+    );
+    rmSync(ghost, { recursive: true, force: true });
+    const { failing } = summarizePushStatuses(readPushStatuses());
+    expect(failing).toHaveLength(0);
   }, T);
 });

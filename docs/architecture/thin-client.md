@@ -10,6 +10,16 @@ empty local PGLite, so a populated remote brain can't silently return
 "No results." Local-only commands refuse with a pinpoint hint instead of
 falling through.
 
+**Surface posture:** thin clients stay FULL-surface. The thin-client CLI routes
+arbitrary `gbrain <op>` invocations over MCP, so a narrowed per-client surface
+(`oauth_clients.surface`, WP4) would break commands the install legitimately
+owns — bootstrap pins `--surface full` on its serve registrations and operators
+should keep thin-client OAuth rows at `full` (or NULL). The stdio transport has
+no client row at all: it serves the server-resolved surface directly, and the
+per-client ceiling machinery (`effectiveSurfaceForClient`) applies only to the
+OAuth HTTP transport. The starter/verbs narrowing is for agent-harness clients,
+not for thin-client installs.
+
 Key files (per-file detail lives in each file's `KEY_FILES.md` entry; this doc
 carries the routing-seam picture):
 

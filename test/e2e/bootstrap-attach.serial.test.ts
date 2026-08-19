@@ -214,6 +214,11 @@ describe('bootstrap attach (machine-2 adoption, serial e2e)', () => {
     // Attach ADOPTS an existing brain — never claims brain ownership [CX2-12].
     expect(receipt!.brain_created_by_bootstrap).toBe(false);
     expect(receipt!.created_paths).toEqual([]);
+    // Attach records repo_url from the adopted origin so the no-daemon push
+    // gate (repoPhaseComplete) recognizes the repo phase as done on this
+    // machine — without it the per-turn/session-end pushes defer forever, and
+    // attach is the ONLY install path in a cloud sandbox.
+    expect((receipt as { repo_url?: string }).repo_url).toContain('origin.git');
   }, 60_000);
 
   test('attach steps are the ordered machine-2 todo list; re-attach preserves the same-workspace receipt', () => {

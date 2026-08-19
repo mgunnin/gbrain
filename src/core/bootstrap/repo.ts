@@ -35,6 +35,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { configDir } from '../config.ts';
 import { realpathOrResolve } from '../path-confine.ts';
+import { defaultRunner, isProxyBlocked403, parseGithubOwnerRepo, type ExecRunner } from '../repo-visibility.ts';
+import { detectExecutionEnvironment } from '../execution-env.ts';
 import { loadWorkspaceAllowlist, scanFiles, SCAN_ALLOW_FILENAME } from '../secret-scan.ts';
 import { GITHUB_URL_PLACEHOLDER } from './assets.ts';
 import {
@@ -52,30 +54,10 @@ import { BootstrapError } from './lock.ts';
 // Exec seam (shared by uninstall.ts; the dispatcher passes the real runner)
 // ---------------------------------------------------------------------------
 
-export interface ExecResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-/** Injectable subprocess seam. argv[0] is the binary; never a shell string. */
-export type ExecRunner = (argv: string[]) => Promise<ExecResult>;
-
-/** Default runner: Bun.spawn, both streams piped, spawn failure → code 127. */
-export const defaultRunner: ExecRunner = async (argv: string[]): Promise<ExecResult> => {
-  try {
-    const proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    return { code, stdout, stderr };
-  } catch (e) {
-    // Binary not on PATH (or unspawnable) — the conventional not-found code.
-    return { code: 127, stdout: '', stderr: (e as Error).message };
-  }
-};
+// Canonical definitions moved to repo-visibility.ts (the visibility ladder
+// needs the same seam and must stay a leaf module); re-exported here so every
+// existing consumer (uninstall.ts, bootstrap.ts, tests) keeps its import path.
+export { defaultRunner, type ExecResult, type ExecRunner } from '../repo-visibility.ts';
 
 // ---------------------------------------------------------------------------
 // Receipt extension: the created repo URL [CX2-12 idempotency key]
@@ -97,6 +79,11 @@ export interface RepoReceipt extends InstallReceipt {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** The one copy of the cloud repo-adoption instruction (two error sites). */
+export const CLOUD_ATTACH_FLOW_HINT =
+  'Create the private repo from a normal machine (or github.com), open a cloud session ON that repo, ' +
+  'then run `gbrain bootstrap attach`.';
+
 /** GitHub repo-name slug: lowercase, alnum runs joined by '-'. */
 export function slugifyRepoName(name: string): string {
   const slug = name
@@ -106,12 +93,11 @@ export function slugifyRepoName(name: string): string {
   return slug || 'agent';
 }
 
-/** Parse owner/name out of an https or ssh GitHub remote URL. */
+/** Parse owner/name out of an https or ssh GitHub remote URL. Thin adapter
+ * over the canonical repo-visibility parser (one grammar, three consumers). */
 export function parseGithubRemote(url: string): { owner: string; name: string } | null {
-  const m =
-    /^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url.trim()) ??
-    /^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/.exec(url.trim());
-  return m ? { owner: m[1], name: m[2] } : null;
+  const p = parseGithubOwnerRepo(url);
+  return p ? { owner: p.owner, name: p.repo } : null;
 }
 
 /** Re-exported for existing consumers; the single definition lives in
@@ -145,6 +131,28 @@ function requireInitializedManifest(workspaceDir: string): { state: ManifestStat
 
 function isRateLimitOr5xx(stderr: string): boolean {
   return /HTTP 5\d\d|HTTP 429|rate limit/i.test(stderr);
+}
+
+/** `gh auth status`'s `--active` flag (added in cli/cli v2.57.0, 2024-09-11)
+ * scopes the check to only the active account instead of aggregating every
+ * registered account. On an older `gh`, passing an unrecognized flag makes
+ * the WHOLE command fail — so Gate 2 must detect support before using it. */
+const GH_ACTIVE_FLAG_MIN_VERSION = [2, 57, 0] as const;
+
+/** Parses the `X.Y.Z` out of `gh --version`'s first line (`gh version X.Y.Z (DATE)`).
+ * Returns null on any unrecognized format — callers treat that as "unknown,
+ * don't assume support". */
+function parseGhVersion(versionOutput: string): readonly [number, number, number] | null {
+  const m = /\bgh version (\d+)\.(\d+)\.(\d+)/.exec(versionOutput);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+function ghVersionAtLeast(v: readonly [number, number, number], min: readonly [number, number, number]): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== min[i]) return v[i]! > min[i]!;
+  }
+  return true;
 }
 
 /** The authenticated gh login, or null when it cannot be read/parsed. */
@@ -277,11 +285,20 @@ async function verifyRepoPrivate(runner: ExecRunner, owner: string, name: string
   }
   const res = await runner(['gh', 'api', `repos/${owner}/${name}`, '--jq', '.private']);
   if (res.code !== 0) {
-    const reason = isRateLimitOr5xx(res.stderr) ? 'GitHub API rate limit / server error' : `gh api failed: ${res.stderr.trim() || `exit ${res.code}`}`;
+    // Classify the failure so the operator gets the REAL fix: a sandbox
+    // egress proxy blocking REST for a repo not attached to the session is a
+    // different problem from a token/rate-limit failure [D14 messaging].
+    const proxyBlocked = isProxyBlocked403(res.stderr);
+    const reason = proxyBlocked
+      ? "this sandbox's egress proxy blocks GitHub REST for repos not attached to the session"
+      : isRateLimitOr5xx(res.stderr)
+        ? 'GitHub API rate limit / server error'
+        : `gh api failed: ${res.stderr.trim() || `exit ${res.code}`}`;
+    const nextStep = proxyBlocked ? CLOUD_ATTACH_FLOW_HINT : 'The repo may be fine — re-run `gbrain bootstrap repo` to verify.';
     throw new BootstrapError(
       'VERIFY_UNAVAILABLE',
       `could not verify that ${owner}/${name} is private (${reason}). ` +
-        'The repo may be fine — re-run `gbrain bootstrap repo` to verify. Nothing is pushed to a repo whose privacy is unverified.',
+        `${nextStep} Nothing is pushed to a repo whose privacy is unverified.`,
       { details: { owner, name, stderr: res.stderr } },
     );
   }
@@ -599,7 +616,22 @@ export async function createPrivateRepo(
   }
 
   // Gate 2: authenticated. Exit-code-2 — the human runs `gh auth login`.
-  const ghAuth = await runner(['gh', 'auth', 'status']);
+  // `--hostname github.com` scopes the check to the host this flow actually
+  // targets (every downstream call — parseGithubOwnerRepo, the repo-create
+  // URL fallback, etc. — is github.com-only), so an unrelated broken account
+  // on some other configured host (e.g. a GitHub Enterprise instance) can't
+  // false-block it either. `--active` (only when the installed `gh` supports
+  // it) further restricts that host's check to the active account. Bare
+  // `gh auth status` aggregates EVERY registered account on EVERY host and
+  // exits 1 if any one of them is invalid — even an unused, long-expired
+  // account — which false-blocks this gate while the active account (what
+  // `gh`/`git` actually use) is perfectly healthy.
+  const ghVersionTuple = parseGhVersion(ghVersion.stdout);
+  const ghSupportsActiveFlag = ghVersionTuple !== null && ghVersionAtLeast(ghVersionTuple, GH_ACTIVE_FLAG_MIN_VERSION);
+  const ghAuthArgv = ghSupportsActiveFlag
+    ? ['gh', 'auth', 'status', '--active', '--hostname', 'github.com']
+    : ['gh', 'auth', 'status', '--hostname', 'github.com'];
+  const ghAuth = await runner(ghAuthArgv);
   if (ghAuth.code !== 0) {
     throw new BootstrapError(
       'GH_AUTH',
@@ -682,6 +714,21 @@ export async function createPrivateRepo(
     // present), so a re-run skipped the repo phase and never pushed the workspace.
     recordRepoInReceipt(gbrainHomeDir, workspaceDir, manifest, originUrl);
     return { url: originUrl, name: parsed.name, disposition: viaUrlMatch ? 'reused' : 'adopted', reused: true };
+  }
+
+  // Cloud-sandbox guard: `gh repo create` inside a proxied cloud session
+  // makes a repo the session is NOT attached to — REST verification 403s and
+  // the proxy denies every push to it, so creation there is a dead end by
+  // construction. Fail fast with the flow that works instead. (Adoption of an
+  // EXISTING attached origin above is untouched — that is the sanctioned path.)
+  if (detectExecutionEnvironment() === 'cloud-sandbox') {
+    throw new BootstrapError(
+      'CLOUD_SANDBOX_REPO',
+      'this is a cloud sandbox session — a repo created from inside it would not be attached to the ' +
+        "session's GitHub scope (verification and pushes are blocked by the proxy). " +
+        CLOUD_ATTACH_FLOW_HINT,
+      { exitCode: 2 },
+    );
   }
 
   // Ensure a git repo exists (main branch on fresh init).
