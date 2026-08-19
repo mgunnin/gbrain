@@ -22,7 +22,7 @@ triggers:
   - "verify the eval panel"
   - "did all providers return"
 requires:
-  - dir:conversations/
+  - dir:raw/chats/
 mutating: true
 writes_pages: false
 writes_to:
@@ -55,7 +55,7 @@ imagination.
 
 Substrates, in priority order:
 
-1. **Brain conversation archive** — pages under `conversations/`, populated by
+1. **Brain conversation archive** — pages under `raw/chats/`, populated by
    the conversation-archive skill (hard dependency for this substrate: if it
    hasn't ingested your history yet, run it first). Search for the target
    skill's name, trigger phrases, and output shapes:
