@@ -22,7 +22,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSources } from '../src/commands/sources.ts';
-import { findMisroutedPages } from '../src/core/multi-source-drift.ts';
+import { DEFAULT_FILE_LIMIT, findMisroutedPages } from '../src/core/multi-source-drift.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
@@ -55,6 +55,10 @@ function seedFile(root: string, relPath: string, content = 'placeholder\n'): voi
 }
 
 describe('findMisroutedPages — heuristic correctness', () => {
+  test('default walk limit covers mature archives above 10K files', () => {
+    expect(DEFAULT_FILE_LIMIT).toBeGreaterThanOrEqual(25_000);
+  });
+
   test('case 1: no non-default sources → returns empty result (caller skips check)', async () => {
     // Findfn is called by doctor only when at least one non-default source
     // with local_path exists; passing an empty array is the equivalent.
