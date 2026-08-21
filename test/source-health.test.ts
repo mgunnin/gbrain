@@ -302,6 +302,25 @@ describe('computeAllSourceMetrics', () => {
     expect(dflt.embed_coverage_pct).toBeCloseTo(33.3, 1);
   });
 
+  test('embedding coverage excludes pages explicitly marked embed_skip', async () => {
+    await engine.putPage('normal', { type: 'note', title: 'normal', compiled_truth: 'normal' });
+    await engine.putPage('skipped', {
+      type: 'note', title: 'skipped', compiled_truth: 'skipped', frontmatter: { embed_skip: true },
+    });
+    await engine.upsertChunks('normal', [
+      { chunk_index: 0, chunk_text: 'normal', chunk_source: 'compiled_truth', token_count: 1, embedding: new Float32Array(1536) },
+    ]);
+    await engine.upsertChunks('skipped', [
+      { chunk_index: 0, chunk_text: 'skipped', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
+    ]);
+
+    const sources = await loadAllSources(engine);
+    const dflt = (await computeAllSourceMetrics(engine, sources)).find((m) => m.source_id === 'default')!;
+    expect(dflt.total_chunks).toBe(1);
+    expect(dflt.embedded_chunks).toBe(1);
+    expect(dflt.embed_coverage_pct).toBe(100);
+  });
+
   test('lag_seconds is null when last_sync_at is null', async () => {
     const sources = await loadAllSources(engine);
     const result = await computeAllSourceMetrics(engine, sources);

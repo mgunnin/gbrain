@@ -371,6 +371,7 @@ async function chunkCountsBySource(engine: BrainEngine): Promise<Map<string, { t
        FROM content_chunks c
        JOIN pages p ON p.id = c.page_id
       WHERE p.deleted_at IS NULL
+        AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
       GROUP BY p.source_id`,
   );
   const m = new Map<string, { total: number; embedded: number }>();
