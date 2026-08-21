@@ -11,8 +11,9 @@
  *
  * Concurrency: reuses the v0.28 page-lock primitive
  * (`src/core/page-lock.ts`), an FS-level lockfile under
- * `~/.gbrain/page-locks/<sha256-of-slug>.lock` with PID-liveness +
- * 5-minute TTL. Multi-process safe — two `gbrain` invocations writing
+ * `~/.gbrain/page-locks/<sha256-of-slug>.lock` with heartbeat-recency
+ * staleness (5-minute TTL; namespace-agnostic — no PID-liveness, #2840).
+ * Multi-process safe — two `gbrain` invocations writing
  * to the same entity page serialize through the same kernel-visible
  * lockfile. 5-second timeout per the plan's "5s retry" failure mode.
  *
@@ -33,13 +34,17 @@
  * sees the constraint.
  */
 
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, isAbsolute, relative } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility } from '../engine.ts';
-import { resolvePageFilePath } from '../markdown.ts';
+import { inferTypeFromPack } from '../markdown.ts';
+import { loadActivePackBestEffort } from '../schema-pack/best-effort.ts';
 import { withPageLock } from '../page-lock.ts';
 import { gbrainPath } from '../config.ts';
+import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
+import { isDurabilityHardened, commitWriteThroughFile } from '../brain-repo-durability.ts';
 import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
@@ -94,6 +99,16 @@ export interface FenceWriteResult {
    * fell through resolution and produced a top-level `jared.md` stub.
    */
   stubGuardBlocked?: true;
+  /**
+   * True when the shared page-target resolver could not produce a usable
+   * fence file path (source tree missing / not a directory, or a hostile
+   * recorded `source_path` escaping the tree). Rows were NOT inserted; the
+   * caller is expected to route the facts to the legacy DB-only path so
+   * they aren't silently dropped. Unlike the old blind `mkdir -p`, we do
+   * NOT resurrect a deleted source tree just to hold a fence — the same
+   * refusal writePageThrough applies (#2018 `repo_not_found`).
+   */
+  targetUnresolvable?: true;
 }
 
 const FAILURE_LOG_PATH = (): string => gbrainPath('facts.write_failures.jsonl');
@@ -119,6 +134,74 @@ function recordWriteFailure(slug: string, sourceId: string, warnings: string[], 
   }
 }
 
+type FactFenceGitPathState = 'clean' | 'self_dirty' | 'foreign_dirty' | 'unknown';
+
+function gitPathState(repoPath: string, filePath: string): FactFenceGitPathState {
+  try {
+    const rel = relative(repoPath, filePath);
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return 'unknown';
+    const status = execFileSync(
+      'git',
+      ['-C', repoPath, 'status', '--porcelain=v1', '--untracked-files=all', '--', rel],
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: process.env },
+    );
+    const lines = status.split('\n').filter((l) => l.length > 0);
+    if (lines.length === 0) return 'clean';
+    // Distinguish dirt that IS the target fence file (safe for the
+    // path-limited commit to sweep — a prior gbrain fence-commit that failed
+    // leaves exactly this shape) from genuinely foreign dirt: unmerged
+    // conflict states, rename entries naming a second path, or any entry the
+    // parse can't positively attribute to `rel` (git quotes special chars).
+    for (const line of lines) {
+      const xy = line.slice(0, 2);
+      if (xy.includes('U') || xy === 'AA' || xy === 'DD') return 'foreign_dirty';
+      const pathField = line.slice(3);
+      if (pathField !== rel && pathField !== `"${rel}"`) return 'foreign_dirty';
+    }
+    return 'self_dirty';
+  } catch {
+    return 'unknown';
+  }
+}
+
+async function commitFactFenceFile(
+  repoPath: string,
+  filePath: string,
+  slug: string,
+  sourceId: string,
+  prewriteState: FactFenceGitPathState,
+): Promise<void> {
+  // Self-dirt does NOT block the commit: a prior fence-commit failure
+  // (index.lock contention, kill mid-commit) leaves the fence file itself
+  // dirty, and refusing on that shape latched the page's durability off
+  // permanently. The locked read-modify-write already incorporated the
+  // file's pre-write content, and the commit below is path-limited to this
+  // one file, so sweeping self-dirt is the recovery — only genuinely foreign
+  // dirt (or an unreadable state) keeps the audit-and-skip behavior.
+  if (prewriteState === 'foreign_dirty' || prewriteState === 'unknown') {
+    recordWriteFailure(
+      slug,
+      sourceId,
+      [prewriteState === 'foreign_dirty'
+        ? 'git_durability_preexisting_dirty'
+        : 'git_durability_prewrite_state_unknown'],
+      filePath,
+    );
+    return;
+  }
+
+  for (const delayMs of [0, 50, 200] as const) {
+    if (delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+    if (commitWriteThroughFile(repoPath, filePath, slug) && gitPathState(repoPath, filePath) === 'clean') {
+      return;
+    }
+  }
+
+  recordWriteFailure(slug, sourceId, ['git_durability_commit_failed'], filePath);
+}
+
 /**
  * Stub-create body for a new entity page. Minimum frontmatter so the
  * page validates as gbrain-canonical markdown and survives an
@@ -126,14 +209,24 @@ function recordWriteFailure(slug: string, sourceId: string, warnings: string[], 
  * (e.g. `people/alice` → 'person'); unknown prefixes fall back to
  * 'concept' which is the most permissive PageType.
  */
-function stubEntityPage(slug: string): string {
-  const prefix = slug.split('/')[0];
-  const type =
-    prefix === 'people'    ? 'person' :
-    prefix === 'companies' ? 'company' :
-    prefix === 'deals'     ? 'deal' :
-    prefix === 'topics'    ? 'concept' :
-    /* fallback */           'concept';
+function stubEntityPage(
+  slug: string,
+  pack: Parameters<typeof inferTypeFromPack>[1] | null,
+): string {
+  // #4322: resolve the type through the ACTIVE PACK, not a hardcoded table.
+  // The previous people/companies/deals/topics ternary shadowed every other
+  // pack-declared prefix, so a stub under a declared prefix such as
+  // `products/` was written as `concept` even though the pack maps that
+  // prefix to `company` — manufacturing prefix/type mismatches in brains
+  // that were otherwise fully pack-conformant, and (because `concept` skips
+  // the facts backstop) silently opting those pages out of the very
+  // subsystem that created them.
+  //
+  // A null pack means the load failed. Per best-effort.ts's contract we do
+  // NOT substitute an ad-hoc table here; passing an empty pack routes
+  // inferTypeFromPack to its own documented GBRAIN_BASE_PATH_PREFIXES
+  // fallback, the same base behaviour every other ingest path degrades to.
+  const type = inferTypeFromPack(slug, pack ?? { page_types: [] });
   const tail = slug.split('/').slice(1).join('/');
   const title = tail
     .replace(/[-_/]+/g, ' ')
@@ -172,14 +265,36 @@ export async function writeFactsToFence(
   if (facts.length === 0) {
     return { inserted: 0, ids: [] };
   }
+  // `sync.write_through` off values make the brain DB-only by operator
+  // choice: no fence file, no stub entity page, no git commit. Same
+  // legacyFallback contract as a missing local_path — the caller's DB-only
+  // path still records the facts.
+  if (await isWriteThroughDisabled(engine)) {
+    return { inserted: 0, ids: [], legacyFallback: true };
+  }
 
-  // Local patch 2026-06-11: route through resolvePageFilePath so non-default
-  // sources fence into `<local_path>/.sources/<id>/<slug>.md` — the same path
-  // the put_page write-through and dream-cycle reverse-render compute. The
-  // bare join wrote main-source fences to the repo ROOT (the default source's
-  // tree), polluting ~/brain with stray root-level fence files.
-  const filePath = resolvePageFilePath(target.localPath, target.slug, target.sourceId);
+  // #4204: compute the SAME path writePageThrough computes for this
+  // (source, slug) — the fence appends to the page's file, so the two writers
+  // must agree. The previous resolvePageFilePath routing nested any
+  // non-default source under `<local_path>/.sources/<id>/` — but every
+  // non-default source that reaches this line has its OWN `local_path`
+  // (callers fall back to the legacy DB-only path when `sources.local_path`
+  // is NULL), and write-through/scanOneSource put that topology's pages at
+  // the tree ROOT. Sync's walker skips dot-directories, so a `.sources/`
+  // fence was invisible to sync and the next extract_facts reconcile deleted
+  // the fence-owned DB rows. The shared resolver also prefers the page's
+  // recorded `source_path`, so the fence lands in the file of record instead
+  // of minting a slug-derived twin beside a human-named vault file.
+  const resolved = await resolvePageWriteTarget(engine, target.slug, target.sourceId);
+  if (!resolved.ok) {
+    // Target tree unusable (deleted dir, hostile source_path row, …) — the
+    // caller routes the facts to the legacy DB-only path so they are
+    // recorded, not dropped.
+    return { inserted: 0, ids: [], targetUnresolvable: true };
+  }
+  const { filePath, writeRoot } = resolved;
   const tmpPath = `${filePath}.tmp`;
+  const durabilityEnabled = isDurabilityHardened(writeRoot);
 
   return withPageLock(
     target.slug,
@@ -220,7 +335,8 @@ export async function writeFactsToFence(
         }
         // Stub-create the parent directory if it doesn't exist.
         mkdirSync(dirname(filePath), { recursive: true });
-        body = stubEntityPage(target.slug);
+        const activePack = await loadActivePackBestEffort({ engine } as never);
+        body = stubEntityPage(target.slug, activePack?.manifest ?? null);
       }
 
       // 2. Upsert each fact onto the fence in input order. row_num
@@ -287,6 +403,14 @@ export async function writeFactsToFence(
         assignedRowNums.push(rowNum);
       }
 
+      // Snapshot the prewrite git state INSIDE the lock, immediately before
+      // the write: an out-of-lock snapshot raced concurrent fence writers — a
+      // waiter observed the holder's not-yet-committed rename as pre-existing
+      // dirt and mis-attributed it in the audit.
+      const durabilityPrewriteState: FactFenceGitPathState = durabilityEnabled
+        ? gitPathState(writeRoot, filePath)
+        : 'clean';
+
       // 3. Atomic write: .tmp first, then parse-validate, then rename.
       writeFileSync(tmpPath, body, 'utf-8');
 
@@ -325,6 +449,15 @@ export async function writeFactsToFence(
       }));
 
       const result = await engine.insertFacts(enriched, { source_id: target.sourceId }); // gbrain-allow-direct-insert: writeFactsToFence is the markdown-first reconcile path; runs only after the atomic fence write commits
+      if (durabilityEnabled) {
+        await commitFactFenceFile(
+          writeRoot,
+          filePath,
+          target.slug,
+          target.sourceId,
+          durabilityPrewriteState,
+        );
+      }
       return { inserted: result.inserted, ids: result.ids };
     },
     { timeoutMs: 5_000 },

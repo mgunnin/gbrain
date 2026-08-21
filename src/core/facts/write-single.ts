@@ -164,7 +164,7 @@ export async function writeSingleFact(
         `facts fence write failed for ${resolvedSlug} — .tmp quarantined; see the facts write-failure JSONL log`,
       );
     }
-    if (!result.stubGuardBlocked && !result.legacyFallback) {
+    if (!result.stubGuardBlocked && !result.legacyFallback && !result.targetUnresolvable) {
       const newId = result.ids[0];
       if (supersedeId !== null && newId !== undefined) {
         await expireSuperseded(engine, supersedeId, newId);
@@ -184,7 +184,9 @@ export async function writeSingleFact(
         degraded_dedup: degradedDedup,
       };
     }
-    // stubGuardBlocked / defensive legacyFallback → DB-only path below.
+    // stubGuardBlocked / legacyFallback (sync.write_through off, or the
+    // defensive null-localPath echo) / targetUnresolvable (#4204: source
+    // tree unusable) → DB-only path below.
   }
 
   const inserted = await engine.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)

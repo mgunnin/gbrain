@@ -12,12 +12,15 @@
 
 import express from 'express';
 import type { Socket } from 'net';
-import type { Request, Response, NextFunction } from 'express';
+import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
-import { randomBytes, createHash } from 'crypto';
+import { randomBytes, createHash, createHmac } from 'crypto';
 import { safeHexEqual } from '../core/timing-safe.ts';
+import { isValidRepoName } from '../core/github-source.ts';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -57,6 +60,89 @@ import { VERSION } from '../version.ts';
 import * as db from '../core/db.ts';
 import { sqlQueryForEngine, executeRawJsonb } from '../core/sql-query.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
+/**
+ * v0.46: normalize the per-event GitHub webhook payload shape into
+ * {repo, number, kind}. Events differ: issues/issue_comment/label/
+ * assignee/milestone carry a top-level `issue` (PRs appear there too,
+ * flagged by `issue.pull_request`), pull_request/review events carry
+ * top-level `pull_request`, and check events nest the linked PRs under
+ * check_run/check_suite/workflow_run. Returns null when the payload
+ * carries no item reference (ping, branch, non-PR checks).
+ */
+export function extractGitHubItemRef(parsed: Record<string, unknown>): { repo: string; number: number; kind: 'issue' | 'pr' } | null {
+  const repoObj = parsed.repository as { full_name?: string } | undefined;
+  const repo = repoObj?.full_name ?? '';
+  const issueObj = parsed.issue as { number?: number; pull_request?: unknown } | undefined;
+  const prObj = parsed.pull_request as { number?: number } | undefined;
+  const checkRun = parsed.check_run as { pull_requests?: Array<{ number?: number }> } | undefined;
+  const checkSuite = parsed.check_suite as { pull_requests?: Array<{ number?: number }> } | undefined;
+  const workflowRun = parsed.workflow_run as { pull_requests?: Array<{ number?: number }> } | undefined;
+  const nestedPrNumber =
+    checkRun?.pull_requests?.[0]?.number ??
+    checkSuite?.pull_requests?.[0]?.number ??
+    workflowRun?.pull_requests?.[0]?.number;
+  const number = prObj?.number ?? issueObj?.number ?? nestedPrNumber;
+  if (typeof number !== 'number' || !isValidRepoName(repo)) return null;
+  const kind = prObj !== undefined || issueObj?.pull_request !== undefined || nestedPrNumber !== undefined ? 'pr' : 'issue';
+  return { repo, number, kind };
+}
+
+/**
+ * True when a github-kind source covers `fullName`: explicit gh_repos list
+ * for scope=repos, the last-discovered state file for scope=auto (accept
+ * when no state exists yet — the sync engine re-checks scope). Repo names
+ * are case-insensitive on GitHub, so matching folds case on both sides
+ * (config and legacy state files may carry canonical-case entries).
+ */
+export function githubKindCoversRepo(
+  cfg: Record<string, unknown>,
+  localPath: string | null,
+  fullName: string,
+): boolean {
+  const repo = fullName.toLowerCase();
+  if (cfg.gh_scope === 'repos') {
+    const repos = typeof cfg.gh_repos === 'string' ? cfg.gh_repos.split(',').map((s) => s.trim().toLowerCase()) : [];
+    return repos.includes(repo);
+  }
+  if (localPath) {
+    try {
+      const state = JSON.parse(readFileSync(join(localPath, '.github-source.json'), 'utf-8')) as {
+        repos?: unknown[];
+      };
+      if (Array.isArray(state.repos)) {
+        return state.repos.some((r) => typeof r === 'string' && r.toLowerCase() === repo);
+      }
+    } catch {
+      /* no state yet */
+    }
+  }
+  return true;
+}
+
+/**
+ * Partition signature-verified webhook sources for an item event. Only a
+ * github-kind source can service a github_item refresh — the sync core
+ * rejects github_item on any other kind, so enqueueing for a legacy
+ * github_repo push source would only mint a dead job. Legacy matches are
+ * reported so the handler can ACK-and-ignore them instead.
+ */
+export function selectGitHubItemSources<Row extends { local_path: string | null; config: unknown }>(
+  rows: Row[],
+  repo: string,
+  verify: (cfg: Record<string, unknown>) => boolean,
+): { verified: Row[]; legacyMatched: boolean } {
+  const verified: Row[] = [];
+  let legacyMatched = false;
+  for (const row of rows) {
+    const cfg = (typeof row.config === 'string' ? JSON.parse(row.config) : (row.config ?? {})) as Record<string, unknown>;
+    if (cfg.kind === 'github' && githubKindCoversRepo(cfg, row.local_path, repo) && verify(cfg)) {
+      verified.push(row);
+      continue;
+    }
+    if (cfg.github_repo === repo && verify(cfg)) legacyMatched = true;
+  }
+  return { verified, legacyMatched };
+}
 import {
   registerScopedClient,
   preflightOauthClientColumns,
@@ -433,7 +519,11 @@ export function parseCorsAllowlistOAuth(): Set<string> | null {
 /**
  * Build a `cors.CorsOptions['origin']` value from the allowlist. The cors
  * package accepts:
- *   - `false` → reject everything (no Allow-Origin header sent)
+ *   - `false` → NOT an Allow-Origin header of "none"; cors@2.8.x treats a
+ *     falsy `origin` option as "no CORS gate" and simply calls `next()`
+ *     without setting or short-circuiting anything (see the mismatch note on
+ *     `mountOAuthCorsGate` below). We keep `false` for the null-allowlist case
+ *     because the gate is enforced by `mountOAuthCorsGate`, not by cors.
  *   - `(origin, cb) => cb(null, boolean)` → dynamic per-request check
  * We use the function form when an allowlist is set so the value of the
  * Allow-Origin header echoes the request Origin (RFC 6454) instead of a
@@ -449,6 +539,45 @@ export function resolveCorsOrigin(allowlist: Set<string> | null): cors.CorsOptio
   return (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
     if (!origin) return cb(null, true);
     cb(null, allowlist.has(origin));
+  };
+}
+
+/**
+ * Wrap the OAuth `cors()` middleware so it OWNS the preflight response and a
+ * denied/default-deny origin can never fall through to a downstream handler
+ * that answers OPTIONS with `Access-Control-Allow-Origin: *`.
+ *
+ * Why this is necessary (#3845): the MCP SDK's `mcpAuthRouter` mounts a bare
+ * `cors()` (origin `*`) as the FIRST middleware on `/token`, `/revoke`, and
+ * `/register` (see @modelcontextprotocol/sdk auth/handlers/{token,revoke,
+ * register}). Our gate at `app.use('/token', cors(oauthOptions))` runs first,
+ * but when the origin is denied — either the allowlist is unset (origin
+ * `false`) or the request Origin is not on the allowlist — cors@2.8.x does NOT
+ * emit a header and does NOT short-circuit; it just calls `next()`. Control
+ * then reaches the SDK's bare `cors()`, which answers the OPTIONS preflight
+ * with `*`, leaking the endpoint surface + methods to any web origin and
+ * contradicting the documented default-deny posture.
+ *
+ * The wrapper closes that gap: cors() only reaches our callback when it did
+ * NOT short-circuit the preflight itself (i.e. the origin was denied or the
+ * request is a real, non-OPTIONS request). For a denied OPTIONS we terminate
+ * with a header-free 204 so the SDK's cors never runs; real requests fall
+ * through unchanged. Allowed origins are still short-circuited by cors() with
+ * the reflected Origin, exactly as before.
+ */
+export function mountOAuthCorsGate(options: cors.CorsOptions): RequestHandler {
+  const corsMiddleware = cors(options);
+  return (req: Request, res: Response, next: NextFunction) => {
+    corsMiddleware(req, res, (err?: unknown) => {
+      if (err) return next(err as Error);
+      if (req.method === 'OPTIONS') {
+        // Default-deny preflight: no Allow-Origin header, no fall-through.
+        res.statusCode = 204;
+        res.setHeader('Content-Length', '0');
+        return res.end();
+      }
+      return next();
+    });
   };
 }
 
@@ -879,10 +1008,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
   };
   app.use('/mcp', cors(corsOAuthOptions));
-  app.use('/token', cors(corsOAuthOptions));
   app.use('/authorize', cors(corsOAuthOptions));
-  app.use('/register', cors(corsOAuthOptions));
-  app.use('/revoke', cors(corsOAuthOptions));
+  // /token, /revoke and /register are shadowed by the MCP SDK's own bare
+  // `cors()` (origin `*`) mounted inside mcpAuthRouter. A denied preflight must
+  // be terminated here — a plain `cors(corsOAuthOptions)` would fall through to
+  // the SDK's `*` (#3845). /mcp and /authorize are not shadowed (no downstream
+  // cors), so they keep the plain gate.
+  app.use('/token', mountOAuthCorsGate(corsOAuthOptions));
+  app.use('/register', mountOAuthCorsGate(corsOAuthOptions));
+  app.use('/revoke', mountOAuthCorsGate(corsOAuthOptions));
 
   // #2179: capture the optional `token_ttl_seconds` DCR extension field
   // BEFORE the SDK's /register handler runs — its request schema strips
@@ -2071,6 +2205,20 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       cache.set(asset.path, buf);
       return buf;
     }
+    // Bare /admin (no trailing slash) never matches the '/admin/{*path}'
+    // pattern below — path-to-regexp requires the literal '/' that
+    // precedes the wildcard segment. The dev-path branch above doesn't need
+    // this: express.static() issues its own redirect-to-trailing-slash for
+    // a directory index request. Mirror that behavior explicitly here.
+    // Express route matching is non-strict by default, so the '/admin'
+    // pattern below also matches '/admin/' — guard on the exact path so
+    // it doesn't shadow the '/admin/{*path}' handler and redirect-loop.
+    app.get('/admin', (req: Request, res: Response, next: NextFunction) => {
+      if (req.path !== '/admin') {
+        return next();
+      }
+      res.redirect('/admin/');
+    });
     app.get('/admin/{*path}', (req: Request, res: Response, next: NextFunction) => {
       if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
         return next();
@@ -2504,6 +2652,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // gets parseable JSON back.
     try {
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as any });
+      // #2844: per-request teardown (SDK stateless pattern) — without it every POST /mcp leaks the transport+Server pair (~3GB/day RSS). Registered BEFORE connect/handleRequest so early disconnects and handleRequest throws still clean up; best-effort catches so cleanup never surfaces an unhandledRejection.
+      res.on('close', () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (e) {
@@ -2662,19 +2812,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const content = body.toString('utf8');
       const contentHash = computeContentHash(content);
       const sourceUri = (req.header('x-gbrain-source-uri') || `mcp-webhook:${authInfo.clientId}:${Date.now()}`).slice(0, 1024);
-      const sourceId = (req.header('x-gbrain-source-id') || `webhook-${authInfo.clientId}`).slice(0, 256);
+      const sourceId = `webhook-${authInfo.clientId}`.slice(0, 256);
       const callerSlug = req.header('x-gbrain-slug');
 
       // Slug-bound clients cannot use /ingest at all. The route hands its
       // payload to the ingest_capture minion handler, which deliberately
       // bypasses the put_page op layer — so no OperationContext exists and
-      // enforceClientSlugFence never runs, and because the payload is marked
-      // untrusted the handler also refuses to honor any source id, landing
-      // every write in the DEFAULT source. Fencing just the slug here would
-      // still write the right slug into the WRONG source, outside the
-      // client's grant. These clients have put_page over MCP, which enforces
-      // both the prefix fence and the source scope; webhook integrations use
-      // unbound clients.
+      // enforceClientSlugFence never runs. The caller-supplied
+      // X-Gbrain-Source-Id is still never honored, but the write source is now
+      // resolved server-side from the client's own OAuth scope, so the write
+      // does land inside the client's granted source. The fence gap is
+      // therefore the SLUG axis alone: without this 403 a bound client could
+      // write any slug within its source, which is exactly the binding it was
+      // given. These clients have put_page over MCP, which enforces both the
+      // prefix fence and the source scope; webhook integrations use unbound
+      // clients.
       const boundPrefixes = authInfo.boundSlugPrefixes;
       if (boundPrefixes || authInfo.fenceProjectionDegraded) {
         res.status(403).json({
@@ -2718,18 +2870,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       try {
+        const writeSourceId = authInfo.sourceId ?? 'default';
         const job = await ingestQueue.add(
           'ingest_capture',
           {
             event,
             ...(callerSlug ? { slug: callerSlug } : {}),
+            sourceId: writeSourceId,
           },
           {
             // Idempotency: same content from the same client within the
             // queue's lifetime is a single job. Different content gets
             // different jobs. Daemon-side dedup catches the 24h window;
             // the queue-level idempotency catches simultaneous retries.
-            idempotency_key: `ingest:webhook:${authInfo.clientId}:${contentHash}`,
+            // The effective write source is part of the key: a client rescoped
+            // from source X to Y must land a NEW capture in Y rather than being
+            // deduped against its old X-bound job.
+            idempotency_key: `ingest:webhook:${authInfo.clientId}:${writeSourceId}:${contentHash}`,
             // Cap waiting jobs from a single client so a runaway integration
             // can't fill the queue.
             maxWaiting: 50,
@@ -2743,7 +2900,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
              VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
             [authInfo.clientId, agentName, 'webhook_ingest', latency, 'success'],
-            [{ content_type: contentType, content_hash: contentHash, bytes: body.length, job_id: job.id }],
+            // write_source_id is the security-relevant part of this request:
+            // which partition the capture was routed to. Without it the audit
+            // trail cannot answer "where did this client's writes land".
+            [{ content_type: contentType, content_hash: contentHash, bytes: body.length, job_id: job.id, write_source_id: writeSourceId }],
           );
         } catch { /* best effort */ }
         broadcastEvent({
@@ -2758,7 +2918,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         res.status(202).json({
           job_id: job.id,
           content_hash: contentHash,
+          // Emitter identity (`webhook-<clientId>`), kept for back-compat.
           source_id: sourceId,
+          // The brain source this capture is routed to, resolved server-side
+          // from the client's OAuth scope. This is the routing decision the
+          // caller actually cares about; `source_id` above is NOT a partition.
+          // Enqueue-time intent: the write runs asynchronously after this 202,
+          // so a later source_fallback (see the ingest_capture job result) can
+          // still redirect it.
+          write_source_id: writeSourceId,
           message: 'Accepted. Event queued for ingestion.',
         });
       } catch (err) {
@@ -2814,6 +2982,111 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     message: { error: 'rate_limit_exceeded', message: 'too many GitHub webhook requests' },
   });
 
+  /**
+   * v0.46: issue/PR event handling for github-kind sources. The payload
+   * names a single item (repo + number); we verify the per-source HMAC and
+   * submit a targeted `sync` job with github_item so exactly that item is
+   * refreshed. Out-of-scope repos are rejected at queue time by the sync
+   * engine's own scope check.
+   */
+  async function handleGitHubItemEvent(
+    engine: BrainEngine,
+    parsed: Record<string, unknown>,
+    sigHeader: string,
+    payload: Buffer,
+    res: Response,
+    eventName: string,
+  ): Promise<void> {
+    const ref = extractGitHubItemRef(parsed);
+    if (ref === null) {
+      // Not an item-bearing payload (e.g. check events without a linked PR,
+      // ping, branch protection). Acknowledge so GitHub does not retry.
+      res.status(202).json({ status: 'ignored', reason: 'no_item_ref' });
+      return;
+    }
+
+    // Collect ALL candidate sources: exact github_repo matches (legacy
+    // webhook config) and github-kind sources with a webhook secret, then
+    // verify HMAC per candidate. Only github-kind sources may enqueue a
+    // github_item refresh; two verifying github-kind sources mean ambiguous
+    // configuration and must not pick silently.
+    let source: { id: string; local_path: string | null; config: unknown } | null = null;
+    try {
+      const rows = await engine.executeRaw<{ id: string; local_path: string | null; config: unknown }>(
+        `SELECT id, local_path, config FROM sources
+           WHERE archived = false
+             AND ((config->>'github_repo' = $1)
+               OR (config->>'kind' = 'github' AND config->>'webhook_secret' IS NOT NULL))`,
+        [ref.repo],
+      );
+      const { verified, legacyMatched } = selectGitHubItemSources(rows, ref.repo, (cfg) =>
+        verifyWebhookSig(cfg, sigHeader, payload),
+      );
+      if (verified.length > 1) {
+        res.status(500).json({
+          error: 'ambiguous_webhook',
+          message: `multiple sources verified the signature for ${ref.repo}; configure one webhook secret per source`,
+          sources: verified.map((v) => v.id),
+        });
+        return;
+      }
+      if (verified.length === 0 && legacyMatched) {
+        // A legacy push-webhook source verified the signature but cannot
+        // service item events — ACK so GitHub doesn't retry, exactly like
+        // the pre-item-flow non-push behavior.
+        res.status(202).json({ status: 'ignored', reason: `event=${eventName}` });
+        return;
+      }
+      source = verified[0] ?? null;
+    } catch (err) {
+      console.error('webhook: github-kind source lookup error:', err);
+      res.status(500).json({ error: 'lookup_failed' });
+      return;
+    }
+    if (!source) {
+      res.status(404).json({ error: 'unknown_repo', repo: ref.repo });
+      return;
+    }
+
+    try {
+      const queue = new MinionQueue(engine);
+      const job = await queue.add(
+        'sync',
+        {
+          sourceId: source.id,
+          noExtract: false,
+          github_item: {
+            repo: ref.repo,
+            number: ref.number,
+            kind: ref.kind,
+            ...(eventName === 'issues' && parsed.action === 'deleted' ? { deleted: true } : {}),
+          },
+          embed_reason: 'webhook',
+        },
+        {
+          priority: -10,
+          idempotency_key: `webhook:item:${source.id}:${ref.repo}:${ref.number}:${Math.floor(Date.now() / 30_000)}`,
+          maxWaiting: 1,
+        },
+      );
+      res.status(202).json({ job_id: job.id, source_id: source.id, item: ref });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('webhook: item queue submission error:', msg);
+      res.status(500).json({ error: 'queue_submission_failed', message: msg });
+    }
+  }
+
+  function verifyWebhookSig(cfg: Record<string, unknown>, sigHeader: string, payload: Buffer): boolean {
+    const secret = cfg.webhook_secret;
+    if (typeof secret !== 'string' || secret === '') return false;
+    // Strict hex shape first: a malformed 64-char signature would make
+    // safeHexEqual throw (500 instead of 401).
+    if (!/^sha256=[0-9a-f]{64}$/.test(sigHeader)) return false;
+    const computedHex = createHmac('sha256', secret).update(payload).digest('hex');
+    return safeHexEqual(sigHeader.slice('sha256='.length), computedHex);
+  }
+
   app.post(
     '/webhooks/github',
     githubWebhookLimiter,
@@ -2828,10 +3101,25 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       // D5: filter by event header. GitHub fires webhooks for every event
-      // type. Anything other than 'push' is acknowledged with 202 + reason
-      // so GitHub doesn't retry — but no source lookup or job submission.
+      // type. Anything not in the handled set is acknowledged with 202 +
+      // reason so GitHub doesn't retry — but no source lookup or job
+      // submission. Push events drive git-source sync (below). Issue/PR
+      // events drive github-kind single-item refresh (itemFlow).
       const event = req.header('X-GitHub-Event') ?? '';
-      if (event !== 'push') {
+      const GH_ITEM_EVENTS = new Set([
+        'issues',
+        'pull_request',
+        'issue_comment',
+        'pull_request_review',
+        'pull_request_review_comment',
+        'label',
+        'assignee',
+        'milestone',
+        'check_run',
+        'check_suite',
+        'workflow_run',
+      ]);
+      if (event !== 'push' && !GH_ITEM_EVENTS.has(event)) {
         res.status(202).json({ status: 'ignored', reason: `event=${event || '(missing)'}` });
         return;
       }
@@ -2842,7 +3130,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         return;
       }
 
-      let parsed: { repository?: { full_name?: string }; ref?: string };
+      let parsed: Record<string, unknown>;
       try {
         parsed = JSON.parse(payload.toString('utf8'));
       } catch {
@@ -2850,8 +3138,17 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         return;
       }
 
-      const fullName = parsed.repository?.full_name;
-      const ref = parsed.ref;
+      // GitHub-kind item refresh path (v0.46): issues / pull_request /
+      // comment / review / label / assignee / milestone / check events
+      // refresh exactly the item that changed.
+      if (GH_ITEM_EVENTS.has(event)) {
+        await handleGitHubItemEvent(engine, parsed, sigHeader, payload, res, event);
+        return;
+      }
+
+      const pushParsed = parsed as { repository?: { full_name?: string }; ref?: string };
+      const fullName = pushParsed.repository?.full_name;
+      const ref = pushParsed.ref;
       if (!fullName || !ref) {
         res.status(400).json({ error: 'missing_fields', message: 'repository.full_name and ref are required' });
         return;
@@ -2904,12 +3201,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // safeHexEqual because Buffer.from('sha256=...', 'hex') silently
       // truncates at the first non-hex char (the 's'), leaving both
       // operands as 0-byte buffers and making every signature "match".
-      // Pinned by test/sources-webhook.test.ts tamper assertions.
+      // Strict hex shape first: a malformed 64-char signature would make
+      // safeHexEqual throw (500 instead of 401), codex LOW.
       const { createHmac } = await import('node:crypto');
       const computedHex = createHmac('sha256', secret).update(payload).digest('hex');
       const prefix = 'sha256=';
-      if (!sigHeader.startsWith(prefix)) {
-        res.status(401).json({ error: 'signature_mismatch', message: 'expected sha256= prefix' });
+      if (!/^sha256=[0-9a-f]{64}$/.test(sigHeader)) {
+        res.status(401).json({ error: 'signature_mismatch', message: 'expected sha256=<64 hex> signature' });
         return;
       }
       if (!safeHexEqual(sigHeader.slice(prefix.length), computedHex)) {
@@ -2974,5 +3272,23 @@ ${bootstrapFromEnv
 `);
   });
 
-  await waitForHttpServerLifecycle(httpServer);
+  // SIGTERM/SIGHUP route through process-cleanup's pass and then
+  // `process.exit`, which skips cli.ts's finally-teardown — so on those
+  // signals the PGLite write handle was never closed. An unclosed PGLite
+  // can leave the control file pointing at a checkpoint record whose WAL
+  // page never reached disk; every later start then dies with
+  // `PANIC: could not locate a valid checkpoint record` (surfaced as the
+  // misleading WASM-init hint) and the daemon crash-loops until a human
+  // intervenes. Registering the engine here gives abnormal termination
+  // the same clean close the SIGINT path already gets via the cli
+  // teardown. Deregistered on normal return so the cli finally remains
+  // the single owner of orderly shutdown.
+  const deregisterEngineCleanup = registerCleanup('pglite-engine-disconnect', () =>
+    engine.disconnect(),
+  );
+  try {
+    await waitForHttpServerLifecycle(httpServer);
+  } finally {
+    deregisterEngineCleanup();
+  }
 }

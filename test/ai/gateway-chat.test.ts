@@ -34,7 +34,7 @@ import { listRecipes, getRecipe } from '../../src/core/ai/recipes/index.ts';
 import type { Recipe } from '../../src/core/ai/types.ts';
 
 describe('chat touchpoint — recipe registry', () => {
-  test('all six chat-capable providers ship a chat touchpoint with supports_subagent_loop', () => {
+  test('all hosted tool-loop providers ship a chat touchpoint with supports_subagent_loop', () => {
     const expected = ['anthropic', 'openai', 'google', 'deepseek', 'groq', 'together'];
     for (const id of expected) {
       const r = getRecipe(id);
@@ -45,28 +45,56 @@ describe('chat touchpoint — recipe registry', () => {
     }
   });
 
-  test('only Anthropic claims supports_prompt_cache outright; others gate per model', () => {
+  test('the set of recipes declaring supports_prompt_cache is the expected one', () => {
+    // The flag answers "does this provider cache prompts at all" — what
+    // capabilities.ts reads to decide whether the subagent loop runs hot.
+    // Explicit client-side markers (Anthropic's cache_control), automatic
+    // server-side prefix caching (OpenAI, DeepSeek), and a local server that
+    // always caches (llama-server) all count.
+    //
+    // This pins the CURRENT declarations, not a claim that every other
+    // provider is cache-less: some recipes here still declare false while
+    // their vendor does cache (moonshot). Correcting those needs per-model
+    // predicates rather than a boolean, so they are tracked separately —
+    // when one is fixed, add it here.
+    // Per-model predicate where caching depends on the model generation or the
+    // routed family — OpenRouter by routed model family (openai/* +
+    // anthropic/claude-*), Google by Gemini version (implicit caching is
+    // 2.5+), OpenAI by the gpt-4o/o-series generation; a plain boolean where
+    // it is a property of the whole provider. Anything else must declare no
+    // caching.
+    const PREDICATE = new Set(['openai', 'openrouter', 'google']);
+    const ALWAYS_CACHES = new Set(['anthropic', 'deepseek', 'llama-server']);
     for (const r of listRecipes()) {
       if (!r.touchpoints.chat) continue;
-      if (r.id === 'anthropic') {
-        expect(r.touchpoints.chat.supports_prompt_cache).toBe(true);
-      } else if (r.id === 'openrouter' || r.id === 'google') {
-        // Scoped predicates, never a blanket true: OpenRouter by routed model
-        // family (openai/* + anthropic/claude-*), Google by Gemini version
-        // (implicit caching is 2.5+). Matrices live in each recipe's test.
-        expect(typeof r.touchpoints.chat.supports_prompt_cache).toBe('function');
+      const flag = r.touchpoints.chat.supports_prompt_cache;
+      if (PREDICATE.has(r.id)) {
+        expect(typeof flag, `${r.id} should gate caching per model`).toBe('function');
+      } else if (ALWAYS_CACHES.has(r.id)) {
+        expect(flag, `${r.id} should declare caching`).toBe(true);
       } else {
-        expect(r.touchpoints.chat.supports_prompt_cache ?? false).toBe(false);
+        expect(flag ?? false, `${r.id} should not declare caching`).toBe(false);
       }
     }
   });
 
-  test('embedding-only providers (voyage, ollama) do NOT declare chat', () => {
+  test('Voyage remains embedding-only', () => {
     expect(getRecipe('voyage')!.touchpoints.chat).toBeUndefined();
-    expect(getRecipe('ollama')!.touchpoints.chat).toBeUndefined();
+  });
+
+  test('Ollama declares local chat without subagent tool-loop support', () => {
+    const chat = getRecipe('ollama')!.touchpoints.chat;
+    expect(chat).toBeDefined();
+    expect(chat!.models).toContain('qwen2.5-coder:14b');
+    expect(chat!.supports_tools).toBe(false);
+    expect(chat!.supports_subagent_loop).toBe(false);
+    expect(chat!.supports_prompt_cache).toBe(false);
+    expect(chat!.cost_per_1m_input_usd).toBe(0);
+    expect(chat!.cost_per_1m_output_usd).toBe(0);
   });
 
   test('openai-compat chat recipes have base_url_default', () => {
+    expect(getRecipe('ollama')!.base_url_default).toBe('http://localhost:11434/v1');
     expect(getRecipe('deepseek')!.base_url_default).toBe('https://api.deepseek.com/v1');
     expect(getRecipe('groq')!.base_url_default).toBe('https://api.groq.com/openai/v1');
     expect(getRecipe('together')!.base_url_default).toBe('https://api.together.xyz/v1');
@@ -168,12 +196,11 @@ describe('chat touchpoint — model resolver + aliases (Codex F-OV-5)', () => {
     // Legacy id retired by DeepSeek 2026-07-24 (#1255): still passes local
     // validation (openai-compat tier), rejection surfaces at the provider.
     expect(() => assertTouchpoint(getRecipe('deepseek')!, 'chat', 'deepseek-chat')).not.toThrow();
+    expect(() => assertTouchpoint(getRecipe('ollama')!, 'chat', 'qwen2.5-coder:14b')).not.toThrow();
   });
 
   test('assertTouchpoint rejects chat on embedding-only providers with a fix hint', () => {
     expect(() => assertTouchpoint(getRecipe('voyage')!, 'chat', 'voyage-3'))
-      .toThrow(AIConfigError);
-    expect(() => assertTouchpoint(getRecipe('ollama')!, 'chat', 'nomic-embed-text'))
       .toThrow(AIConfigError);
   });
 
@@ -191,6 +218,7 @@ describe('chat touchpoint — model resolver + aliases (Codex F-OV-5)', () => {
   test('assertTouchpoint accepts arbitrary model on openai-compat tier', () => {
     // openai-compat lets users pass models not declared in the recipe (provider may host more)
     expect(() => assertTouchpoint(getRecipe('groq')!, 'chat', 'some-future-model')).not.toThrow();
+    expect(() => assertTouchpoint(getRecipe('ollama')!, 'chat', 'locally-installed-model')).not.toThrow();
   });
 });
 
@@ -449,5 +477,44 @@ describe('chat touchpoint — per-part providerMetadata round trip (#4201)', () 
     expect(capturedMessages).toBeDefined();
     const assistant = (capturedMessages as any[]).find(m => m.role === 'assistant');
     expect(assistant.content[0].providerOptions).toEqual(SIG);
+  });
+});
+
+describe('chat — typed provider error status carried to the top level', () => {
+  beforeEach(() => {
+    resetGateway();
+    __setGenerateTextTransportForTests(null);
+  });
+
+  test('claude-cli 429 envelope error keeps apiErrorStatus readable on the normalized error', async () => {
+    // normalizeAIError wraps provider errors (here in AITransientError); the
+    // status a caller branches on must survive as a top-level property, not
+    // only inside `cause`.
+    const { ClaudeCliProcessError } = await import('../../src/core/ai/providers/claude-cli-language-model.ts');
+    const { AITransientError } = await import('../../src/core/ai/errors.ts');
+    __setGenerateTextTransportForTests(async () => {
+      throw new ClaudeCliProcessError(
+        'claude-cli API error 429: monthly spend limit reached',
+        { apiErrorStatus: 429, exitCode: 1 },
+      );
+    });
+    configureGateway({ chat_model: 'claude-cli:claude-sonnet-4-6', env: {} });
+
+    let caught: unknown;
+    try {
+      await chat({
+        model: 'claude-cli:claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hello' }],
+      });
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(AITransientError);
+    const err = caught as InstanceType<typeof AITransientError> & { apiErrorStatus?: number };
+    expect(err.message).toContain('claude-cli API error 429');
+    expect(err.apiErrorStatus).toBe(429);
+    // The original typed error stays reachable as the cause.
+    expect(err.cause).toBeInstanceOf(ClaudeCliProcessError);
   });
 });

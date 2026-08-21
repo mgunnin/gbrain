@@ -146,6 +146,8 @@ Stable phase names shipped in v0.15.2:
 - `import.files`
 - `sync.deletes`, `sync.renames`, `sync.imports`
 - `migrate.copy_pages`, `migrate.copy_links`
+- `migrate.copy_facts` (heartbeat-only, one tick per fact row; the facts
+  table re-copies fully on every run, so the tick count is the whole table)
 - `migrate.reembed` (the re-embed pass of `gbrain migrate embeddings`; total is the
   stale-chunk backlog at the start of the pass, so it can grow slightly if a
   writer adds chunks mid-run)
@@ -165,6 +167,10 @@ Stable phase names shipped in v0.15.2:
 - `transcripts.ingest` (one tick per session-log file; sessions inside a
   multi-session file — the hermes store, consumer exports — don't get their
   own ticks, so total = file count; each session emits a heartbeat instead)
+- `sync.github_materialize` (github-kind source sweep: the phase restarts
+  once per repo with that repo's item count as total — counts are only
+  known after each repo's enumeration — and every item ticks exactly once;
+  scope resolution, per-repo listing and detail fetches emit heartbeats)
 
 Sub-phases exposed via `child()`:
 

@@ -14,7 +14,13 @@
 import type { BrainEngine } from './engine.ts';
 import type { PageType, EffectiveDateSource } from './types.ts';
 import { ensureWellFormed } from './text-safe.ts';
+import { stripCodeBlocks } from './markdown-code.ts';
+import { parseInlineCitationTimelineEntries } from './timeline-citations.ts';
 import { slugifyPath } from './sync.ts';
+import { SLUG_WORD_CHARS } from './cjk.ts';
+
+export { stripCodeBlocks } from './markdown-code.ts';
+export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidate } from './timeline-citations.ts';
 
 /**
  * v0.42.7 — link-extraction version stamp. Bump this ISO timestamp whenever the
@@ -29,12 +35,12 @@ import { slugifyPath } from './sync.ts';
  * OR updated_at > links_extracted_at`. It is an ISO-8601 string (NOT a number) —
  * the column is TIMESTAMPTZ and the predicate binds it as `::timestamptz`.
  */
-// 2026-08-01: bumped for the fix-wave-i extraction batch — the #3466
-// inferTypeByDir fix (unevidenced people/ -> companies/ adjacency now infers
-// 'mentions' instead of 'works_at') AND the #2576 bug-2 fix (the DIR_PATTERN
-// whitelist no longer drops markdown links / bare-slug refs / slash-shaped
-// wikilinks in non-whitelisted directories). Pages stamped by earlier sweeps
-// are re-flagged so the next --stale sweep re-extracts under both fixes.
+// 2026-08-21: re-bumped for #2367 — normalizeBasename semantics changed
+// (non-Latin scripts kept, accents folded like the slug grammar), so
+// pre-#2367 extractions must re-run to pick up the newly-resolvable links.
+// Subsumes the 2026-08-19 fix-wave-i bump (#3466 unevidenced people/ ->
+// companies/ adjacency infers 'mentions', not 'works_at'; #2576 bug-2
+// DIR_PATTERN whitelist no longer drops non-whitelisted-directory links).
 // The watermark MUST NOT be in the future: the stamp path clamps
 // links_extracted_at up to the watermark (so a fresh extraction isn't
 // immediately re-listed), which means a future watermark masks concurrent
@@ -43,7 +49,7 @@ import { slugifyPath } from './sync.ts';
 // PRE-wave code after this date reads as fresh and won't re-extract until
 // the page is next edited; no fixed watermark can cover code that keeps
 // running past it.
-export const LINK_EXTRACTOR_VERSION_TS = '2026-08-01T00:00:00Z';
+export const LINK_EXTRACTOR_VERSION_TS = '2026-08-21T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -75,6 +81,16 @@ export interface EntityRef {
    * LinkCandidate per resolved match.
    */
   needsResolution?: boolean;
+  /**
+   * Number of leading `../` segments on the original markdown link (0 when
+   * absent or for engine-slug refs). The match regex strips the `../` run, so
+   * this preserves the relative depth for callers that know the linking page's
+   * slug (`extractPageLinks`) to resolve the target against the page's own
+   * directory. Without it, `[x](../concepts/x.md)` from a nested page resolves
+   * as the root-relative `concepts/x` instead of `<page-dir-parent>/concepts/x`
+   * — the reason subtree-scoped / nested brains got zero cross-dir edges.
+   */
+  upLevels?: number;
 }
 
 /**
@@ -197,42 +213,6 @@ const WIKILINK_GENERIC_RE = /\[\[([^|\]#\n[]+?)(?:#[^|\]]*?)?(?:\|([^\]]+?))?\]\
 const MARKDOWN_LABEL_WIKILINK_RE = /\[[^\]\n]*\[\[[^\]\n]+\]\][^\]\n]*\]\([^)\n]+\)/g;
 
 /**
- * Strip fenced code blocks (```...```) and inline code (`...`) from markdown,
- * replacing them with whitespace of equivalent length. Preserves byte offsets
- * for any caller that cares about positions; for our extractors this is just
- * defense-in-depth — slugs inside code are not real entity references.
- */
-export function stripCodeBlocks(content: string): string {
-  let out = '';
-  let i = 0;
-  while (i < content.length) {
-    // Fenced block: ``` (optional language) ... ```
-    if (content.startsWith('```', i)) {
-      const end = content.indexOf('```', i + 3);
-      if (end === -1) { out += ' '.repeat(content.length - i); break; }
-      out += ' '.repeat(end + 3 - i);
-      i = end + 3;
-      continue;
-    }
-    // Inline code: `...` (single backtick, no newline inside)
-    if (content[i] === '`') {
-      const end = content.indexOf('`', i + 1);
-      if (end === -1 || content.slice(i + 1, end).includes('\n')) {
-        out += content[i];
-        i++;
-        continue;
-      }
-      out += ' '.repeat(end + 1 - i);
-      i = end + 1;
-      continue;
-    }
-    out += content[i];
-    i++;
-  }
-  return out;
-}
-
-/**
  * A code-reference found in markdown prose. Created by extractCodeRefs and
  * consumed by importFromFile's tail to build doc↔impl edges (v0.19.0 E1).
  */
@@ -345,10 +325,27 @@ export function extractEntityRefs(content: string): EntityRef[] {
   const mdPattern = new RegExp(ENTITY_REF_RE.source, ENTITY_REF_RE.flags);
   while ((match = mdPattern.exec(stripped)) !== null) {
     const name = match[1];
-    const fullPath = match[2];
+    let fullPath = match[2];
+    // Obsidian's useMarkdownLinks mode percent-encodes link targets
+    // (`[Alice](people/alice%20chen)`). Decode before resolution; a
+    // malformed escape keeps the raw text rather than throwing.
+    if (fullPath.includes('%')) {
+      try { fullPath = decodeURIComponent(fullPath); } catch { /* keep raw */ }
+    }
     const slug = fullPath;
     const dir = fullPath.split('/')[0];
-    refs.push({ name, slug, dir });
+    // The regex strips the leading `../` run from `fullPath`; recover its depth
+    // from the raw link target so extractPageLinks can resolve relative to the
+    // linking page's directory. `[x](path)` has no `](` collision because the
+    // capture stops before the first unescaped `)`.
+    const rawTarget = match[0].slice(match[0].indexOf('](') + 2, -1);
+    const up = rawTarget.match(/^(?:\.\.\/)+/);
+    const ref: EntityRef = { name, slug, dir };
+    // Only relative links carry depth; absolute / engine-slug refs keep the
+    // exact {name, slug, dir} shape (no upLevels key) so equality consumers
+    // are unaffected.
+    if (up) ref.upLevels = up[0].length / 3;
+    refs.push(ref);
     markdownRanges.push([match.index, match.index + match[0].length]);
   }
 
@@ -431,6 +428,29 @@ function maskRanges(content: string, ranges: Array<[number, number]>): string {
     for (let i = s; i < e && i < chars.length; i++) chars[i] = ' ';
   }
   return chars.join('');
+}
+
+/**
+ * Resolve a markdown ref's target against the LINKING page's directory when the
+ * original link was relative (had one or more `../`). Filesystem markdown links
+ * are relative to the file that contains them: `[x](../concepts/x.md)` from a
+ * page at `wiki/sources/foo` points at `wiki/concepts/x`, not the root-relative
+ * `concepts/x`. The match regex discards the `../` run, so `ref.upLevels` carries
+ * the depth and this reconstructs the absolute page slug.
+ *
+ * Backward-compatible: for a page one level below the root (`meetings/m` +
+ * `../people/alice` → `people/alice`) the parent walk lands exactly at the root,
+ * so the result is identical to the old `../`-stripping behavior. It only
+ * diverges — correctly — when the linking page is nested deeper than the `../`
+ * count unwinds, i.e. content under a prefix (subtree-scoped sources). An over-
+ * long `../` run clamps at the root. Absolute refs (upLevels 0, e.g. engine-slug
+ * `people/x` or `[[wikilinks]]`) are returned unchanged.
+ */
+function resolveRelativeSlug(pageSlug: string, ref: EntityRef): string {
+  if (!ref.upLevels || ref.upLevels <= 0) return ref.slug;
+  const dirSegs = pageSlug.includes('/') ? pageSlug.split('/').slice(0, -1) : [];
+  const keep = Math.max(0, dirSegs.length - ref.upLevels);
+  return [...dirSegs.slice(0, keep), ref.slug].join('/');
 }
 
 // ─── Link candidates (richer than EntityRef) ────────────────────
@@ -583,9 +603,13 @@ export async function extractPageLinks(
     // narrative prose where a partner's investment verbs appear once and
     // then portfolio companies are listed in subsequent sentences.
     const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
+    // Relative markdown links resolve against THIS page's directory (fixes
+    // cross-dir edges for nested / subtree-scoped content); absolute refs pass
+    // through unchanged.
+    const targetSlug = resolveRelativeSlug(slug, ref);
     candidates.push({
-      targetSlug: ref.slug,
-      linkType: inferLinkType(pageType, context, content, ref.slug),
+      targetSlug,
+      linkType: inferLinkType(pageType, context, content, targetSlug),
       context,
       linkSource: 'markdown',
     });
@@ -922,18 +946,19 @@ export interface SlugResolver {
 }
 
 /**
- * Issue #972 (codex [P2] DRY): the ONE basename matcher. Before this, three
- * surfaces (makeResolver, FS `resolveBasenameMatchesFromSlugs`, the doctor
- * `link_resolution_opportunity` check) each hand-rolled their own key set +
- * sort, and they drifted — the doctor omitted the slugified key, so its
- * "N would resolve" estimate undercounted what extraction actually produces.
- * All three now build/query through these two functions so they cannot drift.
+ * Issue #972 (codex [P2] DRY): the ONE basename matcher. makeResolver, the
+ * FS resolver, and the doctor `link_resolution_opportunity` check all
+ * build/query through these two functions so they cannot drift.
  *
- * Keying: raw tail + lowercase tail + slugified tail. A slug's tail is its
- * final `/`-segment (or the whole slug when it has no `/`).
+ * Keying: raw tail + lowercase tail + slugified tail (the final `/`-segment,
+ * or the whole slug when it has no `/`). #2367: slugified keys mirror
+ * slugifySegment (NFD → strip accents → NFC → lowercase → SLUG_WORD_CHARS
+ * filter); the old ASCII-only strip emptied CJK basenames.
  */
+const BASENAME_KEEP_RE = new RegExp(`[^${SLUG_WORD_CHARS}\\s\\-]`, 'gu');
 export function normalizeBasename(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
+  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC')
+    .toLowerCase().replace(BASENAME_KEEP_RE, '').trim().replace(/\s+/g, '-');
 }
 
 /** Stable order: shorter slug first (likely closer to brain root), then lexical. */
@@ -989,8 +1014,6 @@ export function makeResolver(
   opts: { mode: 'batch' | 'live'; sourceId?: string } = { mode: 'live' },
 ): SlugResolver {
   const cache = new Map<string, string | null>();
-
-  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
 
   // Issue #972: lazy-built basename → slug[] index for global-basename
   // resolution. Built on first call to `resolveBasenameMatches`; reused
@@ -1063,7 +1086,7 @@ export function makeResolver(
       }
 
       // Step 2: dir-hint + slugify → exact getPage
-      const slugified = norm(trimmed);
+      const slugified = normalizeBasename(trimmed); // #2367: shared normalizer
       for (const hint of hints) {
         if (!hint) continue;
         const candidate = `${hint}/${slugified}`;
@@ -1324,24 +1347,12 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
   // until now this parser (the db-source extract + ingest path) could not
   // see it, so a page whose dates all live in citations scored zero
   // timeline coverage. Kept in sync with extractTimelineFromContent's
-  // Format 3 (the fs-source path). Lines already captured by the timeline
+  // Format 3 (the fs-source path). Blocks already captured by the timeline
   // bullet pass are skipped (a bullet often carries its own citation).
-  const citationRe = /\[Source:\s*([^\]]+?),\s*(\d{4}-\d{2}-\d{2})\s*\]/g;
-  for (const line of lines) {
-    if (TIMELINE_LINE_RE.test(line)) continue;
-    const matches = [...line.matchAll(citationRe)];
-    if (matches.length === 0) continue;
-    const summary = line
-      .replace(/\[Source:[^\]]*\]/g, '')
-      .replace(/^[-*>#\s]+/, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 300);
-    if (!summary) continue;
-    for (const m of matches) {
-      if (!isValidDate(m[2])) continue;
-      result.push({ date: m[2], summary, detail: `Source: ${m[1].trim().slice(0, 200)}` });
-    }
+  for (const entry of parseInlineCitationTimelineEntries(content, {
+    skipLine: (line) => TIMELINE_LINE_RE.test(line) || TIMELINE_LINE_RE_CN.test(line),
+  })) {
+    result.push({ date: entry.date, summary: entry.summary, detail: `Source: ${entry.source}` });
   }
   return result;
 }

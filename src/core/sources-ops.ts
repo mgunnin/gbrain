@@ -38,7 +38,7 @@
 
 import { existsSync, mkdirSync, renameSync, rmSync, lstatSync } from 'fs';
 import { join, dirname, basename, resolve as resolvePath } from 'path';
-import { isPathContained } from './path-confine.ts';
+import { isPathContained, msysToNativePath } from './path-confine.ts';
 import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import {
@@ -155,6 +155,25 @@ export interface AddSourceOpts {
    * runs). Does NOT auto-`git init` anything — see `addSource` docstring.
    */
   force?: boolean;
+  /**
+   * v0.46: register a github-kind source (issues/PR sync). When set, the
+   * row is inserted with kind=github config and a managed local_path, and
+   * no git validation or clone happens. See src/core/github-source.ts.
+   */
+  github?: {
+    tokenEnv: string;
+    handle: string;
+    scope: 'auto' | 'repos';
+    repos: string[];
+    dir: string;
+    involvement: boolean;
+    /** GitHub App id; with appPemPath the sync mints installation tokens itself. */
+    appId?: number;
+    /** Path to the app's private key PEM. */
+    appPemPath?: string;
+    /** Installation id; optional, first installation is used when absent. */
+    appInstallId?: number;
+  };
 }
 
 export interface RemoveSourceOpts {
@@ -352,16 +371,42 @@ export async function addSource(
 ): Promise<SourceRow> {
   validateSourceId(opts.id);
 
+  // gbrain#2955: normalize a Git Bash / MSYS drive path (`/c/Users/x`,
+  // `/cygdrive/c/x`) to native Windows form BEFORE the overlap check and the
+  // INSERT — otherwise the recorded local_path later join-resolves to a
+  // phantom `C:\c\Users\x` and sync/write-through silently miss the real
+  // directory. Identity on POSIX and for already-native paths.
+  if (opts.localPath) {
+    opts = { ...opts, localPath: msysToNativePath(opts.localPath) };
+  }
+
   // Q4: pre-flight collision check before any clone work.
-  const existing = await engine.executeRaw<{ id: string }>(
-    `SELECT id FROM sources WHERE id = $1`,
+  const existing = await engine.executeRaw<{ id: string; local_path: string | null }>(
+    `SELECT id, local_path FROM sources WHERE id = $1`,
     [opts.id],
   );
-  if (existing.length > 0) {
+  // #3903: attach, don't collide. `gbrain sync --source X` on a path-less
+  // source prints "Run: gbrain sources add X --path <path>" — so when the
+  // existing row has NO local_path and the caller supplies exactly a --path
+  // (no --url, no --kind github), treat this as attaching a working tree to
+  // the existing row (non-destructive UPDATE) instead of demanding
+  // `sources remove --confirm-destructive`, which cascades page deletion.
+  const attachPath =
+    existing.length > 0 &&
+    existing[0]!.local_path === null &&
+    !!opts.localPath &&
+    !opts.remoteUrl &&
+    !opts.github;
+  if (existing.length > 0 && !attachPath) {
+    const pathNote = existing[0]!.local_path
+      ? ` with local_path ${existing[0]!.local_path}`
+      : '';
     throw new SourceOpError(
       'source_id_taken',
-      `Source id "${opts.id}" is already registered. ` +
-        `Use 'gbrain sources remove ${opts.id} --confirm-destructive' first, then re-add.`,
+      `Source id "${opts.id}" is already registered${pathNote}. ` +
+        `To replace it, run 'gbrain sources remove ${opts.id} --confirm-destructive' ` +
+        `first, then re-add — WARNING: remove permanently deletes every page ` +
+        `imported for this source.`,
     );
   }
 
@@ -471,6 +516,44 @@ export async function addSource(
         e,
       );
     }
+  } else if (opts.github) {
+    // ── Path C: --kind github (v0.46) ─────────────────────────────────────
+    // API-backed source: no git repo, no clone. The managed dir is created
+    // here so `sources status` and webhook repo matching work immediately;
+    // the materializer populates it on first sync.
+    const finalPath = opts.github.dir;
+    mkdirSync(finalPath, { recursive: true });
+    const config: Record<string, unknown> = {
+      kind: 'github',
+      gh_token_env: opts.github.tokenEnv,
+      gh_handle: opts.github.handle,
+      gh_scope: opts.github.scope,
+      gh_repos: opts.github.repos.join(','),
+      gh_involvement: opts.github.involvement,
+      // Ownership marker: the dir is gbrain-managed only when it is the
+      // default clone location. A custom --dir points at user-owned
+      // storage and must never be deleted by purge.
+      gh_managed: finalPath === defaultCloneDir(`${opts.id}-github`),
+      // v0.46: a github-kind mirror is a first-class citizen of unqualified
+      // reads (search/query/get_page without an explicit source_id). The
+      // federated widening in localFederatedSourceIds spans sources with
+      // config.federated=true — without this default, a fresh mirror is
+      // invisible to search. Explicit --no-federated opts out.
+      federated: opts.federated ?? true,
+    };
+    if (opts.github.appId !== undefined && opts.github.appPemPath !== undefined) {
+      config.gh_app_id = opts.github.appId;
+      config.gh_app_pem_path = opts.github.appPemPath;
+      if (opts.github.appInstallId !== undefined) {
+        config.gh_app_install_id = opts.github.appInstallId;
+      }
+    }
+    const displayName = opts.name ?? opts.id;
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+           VALUES ($1, $2, $3, $4::text::jsonb)`,
+      [opts.id, displayName, finalPath, JSON.stringify(config)],
+    );
   } else {
     // ── Path B: --path or no path (existing behavior, pre-v0.28) ─────────
     // #2707: only validate when the path actually exists — a not-yet-created
@@ -504,16 +587,35 @@ export async function addSource(
           `register anyway and git-init later, pass --force.`,
       );
     }
-    const config: Record<string, unknown> = {};
-    if (opts.federated !== null && opts.federated !== undefined) {
-      config.federated = opts.federated;
+    if (attachPath) {
+      // #3903: non-destructive attach — the row already exists (path-less).
+      // local_path is set, and an explicitly-passed --name / --federated is
+      // applied too (silently dropping them would lie to the caller who
+      // typed them). Unmentioned fields, other config keys, and pages all
+      // survive. No JSON.stringify into ::jsonb — the federated flag merges
+      // via jsonb_build_object on a bound boolean.
+      await engine.executeRaw(
+        `UPDATE sources
+            SET local_path = $2,
+                name = COALESCE($3, name),
+                config = CASE WHEN $4::boolean IS NULL THEN config
+                              ELSE COALESCE(config, '{}'::jsonb)
+                                   || jsonb_build_object('federated', $4::boolean) END
+          WHERE id = $1`,
+        [opts.id, finalPath, opts.name ?? null, opts.federated ?? null],
+      );
+    } else {
+      const config: Record<string, unknown> = {};
+      if (opts.federated !== null && opts.federated !== undefined) {
+        config.federated = opts.federated;
+      }
+      const displayName = opts.name ?? opts.id;
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name, local_path, config)
+             VALUES ($1, $2, $3, $4::text::jsonb)`,
+        [opts.id, displayName, finalPath, JSON.stringify(config)],
+      );
     }
-    const displayName = opts.name ?? opts.id;
-    await engine.executeRaw(
-      `INSERT INTO sources (id, name, local_path, config)
-           VALUES ($1, $2, $3, $4::text::jsonb)`,
-      [opts.id, displayName, finalPath, JSON.stringify(config)],
-    );
   }
 
   const created = await fetchSourceRow(engine, opts.id);
@@ -719,12 +821,16 @@ export async function removeSource(
 
   // Decide whether we own the clone dir before removing the row.
   const remoteUrl = getRemoteUrl(src.config);
+  const ghCfg = (typeof src.config === 'string' ? JSON.parse(src.config) : (src.config ?? {})) as Record<string, unknown>;
+  // v0.46: github-kind mirrors at the default clone location are owned by
+  // gbrain (gh_managed marker) and get the same cleanup as --url clones.
+  const ghManaged = ghCfg.kind === 'github' && ghCfg.gh_managed === true;
   const cloneRoot = gbrainPath('clones');
   let cloneRemoved = false;
   if (
     !opts.keepStorage &&
     src.local_path &&
-    remoteUrl && // only auto-clean when this was a --url-managed clone
+    (remoteUrl || ghManaged) && // only auto-clean when gbrain managed the dir
     isPathContained(src.local_path, cloneRoot)
   ) {
     try {
@@ -784,8 +890,12 @@ export async function getSourceStatus(
   const archived = archivedRows[0]?.archived === true;
 
   const remoteUrl = getRemoteUrl(src.config);
+  const sourceConfig =
+    typeof src.config === 'string'
+      ? (JSON.parse(src.config) as Record<string, unknown>)
+      : ((src.config ?? {}) as Record<string, unknown>);
   let cloneState: SourceStatus['clone_state'] = 'not-applicable';
-  if (src.local_path) {
+  if (src.local_path && sourceConfig.kind !== 'github') {
     cloneState = validateRepoState(src.local_path, remoteUrl ?? undefined);
   }
 

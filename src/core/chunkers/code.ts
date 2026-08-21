@@ -285,10 +285,61 @@ function getLanguageEntry(language: string): LanguageEntry | undefined {
   return dynamicLanguages.get(language) ?? LANGUAGE_MANIFEST[language as SupportedCodeLanguage];
 }
 
+// A grammar that fails to load, or whose ABI the pinned web-tree-sitter
+// runtime rejects, used to fall back to text chunks in complete silence — the
+// index reported "0 errors" while `symbol_name` was NULL for every chunk in
+// that language, which is indistinguishable from a language with no semantic
+// nodes. Warn once per language so the failure is visible without turning a
+// per-file fallback into per-file noise. Reset in tests via
+// `resetChunkerWarnings()`.
+const warnedLanguages = new Set<string>();
+
+export function resetChunkerWarnings(): void {
+  warnedLanguages.clear();
+}
+
+function warnParseFailure(language: SupportedCodeLanguage, filePath: string, err: unknown): void {
+  if (warnedLanguages.has(language)) return;
+  warnedLanguages.add(language);
+  const msg = err instanceof Error ? err.message : String(err);
+  console.warn(
+    `[gbrain chunker] ${language}: semantic parsing unavailable (${msg}); ` +
+    `falling back to text chunks for every .${language} file — code-def/code-callers ` +
+    `will return 0 for this language. First seen: ${filePath}`,
+  );
+}
+
+// Dart splits a top-level function into TWO sibling nodes — the
+// `*_signature` and the `function_body` that follows it — where every other
+// grammar gbrain ships nests the body inside the declaration. Chunks are built
+// solely from `semanticNodes`, and source not covered by one is never emitted,
+// so without this the chunk for `int f(int a) => a + 1;` would hold exactly
+// `int f(int a)` and the body would vanish from the index. Returns the node
+// whose END bounds the chunk; the start always stays on the signature.
+const DART_SIGNATURE_TYPES = new Set([
+  'function_signature', 'getter_signature', 'setter_signature',
+]);
+
+function chunkEndNode(node: any, language: SupportedCodeLanguage): any {
+  if (language !== 'dart' || !DART_SIGNATURE_TYPES.has(node.type)) return node;
+  const next = node.nextNamedSibling;
+  // `external int f(int a);` has no body — the signature bounds itself.
+  return next && next.type === 'function_body' ? next : node;
+}
+
 // Per-language top-level AST node types that count as semantic units.
 // Languages not in this map fall through to the recursive text chunker
 // when the grammar loads but no semantic nodes match — correct behavior.
 const TOP_LEVEL_TYPES: Partial<Record<SupportedCodeLanguage, Set<string>>> = {
+  // Dart. `class_definition`/`enum_declaration`/`type_alias`/`function_signature`
+  // normalize to existing DEF_TYPES via normalizeSymbolType; `mixin_declaration`
+  // and `extension_declaration` normalize to "mixin declaration" / "extension
+  // declaration", which code-def's DEF_TYPES lists explicitly.
+  dart: new Set([
+    'class_definition', 'enum_declaration', 'mixin_declaration',
+    'extension_declaration', 'type_alias',
+    'function_signature', 'getter_signature', 'setter_signature',
+  ]),
   typescript: new Set([
     'function_declaration', 'class_declaration', 'abstract_class_declaration',
     'interface_declaration', 'type_alias_declaration', 'enum_declaration',
@@ -324,7 +375,7 @@ const TOP_LEVEL_TYPES: Partial<Record<SupportedCodeLanguage, Set<string>>> = {
   c_sharp: new Set([
     'method_declaration', 'class_declaration', 'interface_declaration',
     'struct_declaration', 'enum_declaration', 'namespace_declaration',
-    'using_directive', 'property_declaration',
+    'file_scoped_namespace_declaration', 'using_directive', 'property_declaration',
   ]),
   cpp: new Set([
     'function_definition', 'class_specifier', 'struct_specifier',
@@ -633,7 +684,8 @@ export async function chunkCodeTextFull(
     const nestedConfig = NESTED_EMIT_CONFIG[language];
 
     for (const node of semanticNodes) {
-      const nodeText = source.slice(node.startIndex, node.endIndex).trim();
+      const endNode = chunkEndNode(node, language);
+      const nodeText = source.slice(node.startIndex, endNode.endIndex).trim();
       if (!nodeText) continue;
 
       // v0.20.0 Cathedral II Layer 6 (A3): for class/module/impl nodes,
@@ -672,7 +724,7 @@ export async function chunkCodeTextFull(
         chunks.push(buildChunk({
           body: nodeText, filePath, language, symbolName, symbolType,
           startLine: node.startPosition.row + 1,
-          endLine: node.endPosition.row + 1,
+          endLine: endNode.endPosition.row + 1,
           index: chunks.length,
           parentSymbolPath: [],
         }));
@@ -685,7 +737,7 @@ export async function chunkCodeTextFull(
         chunks.push(buildChunk({
           body: nodeText, filePath, language, symbolName, symbolType,
           startLine: node.startPosition.row + 1,
-          endLine: node.endPosition.row + 1,
+          endLine: endNode.endPosition.row + 1,
           index: chunks.length,
           parentSymbolPath: [],
         }));
@@ -727,7 +779,8 @@ export async function chunkCodeTextFull(
       return { chunks: fallbackChunks(source, filePath, language, opts), edges: rawEdges };
     }
     return { chunks: capOversizedChunks(mergeSmallSiblings(chunks, chunkTarget), filePath, language, opts), edges: rawEdges };
-  } catch {
+  } catch (err: unknown) {
+    warnParseFailure(language, filePath, err);
     return { chunks: fallbackChunks(source, filePath, language, opts), edges: [] };
   } finally {
     // v0.31.2 (codex C4): single cleanup site so a thrown
@@ -809,12 +862,24 @@ function mergeSmallSiblings(chunks: CodeChunk[], chunkTarget: number): CodeChunk
   return merged;
 }
 
+/**
+ * The structured header `buildChunk` prepends: "[Lang] path:N-M symbol\n\n".
+ * It carries line numbers, so it is volatile across edits above a symbol —
+ * `src/core/embed-reuse.ts` keys the embedding-reuse cache on the stripped body.
+ */
+export const CHUNK_HEADER_RE = /^\[[^\]]+\] [^\n]+\n\n/;
+
+/** Chunk text minus its header, or unchanged when there is no header. */
+export function stripChunkHeader(text: string): string {
+  return text.replace(CHUNK_HEADER_RE, '');
+}
+
 function buildMergedChunk(group: CodeChunk[], index: number): CodeChunk {
   const first = group[0]!;
   const last = group[group.length - 1]!;
   // Strip each chunk's structured header line when merging so the combined
   // body reads like the original source. Header is always "[Lang] path:N-M symbol".
-  const bodies = group.map((c) => c.text.replace(/^\[[^\]]+\] [^\n]+\n\n/, ''));
+  const bodies = group.map((c) => stripChunkHeader(c.text));
   const mergedBody = bodies.join('\n\n');
   const header = `[${displayLang(first.metadata.language)}] ${first.metadata.filePath}:${first.metadata.startLine}-${last.metadata.endLine} merged (${group.length} siblings)`;
   return {
@@ -867,7 +932,7 @@ function capOversizedChunks(
     // header's standalone cl100k figure under-counts ~2.5x once the body
     // contains CJK and the weighted branch takes over (see
     // estimateEmbedTokensCeiling).
-    const headerMatch = c.text.match(/^\[[^\]]+\] [^\n]+\n\n/);
+    const headerMatch = c.text.match(CHUNK_HEADER_RE);
     const body = headerMatch ? c.text.slice(headerMatch[0].length) : c.text;
     const bodyCap = Math.max(1, cap - (headerMatch ? estimateEmbedTokensCeiling(headerMatch[0]) : 0));
     for (const piece of splitToTokenBudget(body, bodyCap, opts)) {
