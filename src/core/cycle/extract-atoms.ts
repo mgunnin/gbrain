@@ -49,7 +49,7 @@
 // sourceId arg — atoms always wrote to 'default' regardless of source,
 // which made the NOT EXISTS guard ineffective on federated brains.
 
-import type { BrainEngine } from '../engine.ts';
+import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { ProgressReporter } from '../progress.ts';
@@ -652,6 +652,11 @@ export async function runPhaseExtractAtoms(
   // chat call resets the streak.
   const llmHalt = createGlobalLlmHaltTracker();
   let abortedGlobalError: GlobalLlmErrorClass | null = null;
+  // Rollup/doctor-health signal only. `failures` (below) stays inclusive of
+  // transient entries for CLI/receipt reporting; this counts everything
+  // EXCEPT the ones TRANSIENT_EXTRACT_ERROR_RE + the rate_limit abort class
+  // say are "retryable, never counted" — see that regex's doc comment.
+  let hardFailureCount = 0;
 
   /** Stamp the zero-yield/complete tombstone (hash-keyed; edits re-eligibilize). */
   async function stampAtomsScanHash(item: { slug: string; contentHash: string }): Promise<void> {
@@ -727,6 +732,7 @@ export async function runPhaseExtractAtoms(
       const parseOutcome = parseAtomsOutcome(result.text);
       if (!parseOutcome.ok) {
         malformedOutputs++;
+        hardFailureCount++;
         const failCount = await recordPageFailureCount(item);
         failures.push({
           source: originLabel,
@@ -776,6 +782,12 @@ export async function runPhaseExtractAtoms(
         // deterministic slugs upsert instead of duplicating.
         const hash16 = item.contentHash.slice(0, 16);
         const importedSlugs: string[] = [];
+        // #3961: provenance edges source-page → atom, accumulated during the
+        // atom loop and flushed AFTER the completion-receipt flip so a
+        // partially-failed item never banks edges for atoms whose receipt
+        // never flipped. Page-kind items only — transcripts are files, not
+        // pages, so there is no from-endpoint to link.
+        const provenanceLinks: LinkBatchInput[] = [];
         for (const atom of atoms) {
           const srcRef = item.kind === 'transcript' ? item.filePath : item.slug;
           const slug = atomSlug(atom.title, srcRef);
@@ -817,6 +829,15 @@ export async function runPhaseExtractAtoms(
             noEmbed: !isAvailable('embedding'),
           });
           importedSlugs.push(slug);
+          if (item.kind === 'page') {
+            provenanceLinks.push({
+              from_slug: item.slug,
+              to_slug: slug,
+              link_source: 'atom-provenance',
+              from_source_id: sourceId,
+              to_source_id: sourceId,
+            });
+          }
           totalAtomsExtracted++;
         }
         // Completion receipt: flip provisional → real in one statement, then
@@ -828,6 +849,21 @@ export async function runPhaseExtractAtoms(
             WHERE source_id = $2 AND type = 'atom' AND slug = ANY($3::text[]) AND deleted_at IS NULL`,
           [hash16, sourceId, importedSlugs],
         );
+        // #3961: bank the provenance edges so `gbrain backlinks <source-page>`
+        // and the graph surface atom lineage. ON CONFLICT-deduped by the
+        // batch write, so the deterministic-slug re-run path upserts instead
+        // of duplicating. Best-effort: a link failure must not fail the item
+        // (the receipt already flipped — atoms are safe) but it logs loudly.
+        if (provenanceLinks.length > 0) {
+          try {
+            await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.extract_atoms.provenance' }); // gbrain-allow-direct-insert: atom-provenance edges derived from the extraction itself (no markdown body to reconcile from)
+          } catch (linkErr) {
+            console.error(
+              `[extract_atoms] atom-provenance link batch failed for ${item.kind === 'page' ? item.slug : 'item'}: ` +
+              `${(linkErr as Error).message}`,
+            );
+          }
+        }
         if (item.kind === 'page') {
           await stampAtomsScanHash(item);
         }
@@ -859,6 +895,7 @@ export async function runPhaseExtractAtoms(
       const decision = llmHalt.observe(err);
       if (decision !== 'continue') {
         abortedGlobalError = haltedClassOf(decision);
+        if (abortedGlobalError !== 'rate_limit') hardFailureCount++;
         failures.push({
           source: originLabel,
           error: `aborting phase: ${llmHalt.note()} (${message})`,
@@ -867,7 +904,10 @@ export async function runPhaseExtractAtoms(
       }
       const transient =
         llmHalt.lastClass() === 'rate_limit' || TRANSIENT_EXTRACT_ERROR_RE.test(message);
-      if (!transient) await recordPageFailureCount(item);
+      if (!transient) {
+        await recordPageFailureCount(item);
+        hardFailureCount++;
+      }
       failures.push({
         source: originLabel,
         error: transient ? `${message} [transient — retried next run]` : message,
@@ -900,12 +940,18 @@ export async function runPhaseExtractAtoms(
     }
   }
   if (!opts.dryRun) {
+    // gbrain#4148 / TRANSIENT_EXTRACT_ERROR_RE: transient provider/infra
+    // failures (rate limits, timeouts, 5xx, network) are "retryable, never
+    // counted" by design — count only hardFailureCount here, not
+    // failures.length (which stays inclusive, for CLI/receipt reporting),
+    // so a heavy run that only ever hit transient errors doesn't trip the
+    // doctor extract_health halt-rate warning.
     await upsertExtractRollup(engine, {
       kind: 'atoms',
       source_id: sourceId,
       cost_delta: estimatedSpendUsd,
-      round_completed_delta: failures.length === 0 ? 1 : 0,
-      halt_delta: failures.length > 0 ? 1 : 0,
+      round_completed_delta: hardFailureCount === 0 ? 1 : 0,
+      halt_delta: hardFailureCount > 0 ? 1 : 0,
     });
   }
 
