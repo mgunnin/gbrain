@@ -90,6 +90,31 @@ describe('parseAtomsOutcome — typed parse (gbrain#4148)', () => {
 });
 
 describe('runPhaseExtractAtoms — failure classes (gbrain#4148)', () => {
+  test('prompt truncation never splits a UTF-16 surrogate pair', async () => {
+    await seedPage('note/surrogate-boundary');
+    const content = `${'a'.repeat(49_999)}💡trailing prose`;
+    let capturedPrompt = '';
+
+    await runPhaseExtractAtoms(engine, {
+      sourceId: 'default',
+      _transcripts: [],
+      _pages: [{ slug: 'note/surrogate-boundary', content, contentHash: HASH_A }],
+      _chat: async (opts: ChatOpts) => {
+        capturedPrompt = String(opts.messages[0]?.content);
+        return okChatResult('[]');
+      },
+    });
+
+    expect(content.slice(0, 50_000).isWellFormed()).toBe(false); // positive control
+    expect(capturedPrompt.isWellFormed()).toBe(true);
+    // Truncation must actually occur (not a no-op that trivially passes well-formedness):
+    // the straddling pair moves the safe cut back to 49,999 'a's, dropping both the emoji
+    // and the trailing prose from the sent prompt entirely.
+    expect(capturedPrompt).not.toContain('trailing prose');
+    expect(capturedPrompt).toContain('a'.repeat(49_999));
+    expect(capturedPrompt.length).toBe(`Source: note/surrogate-boundary\n\n---\n\n${'a'.repeat(49_999)}`.length);
+  });
+
   test('malformed output is a counted failure, NOT a zero-yield tombstone', async () => {
     await seedPage('note/m1');
     const result = await runPhaseExtractAtoms(engine, {

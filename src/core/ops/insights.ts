@@ -17,6 +17,7 @@ import {
   FIND_CONTRADICTIONS_DESCRIPTION,
   FIND_TRAJECTORY_DESCRIPTION,
 } from '../operations-descriptions.ts';
+import { dropPrivateOnlyRows } from '../search/private-visibility.ts';
 
 // --- v0.43 (#2095): push-based context — the brain volunteers pages ---
 
@@ -152,13 +153,18 @@ const find_experts: Operation = {
     const { loadActivePackBestEffort, expertTypesFromPack } = await import('../schema-pack/index.ts');
     const pack = await loadActivePackBestEffort(ctx);
     const types = pack ? expertTypesFromPack(pack.manifest) : [];
-    return findExperts(ctx.engine, {
+    const scope = sourceScopeOpts(ctx);
+    const experts = await findExperts(ctx.engine, {
       topic,
       limit: typeof p.limit === 'number' ? p.limit : undefined,
       explain: p.explain === true,
       types: types as never,
-      ...sourceScopeOpts(ctx),
+      ...scope,
     });
+    // A `visibility: private` page's slug/title/scores must not reach remote
+    // readers through the expertise rankings (same read-leak class as the
+    // delta page arm / find_orphans / get_recent_salience).
+    return dropPrivateOnlyRows(ctx.engine, ctx.remote, experts, e => e.slug, scope);
   },
   // hidden: 'whoknows' is in CLI_ONLY (src/cli.ts) — runWhoknows owns the CLI
   // surface (ranked table + per-factor explain + thin-client routing) and was

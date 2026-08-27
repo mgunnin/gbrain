@@ -37,7 +37,6 @@ import {
   dcrRegistrationContext,
   DEFAULT_DCR_TTL_MIN_SECONDS,
 } from '../core/oauth-provider.ts';
-import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 import { normalizeSourceInput, normalizeFederatedReadInput } from '../core/source-id.ts';
@@ -54,6 +53,8 @@ import {
 } from '../mcp/surface.ts';
 import { writeSurfaceChangeAudit } from '../core/surface-audit.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
+import { bindResolveIpcForServe } from '../mcp/resolve-ipc-binding.ts';
+import { resolveMcpStdioSourceScope } from '../mcp/server.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildError, serializeError } from '../core/errors.ts';
 import { VERSION } from '../version.ts';
@@ -426,26 +427,25 @@ export async function probeHealth(
 }
 
 /**
- * Lightweight liveness probe. Races `SELECT 1` against the same timeout
- * `probeHealth` uses, returns the same tagged-union result type, but the
- * 200 body is intentionally bare: `{status, version, engine}` — no engine
- * stats. Stats moved to `/admin/api/full-stats` (admin auth) in v0.28.10
- * because `getStats()`'s six count(*) queries exceeded HEALTH_TIMEOUT_MS
- * on production brains through PgBouncer, producing false 503s that
- * triggered orchestrator restart cascades and advisory-lock pile-ups.
+ * Races an abortable `SELECT 1` against `probeHealth`'s timeout; Postgres
+ * cancels the losing query while PGLite only discards its eventual result.
  */
 export async function probeLiveness(
-  sql: SqlQuery,
+  engine: BrainEngine,
   engineName: string,
   version: string,
   timeoutMs: number = HEALTH_TIMEOUT_MS,
 ): Promise<ProbeHealthResult> {
   let timer: ReturnType<typeof setTimeout> | null = null;
+  const controller = new AbortController();
   try {
     await Promise.race([
-      sql`SELECT 1`,
+      engine.executeRaw('SELECT 1', undefined, { signal: controller.signal }),
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('health_timeout')), timeoutMs);
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error('health_timeout'));
+        }, timeoutMs);
       }),
     ]);
     return {
@@ -454,7 +454,7 @@ export async function probeLiveness(
       body: { status: 'ok', version, engine: engineName },
     };
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : 'unknown';
+    const msg = controller.signal.aborted ? 'health_timeout' : (e instanceof Error ? e.message : 'unknown');
     return {
       ok: false,
       status: 503,
@@ -1328,7 +1328,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // /admin/api/full-stats (requireAdmin). See probeLiveness above for the why.
   // ---------------------------------------------------------------------------
   app.get('/health', async (_req, res) => {
-    const result = await probeLiveness(sql, config.engine || 'pglite', VERSION);
+    const result = await probeLiveness(engine, config.engine || 'pglite', VERSION);
     res.status(result.status).json(result.body);
   });
 
@@ -3272,6 +3272,22 @@ ${bootstrapFromEnv
 `);
   });
 
+  // #4474: bind the resolve-IPC unix socket under --http too. This is the
+  // exact posture `gbrain bootstrap harness` targets — without the listener
+  // every wired lifecycle hook (SessionStart / UserPromptSubmit / PreCompact)
+  // degrades to `no_serve` forever, and on a PGLite brain there is no local
+  // recovery (the http serve owns the single-writer lock, so a second stdio
+  // serve can't provide the socket). Shares the stdio path's wiring via
+  // bindResolveIpcForServe; best-effort — failure to bind never blocks the
+  // HTTP server.
+  const ipcBinding = await bindResolveIpcForServe(
+    engine,
+    (await resolveMcpStdioSourceScope(engine)).sourceId,
+  );
+  if (ipcBinding.socketPath) {
+    console.error(`  Resolve IPC: ${ipcBinding.socketPath}`);
+  }
+
   // SIGTERM/SIGHUP route through process-cleanup's pass and then
   // `process.exit`, which skips cli.ts's finally-teardown — so on those
   // signals the PGLite write handle was never closed. An unclosed PGLite
@@ -3283,12 +3299,19 @@ ${bootstrapFromEnv
   // the same clean close the SIGINT path already gets via the cli
   // teardown. Deregistered on normal return so the cli finally remains
   // the single owner of orderly shutdown.
+  const deregisterIpcCleanup = registerCleanup('resolve-ipc-close', async () => {
+    ipcBinding.close();
+  });
   const deregisterEngineCleanup = registerCleanup('pglite-engine-disconnect', () =>
     engine.disconnect(),
   );
   try {
     await waitForHttpServerLifecycle(httpServer);
   } finally {
+    // Close the IPC listener + reap the socket file on orderly shutdown
+    // (abnormal termination goes through the registered cleanup above).
+    ipcBinding.close();
+    deregisterIpcCleanup();
     deregisterEngineCleanup();
   }
 }

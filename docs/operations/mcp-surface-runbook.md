@@ -138,8 +138,12 @@ remote/untrusted read path by default (fail-closed; trusted local CLI —
 `ctx.remote === false` — always sees everything). The gate covers search +
 recall's query arm, entity cards / context_pack / delta, and the page read
 ops: `get_page` / `fetch` / `list_pages`, `get_chunks` / `get_versions` /
-`get_timeline` / `get_raw_data`, `resolve_slugs`, and
-`get_links` / `get_backlinks` / `traverse_graph`. A gated page reads exactly
+`get_timeline` / `get_raw_data`, `resolve_slugs`,
+`get_links` / `get_backlinks` / `traverse_graph`, and the list-style
+analytics ops `find_orphans` / `get_recent_salience` / `find_anomalies` /
+`find_experts` (published counts and derived statistics are adjusted with
+the filtered rows, so remote responses stay self-consistent and reveal
+nothing about what was filtered). A gated page reads exactly
 like a missing one (no existence oracle), and link/graph output never
 enumerates private slugs.
 

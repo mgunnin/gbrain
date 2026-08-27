@@ -20,7 +20,7 @@
  * AND lose to new-key config when both are set.
  */
 
-import type { BrainEngine } from './engine.ts';
+import type { ConfigReader } from './config-snapshot.ts';
 import { splitProviderModelId } from './model-id.ts';
 import type { GBrainConfig } from './config.ts';
 import { loadConfig } from './config.ts';
@@ -305,6 +305,19 @@ export function isAnthropicProvider(modelString: string): boolean {
   return model.toLowerCase().startsWith('claude-');
 }
 
+/**
+ * OpenRouter Anthropic routes (`openrouter:anthropic/…`). These are NOT
+ * native Anthropic (`isAnthropicProvider` stays false — the Messages SDK
+ * cannot speak OR). The legacy `!useGatewayLoop && !isAnthropicProvider`
+ * pin treats them as an exception and auto-routes through gateway.toolLoop().
+ */
+export function isOpenRouterAnthropic(modelString: string): boolean {
+  if (!modelString) return false;
+  const { provider, model } = splitProviderModelId(modelString);
+  return provider?.trim().toLowerCase() === 'openrouter'
+    && model.toLowerCase().startsWith('anthropic/');
+}
+
 const _subagentTierWarningsEmitted = new Set<string>();
 
 // Module-level set of deprecated config keys we've already warned about.
@@ -347,7 +360,7 @@ export type ResolveSource =
  * unservable Anthropic default.
  */
 export async function resolveModelDetailed(
-  engine: BrainEngine | null,
+  engine: ConfigReader | null,
   opts: ResolveModelOpts,
 ): Promise<{ model: string; source: ResolveSource }> {
   const envVar = opts.envVar ?? 'GBRAIN_MODEL';
@@ -426,7 +439,7 @@ export async function resolveModelDetailed(
  * `resolveModelDetailed` for the ~30 callers that don't care which step won.
  */
 export async function resolveModel(
-  engine: BrainEngine | null,
+  engine: ConfigReader | null,
   opts: ResolveModelOpts,
 ): Promise<string> {
   return (await resolveModelDetailed(engine, opts)).model;
@@ -541,7 +554,7 @@ void enforceSubagentAnthropic;
  * to `super-opus` which aliases to `opus`, we return `super-opus` and stop.
  */
 export async function resolveAlias(
-  engine: BrainEngine | null,
+  engine: ConfigReader | null,
   name: string,
   depth = 0,
 ): Promise<string> {

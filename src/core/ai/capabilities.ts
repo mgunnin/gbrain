@@ -14,7 +14,7 @@
  * gateway's `toolLoop()` consumes to decide:
  *   - REFUSE at submit when tool-calling is unsupported (D6 — useless loop)
  *   - REFUSE at submit/dispatch when the recipe declares
- *     `supports_subagent_loop: false` (unstable tool_use_id through a proxy)
+ *     `supports_subagent_loop: false` (or a per-id predicate returns false)
  *   - WARN at submit when prompt caching is unavailable (D6 — cost regression)
  *   - INFO at submit when parallel tools unsupported (D6 — just slower)
  *
@@ -23,7 +23,7 @@
  * decisions don't depend on it.
  */
 
-import { resolveRecipe } from './model-resolver.ts';
+import { resolveChatContextTokens, resolveRecipe } from './model-resolver.ts';
 import { listRecipes } from './recipes/index.ts';
 import { AIConfigError } from './errors.ts';
 
@@ -112,9 +112,12 @@ export function getProviderCapabilities(modelString: string): ProviderCapabiliti
 
   const promptCache = chat.supports_prompt_cache;
 
+  const subagentLoop = chat.supports_subagent_loop;
   return {
     supportsToolCalling: chat.supports_tools === true,
-    supportsSubagentLoop: chat.supports_subagent_loop === true,
+    supportsSubagentLoop: typeof subagentLoop === 'function'
+      ? subagentLoop(parsed.modelId)
+      : subagentLoop === true,
     supportsPromptCaching: typeof promptCache === 'function'
       ? promptCache(parsed.modelId)
       : promptCache === true,
@@ -128,7 +131,7 @@ export function getProviderCapabilities(modelString: string): ProviderCapabiliti
     supportsThinking: typeof chat.thinking_by_default === 'function'
       ? chat.thinking_by_default(parsed.modelId)
       : chat.thinking_by_default === true,
-    maxContext: chat.max_context_tokens ?? 128_000,
+    maxContext: resolveChatContextTokens(modelString) ?? 128_000,
   };
 }
 

@@ -431,6 +431,7 @@ test-shaped segment past it.
 
 Unit tests and what they cover:
 
+- `test/facts-engine.test.ts` / `test/consolidate-valid-until.test.ts` — facts-list filtering and consolidate correctness (#4057): `unconsolidatedOnly` is applied before the 100-row limit, so newer consolidated facts cannot permanently hide older pending facts; the phase regression seeds 100 consolidated rows plus three older pending rows and requires all three to progress.
 - `test/markdown.test.ts` — frontmatter parsing; `splitBody` sentinel precedence, horizontal-rule preservation, `inferType` wiki subtypes.
 - `test/chunkers/recursive.test.ts` — chunking.
 - `test/parity.test.ts` — operations contract parity.
@@ -529,6 +530,7 @@ Unit tests and what they cover:
 - `test/oauth.test.ts` — OAuth 2.1 provider: register, getClient, `client_credentials` grant exchange, `authorization_code` flow with PKCE challenge/verifier, refresh token rotation, `verifyAccessToken` with both OAuth + legacy `access_tokens` fallback, `revokeToken`, `sweepExpiredTokens`; contract test asserting `scope` + `localOnly` annotations on all operations; `coerceTimestamp` unit cases (null/undefined/string/number/throw-on-NaN); NULL-`expires_at`-as-expired contract for both refresh + access token paths; cascade-delete contract asserting `revoke-client` purges `oauth_tokens` + `oauth_codes` via FK CASCADE; cross-client isolation (wrong-client attempt MUST reject AND rightful owner MUST still succeed atomically afterward); empty-string `redirect_uri` bypass guard; PKCE DCR public-client gate (`token_endpoint_auth_method: "none"` returns no `client_secret`, default `client_secret_post` clients get the one-time-reveal secret, `getClient` NULL→undefined normalization, full PKCE `/authorize` → `/token` round-trip against a public client).
 - `test/mcp-dispatch-summarize.test.ts` — `summarizeMcpParams` invariants: declared-keys allow-list intersection, attacker-key-name leak guard (unknown keys counted not named), 1KB byte bucketing for size-probe defense, missing op falls through to fully-redacted shape, declared-keys sorted for deterministic output.
 - `test/trust-boundary-contract.test.ts` — fail-closed trust semantics under cast bypass: `ctx.remote === undefined` treated as remote/untrusted at every flipped call site; `as any` and `Partial<>` spreads can't downgrade trust by accident.
+- `test/remote-privacy-sweep.test.ts` — registry-driven remote privacy sweep: every non-localOnly op dispatched remote-shaped through `dispatchToolCall` against a corpus seeded with high-entropy private sentinels, in both scalar and federated caller shapes; the full response envelope (structured fields, rendered text, errors, `_meta.brain_hot_memory`) asserted sentinel-free. Fail-closed maintenance contract: a new op fails the suite until classified in `EXPECTED_OUTCOME` (+ `PARAM_FACTORY` if it can return corpus data); localOnly ops asserted denied over non-stdio transports; publish-gated ops must deny naming their gate. Curated static sibling: `test/operations-trust-boundary.test.ts`.
 - `test/check-resolvable-cli.test.ts` — CLI wrapper: exit codes, JSON envelope shape, AGENTS.md fallback chain.
 - `test/regression-v0_16_4.test.ts` — `findRepoRoot` regression guard, hermetic startDir parameterization.
 - `test/repo-root.test.ts` — `findRepoRoot` walk semantics + default-arg parity; the 4-tier `autoDetectSkillsDir` fallback chain (`$OPENCLAW_WORKSPACE` → `~/.openclaw/workspace` → repo-root → `./skills`); RESOLVER.md/AGENTS.md filename precedence; explicit-env-wins-over-repo-root; tier-0 `$GBRAIN_SKILLS_DIR` valid/invalid/precedence-over-`OPENCLAW_WORKSPACE`; the install-path walk in `autoDetectSkillsDirReadOnly`; no-drift on primary success; `AUTO_DETECT_HINT` + `AUTO_DETECT_HINT_READ_ONLY` content; regression guard asserting the shared `autoDetectSkillsDir` MUST NEVER return `'install_path'` source (how the read-path/write-path split stays safe).
@@ -559,6 +561,8 @@ Unit tests and what they cover:
 ### E2E test inventory
 
 E2E tests live in `test/e2e/` and run against real Postgres+pgvector (require `DATABASE_URL`), except where noted as PGLite in-memory (no `DATABASE_URL` needed). One file outside the directory also rides the e2e lane: `test/phantom-redirect-engine-parity.test.ts` (Postgres arm; see the file taxonomy above).
+
+- `test/e2e/facts-separation-postgres.test.ts` — real-Postgres parity for cross-session facts, supersession, and the pre-limit `unconsolidatedOnly` predicate used by consolidation.
 
 - `bun run test:e2e` runs Tier 1 (mechanical, all operations, no API keys). Includes dedicated cases for the postgres-engine `addLinksBatch` / `addTimelineEntriesBatch` bind path — postgres-js's JSONB bind (`jsonb_to_recordset(($1::jsonb)->'rows')`) differs from PGLite's and gets its own coverage.
 - `test/e2e/search-quality.test.ts` — search quality against PGLite (no API keys, in-memory).

@@ -3,6 +3,7 @@ import { isAbsolute, join } from 'path';
 import { homedir } from 'os';
 import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
 import { applyDbPlaneReadSideMerge, type DbPlaneEngineReader } from './config-db-merge.ts';
+import { loadConfigSnapshot } from './config-snapshot.ts';
 
 /**
  * Where is the active DB URL coming from? Pure introspection, no connection
@@ -763,8 +764,10 @@ export { DB_MERGED_PROVIDER_KEY_FIELDS } from './config-db-merge.ts';
  * also documents why embedding_model/dims must NEVER join any list, #4287).
  */
 export async function loadConfigWithEngine(
-  // DbPlaneEngineReader: { getConfig; listConfigKeys?; executeRaw? } — the
-  // optional executeRaw lets the #2119 merge batch its reads in one query.
+  // DbPlaneEngineReader: { getConfig; listConfigKeys?; getAllConfig?;
+  // executeRaw? } — the optional getAllConfig serves every read below from
+  // one snapshot; the optional executeRaw lets the #2119 merge batch its
+  // reads in one query when no snapshot is available.
   engine: DbPlaneEngineReader,
   base?: GBrainConfig | null,
 ): Promise<GBrainConfig | null> {
@@ -781,12 +784,22 @@ export async function loadConfigWithEngine(
     (base !== undefined ? base : loadConfig()) ??
     ({ engine: 'postgres' } as GBrainConfig);
 
-  // DB-plane reads. Quiet failures — if the config table doesn't exist yet
-  // (pre-v36 brain mid-migration), treat as null and let file/env defaults
-  // win. The migration runner reads file/env directly anyway.
+  // This function reads two dozen config keys. One key per round trip is free
+  // on PGLite and is most of the wall clock on a hosted Postgres, so read the
+  // whole table once and answer every key from that. See config-snapshot.ts.
+  //
+  // Quiet failure below is deliberate and unchanged: when the snapshot is
+  // unavailable (a pre-v36 brain mid-migration, or an engine from outside this
+  // repo) every read falls back to a per-key getConfig(), same as before.
+  const snapshot = await loadConfigSnapshot(engine);
+
+  function dbRaw(key: string): Promise<string | null | undefined> {
+    if (snapshot) return Promise.resolve(snapshot[key]);
+    return Promise.resolve(engine.getConfig(key));
+  }
   async function dbBool(key: string): Promise<boolean | undefined> {
     try {
-      const v = await engine.getConfig(key);
+      const v = await dbRaw(key);
       if (v === undefined || v === null || v === '') return undefined;
       return v === 'true';
     } catch {
@@ -795,7 +808,7 @@ export async function loadConfigWithEngine(
   }
   async function dbStr(key: string): Promise<string | undefined> {
     try {
-      const v = await engine.getConfig(key);
+      const v = await dbRaw(key);
       if (v === undefined || v === null || v === '') return undefined;
       return v;
     } catch {
@@ -803,11 +816,16 @@ export async function loadConfigWithEngine(
     }
   }
   async function dbPrefixMap(prefix: string): Promise<Record<string, string> | undefined> {
-    if (typeof engine.listConfigKeys !== 'function') return undefined;
     let keys: string[];
-    try {
-      keys = await engine.listConfigKeys(prefix);
-    } catch {
+    if (snapshot) {
+      keys = Object.keys(snapshot);
+    } else if (typeof engine.listConfigKeys === 'function') {
+      try {
+        keys = await engine.listConfigKeys(prefix);
+      } catch {
+        return undefined;
+      }
+    } else {
       return undefined;
     }
 
@@ -1018,7 +1036,7 @@ export async function loadConfigWithEngine(
   // behavior change for existing brains and belongs in its own PR.
   async function dbBoolStrict(key: string): Promise<boolean | undefined> {
     try {
-      const v = await engine.getConfig(key);
+      const v = await dbRaw(key);
       if (v === 'true') return true;
       if (v === 'false') return false;
       return undefined;
@@ -1047,8 +1065,20 @@ export async function loadConfigWithEngine(
 
   // #2119-class read-side merge (also #2137/#4297): provider credentials,
   // chat/expansion pins, chat_fallback_chain, flat cycle.* (env > file > DB).
-  // One batched, ~30s-memoized read per engine handle (D2 remediation).
-  await applyDbPlaneReadSideMerge(merged, engine);
+  // Served from the SAME snapshot as the reads above when available (zero
+  // extra round trips, and the merge can't disagree with the dbStr/dbBool
+  // reads); otherwise one batched, ~30s-memoized read per engine handle
+  // (D2 remediation).
+  await applyDbPlaneReadSideMerge(
+    merged,
+    snapshot
+      ? {
+          getConfig: async (key) => snapshot[key] ?? null,
+          listConfigKeys: async (prefix) =>
+            Object.keys(snapshot).filter((k) => k.startsWith(prefix)),
+        }
+      : engine,
+  );
 
   return merged;
 }
@@ -1141,6 +1171,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.image_query.max_bytes',
   'search.reranker.enabled',
   'search.track_retrieval',
+  // #4415: per-brain query-intent pattern extensions (JSON bank→regex[]),
+  // merged over the shipped banks in src/core/search/query-intent.ts.
+  'search.intent_patterns',
   // Models tier system (v0.31.12)
   'models.default',
   'models.tier.utility',
@@ -1151,6 +1184,14 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.dream.synthesize',
   'models.dream.extract_atoms',
   'cycle.extract_atoms.budget_usd',
+  'cycle.extract_atoms.max_source_chars',
+  'cycle.extract_atoms.page_discovery_budget',
+  // #4540: per-item extractor caps (defaults 50000 chars / 4096 tokens) plus
+  // an optional between-item pacing sleep (ms, default 0). Read via
+  // engine.getConfig in src/core/cycle/extract-atoms.ts.
+  'cycle.extract_atoms.max_input_chars',
+  'cycle.extract_atoms.max_output_tokens',
+  'cycle.extract_atoms.pacing_ms',
   'models.dream.patterns',
   'models.dream.synthesize_verdict',
   // #4152: preferred triage-model key (explicit pre-read in loadSynthConfig;
@@ -1213,6 +1254,11 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dream.triage.max_tokens',
   'dream.triage.max_ms',
   'dream.triage.concurrency',
+  // #4494: propose_takes extractor output caps (defaults 2048/4096, floor
+  // 256, retry clamped >= base). Thinking models spend reasoning tokens
+  // inside maxTokens, so the hardcoded defaults truncated every dense page.
+  'dream.propose_takes.max_tokens',
+  'dream.propose_takes.retry_max_tokens',
   'dream.patterns.lookback_days',
   'dream.patterns.min_evidence',
   // #2782-family: patterns-phase subagent timeouts (mirror of the
@@ -1298,6 +1344,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'orphans.exclude_slugs',
   'sync.cost_gate_min_usd',
   'sync.federated_v2',
+  'sync.include_working_tree',
   // #2179: clamp window for DCR-requested per-client token TTLs. Read by
   // `gbrain serve --http` at startup; unset min defaults to 300s, unset max
   // defaults fail-closed to max(--token-ttl, min).
@@ -1343,6 +1390,7 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   //   parser; numeric 0 disables.
   'minions.',
   'pace.',              // pace.mode + PACE_MODE_CONFIG_KEYS (src/core/pace-mode.ts)
+  'connectors.',        // chat-connectors: source_id, sync_floor_min, embed_kickoff_min_pages, doctor_stale_hours, <provider>.{auto_sync,last_sync_at,auth_error_at,watermark_iso} (no secrets — creds are file-plane)
 ];
 
 /**

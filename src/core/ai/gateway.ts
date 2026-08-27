@@ -23,7 +23,7 @@
 
 import { embed as aiEmbed, embedMany, generateObject, generateText, jsonSchema } from 'ai';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { listRecipes } from './recipes/index.ts';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -31,12 +31,12 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { z } from 'zod';
 
+import { truncateUtf8 } from '../text-safe.ts';
 import {
   BudgetTracker,
   extractUsageFromError as _extractUsageFromError,
   type BudgetKind,
 } from '../budget/budget-tracker.ts';
-
 import type {
   AIGatewayConfig,
   EmbedMultimodalOpts,
@@ -52,7 +52,8 @@ import {
   OPENROUTER_CACHE_HEADER,
   openrouterRequiresExplicitPromptCache,
 } from './recipes/openrouter.ts';
-import { resolveModel, resolveModelDetailed, resolveEffectiveChatModel, resolveEffectiveExpansionModel } from '../model-config.ts';
+import { resolveModelDetailed, resolveEffectiveChatModel, resolveEffectiveExpansionModel } from '../model-config.ts';
+import { snapshotConfigReader } from '../config-snapshot.ts';
 import { parseLlmJson } from '../llm-json.ts';
 import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
@@ -550,15 +551,26 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
     env: cfg.env ?? process.env,
     baseUrl: resolveNativeBaseUrl('openai', cfg),
   });
+
+  // The two resolutions below each walk a 5-tier precedence chain that reads
+  // up to 4 config keys, plus alias expansion. Against the engine that is
+  // many sequential round trips before the CLI does any work — seconds of
+  // `gbrain stats`'s wall clock on a hosted brain, for reads the server
+  // answered in microseconds. Take one snapshot of the config table (AFTER
+  // the discovery refresh above, so tier defaults see fresh discovery) and
+  // resolve every model against it. Same keys, same precedence, one round
+  // trip.
+  const reader = await snapshotConfigReader(engine);
+
   // Resolve expansion (utility tier) and chat (reasoning tier). Embedding is
   // intentionally NOT re-resolved here — switching embedding models invalidates
   // the vector index. Out of scope per v0.31.12 plan ("Embedding tier knob").
-  const expansionDetailed = await resolveModelDetailed(engine, {
+  const expansionDetailed = await resolveModelDetailed(reader, {
     configKey: 'models.expansion',
     tier: 'utility',
     fallback: cfg.expansion_model ?? DEFAULT_EXPANSION_MODEL,
   });
-  const chatDetailed = await resolveModelDetailed(engine, {
+  const chatDetailed = await resolveModelDetailed(reader, {
     configKey: 'models.chat',
     tier: 'reasoning',
     fallback: cfg.chat_model ?? DEFAULT_CHAT_MODEL,
@@ -1783,7 +1795,7 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const resolveTarget = opts?.embeddingModel ?? getEmbeddingModel();
   const tracker = __budgetStore.getStore() ?? null;
   const { model, recipe, modelId } = await resolveEmbeddingProvider(resolveTarget);
-  const truncated = texts.map(t => (t ?? '').slice(0, MAX_CHARS));
+  const truncated = texts.map(t => truncateUtf8(t ?? '', MAX_CHARS));
 
   // Reserve up front for the worst-case batch token count. Embeddings have
   // no output rate, so maxOutputTokens=0. record() at the end uses the
@@ -2778,6 +2790,21 @@ export async function expand(query: string): Promise<string[]> {
         result = await _generateObjectTransport({
           model,
           schema: ExpansionSchema,
+          // Name the schema. On the native-anthropic path the SDK turns the schema
+          // into a tool, and without a name+description that tool carries no
+          // `description` field. api.anthropic.com tolerates that; an
+          // Anthropic-COMPATIBLE endpoint need not, and at least one (z.ai/GLM)
+          // then ignores `tool_choice: {type:'tool'}` and answers with
+          // markdown-fenced JSON as ordinary text. Measured 3/3 deterministic both
+          // ways against z.ai: with a description, 3/3 tool_use; without it, 3/3
+          // end_turn+text. generateObject then sees no object, `result.object` is
+          // undefined, and expansion degrades to the bare query — on EVERY call,
+          // with no error line, because the catch below only reports AIConfigError.
+          // The two openai-compatible branches already recover via viaText(); this
+          // native branch has no such fallback, so naming the schema is its only
+          // guard.
+          schemaName: 'query_expansions',
+          schemaDescription: 'The rewritten search queries used to retrieve relevant documents.',
           abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
           prompt: expansionPrompt,
         });
@@ -2795,6 +2822,12 @@ export async function expand(query: string): Promise<string[]> {
         const result = await _generateObjectTransport({
           model,
           schema: ExpansionSchema,
+          // Same schema name+description as the native branch above: an
+          // Anthropic-compatible endpoint reached through this lane can hinge
+          // its tool_choice compliance on the tool carrying a description
+          // (the z.ai/GLM failure mode), and naming costs nothing elsewhere.
+          schemaName: 'query_expansions',
+          schemaDescription: 'The rewritten search queries used to retrieve relevant documents.',
           abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
           prompt: expansionPrompt,
         });
@@ -2967,9 +3000,19 @@ export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
  * on the rebuilt part in toModelMessages(), and carried through the replay shim
  * (adaptContentBlocksToChatBlocks). Attached ONLY when the provider sent one —
  * blocks from providers without per-part state stay byte-identical.
+ *
+ * `reasoning` blocks are the same #4201 shape applied to OpenAI's Responses
+ * API reasoning models (o-series, gpt-5.x family): every response `reasoning`
+ * part carries `providerMetadata.openai.itemId` (+ optional
+ * `reasoningEncryptedContent`), and OpenAI's server REJECTS a later turn whose
+ * history has a `function_call` item with no matching `reasoning` item —
+ * "Item '<fc_id>' of type 'function_call' was provided without its required
+ * 'reasoning' item: '<rs_id>'." A reasoning-model tool-loop conversation dies
+ * on turn 2 without this: `chat()` previously never captured the part at all.
  */
 export type ChatBlock =
   | { type: 'text'; text: string; providerMetadata?: Record<string, unknown> }
+  | { type: 'reasoning'; text: string; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-result'; toolCallId: string; toolName: string; output: unknown; isError?: boolean; providerMetadata?: Record<string, unknown> };
 
@@ -3059,6 +3102,23 @@ function safeStringify(value: unknown): string {
   }
 }
 
+/**
+ * Some Anthropic-compatible providers (notably z.ai/GLM) occasionally return a
+ * tool-call part WITHOUT a `toolCallId`. AI SDK v6's ModelMessage schema requires
+ * `toolCallId: z.string()`, so an undefined id is invisible on the turn it is
+ * produced but throws "The messages do not match the ModelMessage[] schema" the
+ * moment that assistant turn is replayed as history on the next tool-loop turn —
+ * permanently wedging the job (observed as ~528 identical autopilot failures).
+ * Synthesize a stable, unique id AT THE SOURCE (`chat()` block-normalization) so
+ * the SAME id flows to both the persisted tool-call block and its matching
+ * tool-result block within a turn. Also used defensively in `toModelMessages` to
+ * keep any already-persisted poisoned rows from throwing on replay.
+ */
+function ensureToolCallId(id: unknown, toolName: string): string {
+  if (typeof id === 'string' && id.length > 0) return id;
+  return `glmfix-${toolName}-${randomUUID()}`;
+}
+
 export function toModelMessages(messages: ChatMessage[]): unknown[] {
   return messages.map((m) => {
     if (typeof m.content === 'string') return { role: m.role, content: m.content };
@@ -3085,15 +3145,16 @@ export function toModelMessages(messages: ChatMessage[]): unknown[] {
     }
     return {
       role: m.role,
-      // Drop text blocks whose `text` isn't a string: reasoning models
-      // (DeepSeek v4, etc.) surface `text: null/undefined` thinking parts that
-      // AI SDK v6's Zod schema rejects, poisoning the whole call. `''` is valid
-      // and kept.
+      // Drop text/reasoning blocks whose `text` isn't a string: reasoning
+      // models (DeepSeek v4, etc.) surface `text: null/undefined` thinking
+      // parts that AI SDK v6's Zod schema rejects, poisoning the whole call.
+      // `''` is valid and kept.
       content: blocks
-        .filter((b) => b.type !== 'text' || typeof b.text === 'string')
+        .filter((b) => (b.type !== 'text' && b.type !== 'reasoning') || typeof b.text === 'string')
         .map((b) => {
           // #4201: `providerOptions` echoes per-part provider state (e.g.
-          // Gemini 3.x thoughtSignature) — attached only when captured.
+          // Gemini 3.x thoughtSignature, OpenAI reasoning-item id) — attached
+          // only when captured.
           if (b.type === 'text') {
             return {
               type: 'text' as const,
@@ -3101,10 +3162,20 @@ export function toModelMessages(messages: ChatMessage[]): unknown[] {
               ...(b.providerMetadata ? { providerOptions: b.providerMetadata } : {}),
             };
           }
+          if (b.type === 'reasoning') {
+            return {
+              type: 'reasoning' as const,
+              text: b.text,
+              ...(b.providerMetadata ? { providerOptions: b.providerMetadata } : {}),
+            };
+          }
           if (b.type === 'tool-call') {
+            // ensureToolCallId here is the defensive half: rows persisted before
+            // the chat()-side fix can still carry an undefined id, and replaying
+            // one would throw on the ModelMessage schema.
             return {
               type: 'tool-call' as const,
-              toolCallId: b.toolCallId,
+              toolCallId: ensureToolCallId(b.toolCallId, b.toolName),
               toolName: b.toolName,
               input: b.input,
               ...(b.providerMetadata ? { providerOptions: b.providerMetadata } : {}),
@@ -3781,17 +3852,20 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     if (Array.isArray(rawContent) && rawContent.length > 0) {
       for (const part of rawContent) {
         // #4201: capture per-part providerMetadata (Gemini 3.x thoughtSignature
-        // arrives on functionCall/text parts and must be echoed back next turn).
-        // `reasoning` parts stay deliberately dropped: the echo requirement is
-        // on functionCall parts; reasoning text never re-enters the transcript.
+        // and OpenAI reasoning-item ids arrive on functionCall/reasoning/text
+        // parts and must be echoed back next turn — see the ChatBlock doc
+        // comment for the OpenAI Responses API's specific requirement).
         const partMeta = part.providerMetadata && typeof part.providerMetadata === 'object'
           ? { providerMetadata: part.providerMetadata as Record<string, unknown> }
           : {};
         if (part.type === 'text') blocks.push({ type: 'text', text: part.text, ...partMeta });
+        else if (part.type === 'reasoning') {
+          blocks.push({ type: 'reasoning', text: typeof part.text === 'string' ? part.text : '', ...partMeta });
+        }
         else if (part.type === 'tool-call') {
           blocks.push({
             type: 'tool-call',
-            toolCallId: part.toolCallId,
+            toolCallId: ensureToolCallId(part.toolCallId, part.toolName),
             toolName: part.toolName,
             input: part.input ?? part.args,
             ...partMeta,
@@ -3806,7 +3880,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       for (const tc of (result as any).toolCalls ?? []) {
         blocks.push({
           type: 'tool-call',
-          toolCallId: tc.toolCallId,
+          toolCallId: ensureToolCallId(tc.toolCallId, tc.toolName),
           toolName: tc.toolName,
           input: tc.input ?? tc.args,
         });

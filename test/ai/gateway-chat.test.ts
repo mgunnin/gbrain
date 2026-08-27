@@ -191,7 +191,7 @@ describe('chat touchpoint — model resolver + aliases (Codex F-OV-5)', () => {
   test('assertTouchpoint accepts chat for chat-capable native + openai-compat providers', () => {
     expect(() => assertTouchpoint(getRecipe('anthropic')!, 'chat', 'claude-opus-4-7')).not.toThrow();
     expect(() => assertTouchpoint(getRecipe('openai')!, 'chat', 'gpt-5.2')).not.toThrow();
-    expect(() => assertTouchpoint(getRecipe('google')!, 'chat', 'gemini-2.0-flash')).not.toThrow();
+    expect(() => assertTouchpoint(getRecipe('google')!, 'chat', 'gemini-2.5-flash')).not.toThrow();
     expect(() => assertTouchpoint(getRecipe('deepseek')!, 'chat', 'deepseek-v4-flash')).not.toThrow();
     // Legacy id retired by DeepSeek 2026-07-24 (#1255): still passes local
     // validation (openai-compat tier), rejection surfaces at the provider.
@@ -477,6 +477,66 @@ describe('chat touchpoint — per-part providerMetadata round trip (#4201)', () 
     expect(capturedMessages).toBeDefined();
     const assistant = (capturedMessages as any[]).find(m => m.role === 'assistant');
     expect(assistant.content[0].providerOptions).toEqual(SIG);
+  });
+});
+
+// OpenAI's Responses API requires every `function_call` item in a replayed
+// transcript to be paired with the `reasoning` item that produced it, or the
+// NEXT turn 400s: "Item '<fc_id>' of type 'function_call' was provided
+// without its required 'reasoning' item: '<rs_id>'." Reproduced live against
+// openai:gpt-5.6-luna in a 2-turn tool-calling conversation: turn 1 captured
+// zero reasoning blocks (chat() silently dropped the `reasoning` part) and
+// turn 2 failed with exactly that message; after this fix turn 1 captures
+// the reasoning block and turn 2 completes. This suite covers the inbound
+// capture half with the SAME #4201 providerMetadata channel `text`/`tool-call`
+// already use — see gateway-model-messages.test.ts for the outbound echo half.
+describe('chat touchpoint — reasoning-item round trip (OpenAI Responses API)', () => {
+  beforeEach(() => {
+    resetGateway();
+    __setGenerateTextTransportForTests(null);
+  });
+
+  const REASONING_SIG = { openai: { itemId: 'rs_abc123', reasoningEncryptedContent: 'opaque-blob' } };
+
+  test('chat() captures a reasoning part into a ChatBlock (inbound half)', async () => {
+    __setGenerateTextTransportForTests(async () => ({
+      content: [
+        { type: 'reasoning', text: 'weighing today vs. the forecast...', providerMetadata: REASONING_SIG },
+        { type: 'tool-call', toolCallId: 'c1', toolName: 'get_forecast', input: { city: 'Tokyo' } },
+      ],
+      finishReason: 'tool-calls',
+      usage: { inputTokens: 5, outputTokens: 5 },
+    }) as any);
+    configureGateway({ chat_model: 'openai:gpt-5.6-luna', env: { OPENAI_API_KEY: 'fake' } });
+    const result = await chat({
+      model: 'openai:gpt-5.6-luna',
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+    const reasoning = result.blocks.find(b => b.type === 'reasoning') as any;
+    expect(reasoning).toBeDefined();
+    expect(reasoning.text).toBe('weighing today vs. the forecast...');
+    expect(reasoning.providerMetadata).toEqual(REASONING_SIG);
+    // Never leaks into the final answer text (that's the model's actual reply, not its thinking).
+    expect(result.text).toBe('');
+  });
+
+  test('a reasoning part with a non-string text field does not poison the call', async () => {
+    __setGenerateTextTransportForTests(async () => ({
+      content: [
+        { type: 'reasoning', text: null },
+        { type: 'text', text: 'ok' },
+      ],
+      finishReason: 'stop',
+      usage: { inputTokens: 1, outputTokens: 1 },
+    }) as any);
+    configureGateway({ chat_model: 'openai:gpt-5.6-luna', env: { OPENAI_API_KEY: 'fake' } });
+    const result = await chat({
+      model: 'openai:gpt-5.6-luna',
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+    const reasoning = result.blocks.find(b => b.type === 'reasoning') as any;
+    expect(reasoning.text).toBe('');
+    expect(result.text).toBe('ok');
   });
 });
 

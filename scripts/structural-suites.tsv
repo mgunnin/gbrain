@@ -64,7 +64,7 @@ test/compile-view.test.ts	compileView — source isolation + read errors	3	readF
 test/config.test.ts	config source correctness	2	readFileSync
 test/connection-resilience.test.ts	Eng-review D3 — executeRaw has no per-call retry wrapper	3	readFileSync
 test/contextual-retrieval-service-pure.test.ts	inline import contextual synopsis containment	1	readFileSync
-test/conversation-facts-type-allowlist-drift.test.ts	(file-level)	17	readFileSync
+test/conversation-facts-type-allowlist-drift.test.ts	(file-level)	18	readFileSync
 test/cycle-abort.test.ts	#1972 — complete cooperative-abort coverage	3	readFileSync
 test/cycle-abort.test.ts	CycleOpts.signal contract (v0.20.5)	4	readFileSync
 test/cycle-abort.test.ts	autopilot-cycle handler contract (v0.20.5)	3	readFileSync
@@ -84,12 +84,14 @@ test/destructive-guard.test.ts	FK-RESTRICT lifecycle (clientsReferencingSource +
 test/destructive-guard.test.ts	assessDestructiveImpact	5	readFileSync
 test/destructive-guard.test.ts	formatters (display helpers)	4	readFileSync
 test/destructive-guard.test.ts	purgeExpiredSources — clone cleanup containment	1	readFileSync
+test/detached-stderr.test.ts	jobs.ts detach branch (source pin, #4418)	2	readFileSync
 test/doctor-embedding-env-override.test.ts	cross-surface parity (source-grep regression guard)	1	doctor-source-helper
 test/doctor-fix.test.ts	gbrain doctor --fix CLI integration	3	readFileSync
 test/doctor-frontmatter-partial.test.ts	doctor frontmatter_integrity — load-bearing render strings	5	doctor-source-helper
 test/doctor-frontmatter-partial.test.ts	doctor frontmatter_integrity — structural rendering (source-grep)	6	doctor-source-helper
 test/doctor-orphan-ratio.test.ts	cross-surface parity contract	3	doctor-source-helper,readFileSync
 test/doctor-orphan-ratio.test.ts	runOrphanRatioCheck — thin-client surface (D11)	1	readFileSync
+test/doctor-schema-column-diff.test.ts	doctor schema_version wires the column diff (#4421)	1	doctor-source-helper
 test/doctor-supervisor-singleton-pidfile.test.ts	doctor supervisor_singleton — honors the recorded pid_file (custom --pid-file)	2	doctor-source-helper
 test/doctor-supervisor-singleton-pidfile.test.ts	doctor supervisor_singleton — pid_file fallback (source-grep)	1	doctor-source-helper
 test/doctor-volunteer-channels.test.ts	checkVolunteerChannels	9	doctor-source-helper,readFileSync
@@ -129,6 +131,7 @@ test/exit-classification.test.ts	consumer wire-up — helper used by all 3 sites
 test/extract-atoms-drain.test.ts	extract-atoms-drain Minion handler retries on provider_failure (issue #3218)	2	readFileSync
 test/extract-atoms-drain.test.ts	shared wiring helper holds the cycle lock (5A)	2	readFileSync
 test/extract-workers.test.ts	extract.ts → workers wiring (T7)	10	readFileSync
+test/facts-backstop-remedy-verb.test.ts	facts backstop thin-client-fallback remedy verb (#4489)	3	readFileSync
 test/features.test.ts	CLI routing	2	bun-file
 test/fence-extraction.test.ts	Layer 8 D2 — markdown fence extraction	18	readFileSync
 test/filing-rules-resolution.serial.test.ts	per-source filing-rules resolution	3	readFileSync
@@ -186,6 +189,7 @@ test/openclaw-plugin-manifest.test.ts	bundled-skill reference closure (nothing b
 test/openclaw-plugin-manifest.test.ts	plugin membership curation (skills = plugin ∪ exclusions, disjoint)	9	readFileSync
 test/openclaw-plugin-manifest.test.ts	root OpenClaw plugin manifest	2	readFileSync
 test/pglite-engine.test.ts	PGLiteEngine: v0.13.1 error-wrap on connect() (#223)	1	readFileSync
+test/pglite-repair-command.serial.test.ts	gbrain pglite-repair — interactive confirm wiring (#4318 residual)	1	readFileSync
 test/pglite-wal-repair.serial.test.ts	WAL auto-repair — real-brain regression (#223/#1670/#2575)	6	readFileSync
 test/phantom-redirect-per-source-lock.test.ts	phantom-redirect lock contract	3	readFileSync
 test/postgres-engine-singleton-ownership.test.ts	postgres-engine / module-singleton ownership (#1471)	7	readFileSync
@@ -213,6 +217,7 @@ test/scripts/run-verify-parallel.test.ts	guard registration ⇒ execution covera
 test/scripts/test-shard.slow.test.ts	test-shard.sh — LPT balance contract	5	readFileSync
 test/serve-http-github-webhook.test.ts	handler wiring (source pin)	1	readFileSync
 test/serve-http-mcp-transport-cleanup.test.ts	POST /mcp transport cleanup (#2844)	2	readFileSync
+test/serve-stdin-eof-drain.test.ts	serve-sync-runner stays off the boot path (#4409)	1	readFileSync
 test/skillify-scaffold.test.ts	11-item scaffold contract (T9 + Phase 3 cross-modal eval)	1	readFileSync
 test/skillify-scaffold.test.ts	applyScaffold	3	readFileSync
 test/skillify-scaffold.test.ts	planScaffold	13	readFileSync
@@ -231,8 +236,10 @@ test/skillpack-scrub-legacy.test.ts	runScrubLegacy	8	readFileSync
 test/sources-webhook.test.ts	Webhook sync job extraction contract	1	readFileSync
 test/spend-off-switch.test.ts	reindex / onboard off-switch dispatch (regression guards)	3	bun-file
 test/supervisor.test.ts	recovery hook timeout bound (structural)	1	readFileSync
+test/sync-failures.test.ts	#4543 blocked output names failing files	4	bun-file,doctor-source-helper
 test/sync-failures.test.ts	Bug 9 — doctor surfaces sync failures	2	doctor-source-helper
 test/sync-failures.test.ts	Bug 9 — sync.ts CLI flag wiring	6	bun-file,doctor-source-helper
+test/sync-include-hidden.test.ts	sync.ts delta path threads includeHidden (#4027 merge guard)	1	readFileSync
 test/sync.test.ts	buildSyncManifest	9	bun-file
 test/sync.test.ts	isSyncable	8	bun-file
 test/sync.test.ts	resolveSlugByPathOrSourcePath (CJK wave v0.32.7, codex F4)	3	bun-file
@@ -246,6 +253,7 @@ test/thin-client-routing-audit.test.ts	thin-client routing audit — v0.32 ROUTE
 test/timing-safe.test.ts	extraction contract	1	readFileSync
 test/tool-catalog.test.ts	freshness guard	2	readFileSync
 test/transcription-injection.test.ts	transcription — command injection (#245)	2	readFileSync
+test/upgrade-skill-publish-prompt-race.test.ts	gbrain upgrade — skill-publish prompt wiring (#4318 residual)	3	readFileSync
 test/upgrade.serial.test.ts	detectInstallMethod heuristic (source analysis)	13	readFileSync
 test/v0_37_fix_wave.serial.test.ts	v0.37 Lane A — defaults sweep	8	readFileSync
 test/v0_37_fix_wave.serial.test.ts	v0.37 Lane B — init paths	3	readFileSync

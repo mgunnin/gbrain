@@ -1,7 +1,5 @@
 import type { BrainEngine } from '../core/engine.ts';
-// Leaf module (no flag surface of its own) — see that file for why this
-// isn't imported from extract-conversation-facts.ts directly (#4135).
-import { ALLOWED_TYPES } from '../core/facts/conversation-types.ts';
+import { EMBED_SKIP_FILTER_FRAGMENT } from '../core/embed-skip.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
@@ -23,6 +21,7 @@ import { computeEffectiveDate } from '../core/effective-date.ts';
 import { parseFrontmatter } from '../core/backfill-effective-date.ts';
 import { hnswIndexExpected, hnswMaxDimsForType } from '../core/vector-index.ts';
 import { VERSION as GBRAIN_BINARY_VERSION } from '../version.ts';
+import { schemaVersionHealth } from '../core/schema-version-health.ts';
 import { zeroTotalContradictionsCheck } from '../core/eval-contradictions/run-health.ts';
 // Peeled doctor modules (containment sprint): each is a verbatim move out of
 // this file. doctor.ts re-exports every moved public symbol under its
@@ -129,6 +128,7 @@ export {
   computeExtractHealthCheck,
   checkSyncFreshness,
 } from './doctor/checks/extraction-sync.ts';
+export { computeConversationFormatCoverageCheck } from './doctor/checks/conversation-coverage.ts';
 export {
   checkSyncConsolidation,
   computePoolBudgetCheck,
@@ -210,6 +210,7 @@ import {
   computeExtractHealthCheck,
   checkSyncFreshness,
 } from './doctor/checks/extraction-sync.ts';
+import { computeConversationFormatCoverageCheck } from './doctor/checks/conversation-coverage.ts';
 import {
   checkSyncConsolidation,
   checkCycleFreshness,
@@ -383,6 +384,36 @@ export function computeDoctorReport(checks: Check[]): DoctorReport {
  */
 
 /**
+ * #4517: is the latest upgrade-errors.jsonl record superseded? True when the
+ * running binary version is at/past the version the failed upgrade was moving
+ * to AND the schema ledger is current (no pending migrations) — i.e. a later
+ * (or retried) upgrade demonstrably finished the job. Pure + exported for
+ * tests. Compares ALL dot-segments (the canonical `compareVersions` stops at
+ * 3, which would treat 0.31.4.1 == 0.31.4.0); a malformed version fails
+ * closed (keeps warning).
+ */
+export function upgradeErrorResolved(
+  failedToVersion: string,
+  binaryVersion: string,
+  schemaCurrent: boolean,
+): boolean {
+  if (!schemaCurrent) return false;
+  if (typeof failedToVersion !== 'string' || typeof binaryVersion !== 'string') return false;
+  const a = binaryVersion.replace(/^v/, '').split('.');
+  const b = failedToVersion.replace(/^v/, '').split('.');
+  if (a.length === 0 || b.length === 0) return false;
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const da = parseInt(a[i] ?? '0', 10);
+    const db = parseInt(b[i] ?? '0', 10);
+    if (!Number.isFinite(da) || !Number.isFinite(db) || Number.isNaN(da) || Number.isNaN(db)) return false;
+    if (da > db) return true;
+    if (da < db) return false;
+  }
+  return true; // equal → the failed target version is now running
+}
+
+/**
  * v0.42 self_upgrade_health. Surfaces the self-upgrade mode, whether an update
  * is pending (from the cache), and any recent failed auto-upgrade attempts.
  * File-plane only (no DB) so it runs on thin clients. Three-state: warn on
@@ -440,6 +471,64 @@ export function checkSelfUpgradeHealth(): Check {
       status: 'ok',
       message: `Self-upgrade status unavailable (${e instanceof Error ? e.message : String(e)})`,
     };
+  }
+}
+
+/**
+ * Upgrade-error trail (v0.13+). `gbrain upgrade` silently swallows
+ * best-effort failures in `gbrain post-upgrade`; the failure record is
+ * appended to `~/.gbrain/upgrade-errors.jsonl` so we can surface it here
+ * with a paste-ready recovery hint. Without this, users end up with
+ * half-upgraded brains and no signal.
+ *
+ * #4517: a failure record on its own doesn't mean the brain is STILL
+ * broken — the recovery hint (e.g. `apply-migrations --yes`) may have
+ * already fixed it. Suppression requires BOTH proofs: the installed
+ * binary's own version is at/past the record's `to_version` (the failed
+ * upgrade demonstrably completed filesystem-side) AND the schema ledger is
+ * current (`config.version >= LATEST_VERSION` — the DB half of the upgrade
+ * also finished). A binary alone can lie: `self-upgrade` swaps the binary
+ * before `post-upgrade` runs migrations, which is exactly the failure this
+ * trail records. When the schema can't be verified (no engine, unreadable
+ * version), the warn stays — fail-closed. A superseded record downgrades to
+ * an explicit status:'ok' line (rather than silence) so the operator sees
+ * the past failure was resolved, not swallowed.
+ * `upgradeErrorResolved` above is the pure decision fn.
+ */
+export async function checkUpgradeErrors(
+  engine: Pick<BrainEngine, 'getConfig'> | null,
+): Promise<Check | null> {
+  try {
+    const errPath = gbrainPath('upgrade-errors.jsonl');
+    if (!existsSync(errPath)) return null;
+    const lines = readFileSync(errPath, 'utf-8').split('\n').filter(l => l.trim());
+    if (lines.length === 0) return null;
+    const latest = JSON.parse(lines[lines.length - 1]) as {
+      ts: string; phase: string; from_version: string; to_version: string; hint: string;
+    };
+    const date = latest.ts.slice(0, 10);
+    let schemaCurrent = false;
+    if (engine) {
+      try {
+        const v = parseInt((await engine.getConfig('version')) || '0', 10);
+        schemaCurrent = v >= LATEST_VERSION;
+      } catch { /* unverifiable → keep warning */ }
+    }
+    if (upgradeErrorResolved(latest.to_version, GBRAIN_BINARY_VERSION, schemaCurrent)) {
+      return {
+        name: 'upgrade_errors',
+        status: 'ok',
+        message: `Past post-upgrade failure on ${date} (${latest.from_version} → ${latest.to_version}) superseded: binary now ${GBRAIN_BINARY_VERSION}, schema current.`,
+      };
+    }
+    return {
+      name: 'upgrade_errors',
+      status: 'warn',
+      message: `Post-upgrade failure on ${date} (${latest.from_version} → ${latest.to_version}, phase: ${latest.phase}). Recovery: ${latest.hint}`,
+    };
+  } catch {
+    // Read/parse failure is itself best-effort; skip silently.
+    return null;
   }
 }
 
@@ -672,6 +761,18 @@ export async function buildChecks(
   // brains keep a clean doctor.
   checks.push(...(await bootstrapDoctorChecks(engine)));
 
+  // 2e. Chat-connector health (D3.2): re-auth-needed / stalled-sync / drift.
+  // Credential-gated + auto_sync-gated — emits a plain "ok" (no nag) on brains
+  // with no connectors or a manual-only user.
+  if (engine) {
+    try {
+      const { connectorsHealthCheck } = await import('./doctor/checks/connectors.ts');
+      checks.push(await connectorsHealthCheck(engine));
+    } catch {
+      // best-effort; a connectors check failure must never break doctor
+    }
+  }
+
   // 3. Half-migrated Minions detection (filesystem-only).
   // If completed.jsonl has any status:"partial" entry with no later
   // status:"complete" for the same version, the install is mid-migration.
@@ -752,31 +853,10 @@ export async function buildChecks(
     // handles the "schema v7+ but no prefs" case.
   }
 
-  // 3b. Upgrade-error trail (v0.13+). `gbrain upgrade` silently swallows
-  // best-effort failures in `gbrain post-upgrade`; the failure record is
-  // appended to ~/.gbrain/upgrade-errors.jsonl so we can surface it here
-  // with a paste-ready recovery hint. Without this, users end up with
-  // half-upgraded brains and no signal.
-  try {
-    const home = process.env.HOME || '';
-    const errPath = join(home, '.gbrain', 'upgrade-errors.jsonl');
-    if (existsSync(errPath)) {
-      const lines = readFileSync(errPath, 'utf-8').split('\n').filter(l => l.trim());
-      if (lines.length > 0) {
-        const latest = JSON.parse(lines[lines.length - 1]) as {
-          ts: string; phase: string; from_version: string; to_version: string; hint: string;
-        };
-        const date = latest.ts.slice(0, 10);
-        checks.push({
-          name: 'upgrade_errors',
-          status: 'warn',
-          message: `Post-upgrade failure on ${date} (${latest.from_version} → ${latest.to_version}, phase: ${latest.phase}). Recovery: ${latest.hint}`,
-        });
-      }
-    }
-  } catch {
-    // Read/parse failure is itself best-effort; skip silently.
-  }
+  // 3b. Upgrade-error trail (v0.13+). See checkUpgradeErrors for the #4517
+  // staleness re-verification semantics (binary version + schema ledger).
+  const upgradeErrorsCheck = await checkUpgradeErrors(engine);
+  if (upgradeErrorsCheck) checks.push(upgradeErrorsCheck);
 
   // 3b-ter. Self-upgrade health (#3747). Pure local-file check (config +
   // upgrade cache + audit trail; no DB) that was only ever pushed by the
@@ -815,6 +895,16 @@ export async function buildChecks(
       } catch { /* pre-migration / transient: pidfile-only */ }
     }
     const running = pidfileRunning || detectedViaDbLock;
+    // #4518: under --fast, `engine` is null (the CLI dispatcher never
+    // connects — see cli.ts's `if (args.includes('--fast'))` branch), so the
+    // #1849 DB-lock fallback above is structurally unreachable. A supervisor
+    // running the documented multi-queue pattern (distinct --pid-file per
+    // named queue, e.g. `supervisor-cron.pid` + `supervisor-default.pid`)
+    // never writes DEFAULT_PID_FILE either, so `running` is always false for
+    // that install shape under --fast — not because it's actually down, but
+    // because the ONE check that could prove otherwise was never attempted.
+    // Don't assert "not running" on a check we know is inconclusive here.
+    const dbLockCheckSkippedUnderFast = fastMode && !pidfileRunning && !engine;
 
     const events = readSupervisorEvents({ sinceMs: 24 * 60 * 60 * 1000 });
     const lastStart = events.filter(e => e.event === 'started').pop()?.ts ?? null;
@@ -842,6 +932,17 @@ export async function buildChecks(
           name: 'supervisor',
           status: 'fail',
           message: `Supervisor gave up at ${maxCrashesEvent.ts} (max_crashes_exceeded). Restart with: gbrain jobs supervisor start --detach`,
+        });
+      } else if (!running && dbLockCheckSkippedUnderFast && events.length > 0) {
+        // #4518: pidfile check found nothing at the HOME-derived default
+        // path, but under --fast we never got to try the #1849 DB-lock
+        // fallback that would prove a per-queue --pid-file supervisor is
+        // actually alive. Say so instead of asserting a liveness verdict
+        // this run structurally couldn't determine.
+        checks.push({
+          name: 'supervisor',
+          status: 'ok',
+          message: `Not found at the default pidfile path (last_start=${lastStart ?? 'unknown'}) — inconclusive under --fast (DB-lock fallback needs a connection). Run \`gbrain doctor\` without --fast to verify a per-queue --pid-file supervisor.`,
         });
       } else if (!running && events.length > 0) {
         checks.push({
@@ -1284,81 +1385,12 @@ export async function buildChecks(
     }
   }
 
-  // 3d.3 v0.41.13.0 — conversation_format_coverage. Scans up to 200
-  // most-recent conversation-type pages, runs parseConversation in
-  // dry mode, reports per-pattern hit counts + unmatched count. Warn
-  // at >10% unmatched with paste-ready hint pointing at
-  // `gbrain conversation-parser scan <slug>` so the operator can
-  // triage the misses interactively.
+  // 3d.3 v0.41.13.0 — conversation_format_coverage. Peeled to
+  // doctor/checks/conversation-coverage.ts (#4193) so it is unit-testable;
+  // summary-only conversation pages report separately instead of counting
+  // as parser misses. Error handling lives inside the compute function.
   if (engine) {
-    try {
-      const { readConversationBodyForParsing } = await import('../core/conversation-parser/body.ts');
-      const { parseConversation } = await import('../core/conversation-parser/parse.ts');
-      // Single source of truth for the conversation-facts type allowlist (#4135).
-      const allowedTypes = ALLOWED_TYPES;
-      // PageFilters supports singular `type` only; iterate the allowed types
-      // and cap at ~50/each to land at ~200 total max.
-      const sample: import('../core/types.ts').Page[] = [];
-      for (const t of allowedTypes) {
-        const slice = await engine.listPages({ limit: 50, type: t as import('../core/types.ts').PageType });
-        sample.push(...slice);
-      }
-      if (sample.length === 0) {
-        checks.push({
-          name: 'conversation_format_coverage',
-          status: 'ok',
-          message: 'No conversation-type pages — coverage check not applicable',
-        });
-      } else {
-        const hitsByPattern: Record<string, number> = {};
-        let unmatched = 0;
-        let evaluated = 0;
-        const llmFallbackEnabled =
-          (await engine.getConfig('conversation_parser.llm_fallback_enabled')) === 'true';
-        for (const page of sample) {
-          const body = await readConversationBodyForParsing(engine, page);
-          // Empty collector placeholders and operational skill docs are not
-          // conversations, even when legacy schema inference labels them slack.
-          if (!body.trim() || page.slug.startsWith('skills/')) continue;
-          evaluated++;
-          const result = parseConversation(body, { page, noPolish: true, noFallback: true });
-          const usesMeetingFallback =
-            result.phase === 'no_match' && page.type === 'meeting' && llmFallbackEnabled;
-          const id = usesMeetingFallback
-            ? '_llm_fallback'
-            : (result.matched_pattern_id ?? '_no_match');
-          hitsByPattern[id] = (hitsByPattern[id] ?? 0) + 1;
-          if (result.phase === 'no_match' && !usesMeetingFallback) unmatched++;
-        }
-        const unmatchedPct = evaluated === 0 ? 0 : (unmatched / evaluated) * 100;
-        const breakdown = Object.entries(hitsByPattern)
-          .sort(([, a], [, b]) => b - a)
-          .map(([k, v]) => `${k}=${v}`)
-          .join(', ');
-        if (unmatchedPct > 10) {
-          checks.push({
-            name: 'conversation_format_coverage',
-            status: 'warn',
-            message:
-              `${unmatched}/${evaluated} conversation pages (${unmatchedPct.toFixed(1)}%) have no deterministic pattern or configured fallback. ` +
-              `Breakdown: ${breakdown}. ` +
-              `Investigate: gbrain conversation-parser scan <slug>`,
-          });
-        } else {
-          checks.push({
-            name: 'conversation_format_coverage',
-            status: 'ok',
-            message: `${evaluated} non-empty conversation pages: ${breakdown}`,
-          });
-        }
-      }
-    } catch (err) {
-      checks.push({
-        name: 'conversation_format_coverage',
-        status: 'warn',
-        message: `Could not check conversation format coverage: ${(err as Error)?.message ?? String(err)}`,
-      });
-    }
+    checks.push(await computeConversationFormatCoverageCheck(engine));
   }
 
   // 3d.4 v0.41.13.0 — progressive_batch_audit_health. Reads last 7
@@ -1913,21 +1945,45 @@ export async function buildChecks(
   try {
     const version = await engine.getConfig('version');
     schemaVersion = parseInt(version || '0', 10);
-    if (schemaVersion >= LATEST_VERSION) {
-      checks.push({ name: 'schema_version', status: 'ok', message: `Version ${schemaVersion} (latest: ${LATEST_VERSION})` });
-    } else if (schemaVersion === 0) {
-      checks.push({
-        name: 'schema_version',
-        status: 'fail',
-        message: `No schema version recorded. Migrations never ran. Fix: gbrain apply-migrations --yes. ` +
-                 `If you installed via 'bun install -g github:...', see https://github.com/garrytan/gbrain/issues/218.`,
-      });
-    } else {
-      checks.push({
-        name: 'schema_version',
-        status: 'warn',
-        message: `Version ${schemaVersion}, latest is ${LATEST_VERSION}. Fix: gbrain apply-migrations --yes`,
-      });
+    checks.push({ name: 'schema_version', ...schemaVersionHealth(schemaVersion, LATEST_VERSION) });
+
+    // 6b. Schema columns — gbrain#4421/#4425. The ledger counter alone can
+    // lie: a PgBouncer transaction-mode pooler can swallow an ALTER TABLE
+    // while the migration runner still advances config.version, leaving the
+    // ledger "current" over a physically narrower table. The read-only column
+    // diff below does the same live-column check `gbrain init --migrate-only`
+    // already self-heals with — but a plain diagnostic run never issues DDL.
+    if (schemaVersion > LATEST_VERSION) {
+      // Forward skew (schemaVersionHealth warns AHEAD above): an ahead DB is
+      // a superset of this client's expected columns — the diff below would
+      // only mislead. "Upgrade this client" is the real fix; skip the diff.
+    } else if (schemaVersion >= LATEST_VERSION) {
+      // Ledger-current branch. Dynamic import is deliberate: the positional
+      // source guard in test/doctor-schema-column-diff.test.ts pins that the
+      // diff consult lives INSIDE this branch (a behind DB is EXPECTED to
+      // miss columns from unapplied migrations — schema_version's own warn
+      // covers that already, so the diff would only mislead there too).
+      progress.heartbeat('schema_columns');
+      try {
+        const { detectMissingColumns } = await import('../core/schema-verify.ts');
+        const detected = await detectMissingColumns(engine);
+        if (detected.missing.length === 0) {
+          checks.push({ name: 'schema_columns', status: 'ok', message: `${detected.checked} column(s) verified against live schema` });
+        } else {
+          const cols = detected.missing.map(m => `${m.table}.${m.column}`).join(', ');
+          checks.push({
+            name: 'schema_columns',
+            status: 'warn',
+            message:
+              `${detected.missing.length} column(s) missing despite schema_version reporting up to date: ${cols}. ` +
+              `The migration ledger advanced past a swallowed ALTER TABLE (PgBouncer transaction-mode is the ` +
+              `usual cause). Fix: gbrain init --migrate-only (runs the schema self-heal); if it persists, ` +
+              `connect directly to Postgres (not the pooler) first.`,
+          });
+        }
+      } catch {
+        checks.push({ name: 'schema_columns', status: 'warn', message: 'Could not verify live schema columns' });
+      }
     }
   } catch {
     checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
@@ -2830,6 +2886,16 @@ export async function buildChecks(
   //   counting pages whose body (compiled_truth + timeline, UTF-8 bytes
   //   via octet_length per Codex r2 #13) exceeds the block threshold.
   //   Status warn when 1+ rows; never fail (oversize is now a soft state).
+  //   Excludes frontmatter.embed_skip pages via the canonical
+  //   EMBED_SKIP_FILTER_FRAGMENT (src/core/embed-skip.ts) — key existence,
+  //   not a boolean value comparison, matching every other embed-skip
+  //   consumer in the codebase. The warn message itself says "existing
+  //   oversized pages can be ... accepted as non-embeddable" (i.e.
+  //   embed_skip set), so a page that already took that accepted
+  //   remediation must not still count against this check — otherwise the
+  //   warning can never clear for a page an operator already resolved the
+  //   documented way (found via dogfooding: a page with embed_skip set
+  //   kept re-appearing in this check's output every run).
   // - scraper_junk_pages: capped 1000-most-recent default + --content-audit
   //   opt-in for full scan (D10 mirrors --index-audit precedent). Applies
   //   the assessor per-page on title + 2KB head-slice + frontmatter.
@@ -2856,8 +2922,8 @@ export async function buildChecks(
               octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) AS bytes
        FROM pages p
        WHERE p.deleted_at IS NULL
-         AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'embed_skip')
-         AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) > $1
+        AND ${EMBED_SKIP_FILTER_FRAGMENT}
+        AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) > $1
        ORDER BY bytes DESC
        LIMIT 100`,
       [bytesBlock],
@@ -2866,7 +2932,7 @@ export async function buildChecks(
       checks.push({
         name: 'oversized_pages',
         status: 'ok',
-        message: `No pages exceed ${bytesBlock} bytes`,
+        message: `No pages exceed ${bytesBlock} bytes (excluding embed_skip pages, which already took the accepted non-embeddable remediation)`,
       });
     } else {
       const oversizeRows = rows as unknown as Array<{ slug: string; source_id: string; bytes: number }>;

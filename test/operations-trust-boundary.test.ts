@@ -32,11 +32,18 @@
  *
  * Companion guard at scripts/check-operations-filter-bypass.sh enforces
  * the canonical filter site so a future HTTP route can't bypass it.
+ *
+ * Dynamic sibling: test/remote-privacy-sweep.test.ts — a corpus-seeded
+ * sweep of EVERY non-localOnly op through dispatchToolCall asserting no
+ * private-sentinel leakage (the #4546/#4549 read-leak class). This file
+ * pins the static contract + curated handler probes; the sweep catches
+ * leaks in ops neither file has heard of yet. Same doctrine, two layers.
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
+import { MinionQueue } from '../src/core/minions/queue.ts';
 import { hasScope } from '../src/core/scope.ts';
 
 let engine: PGLiteEngine;
@@ -124,6 +131,47 @@ describe('operations contract — every op has scope + correct mutability shape'
         `op "${op.name}" has unknown scope "${op.scope}"`,
       ).toBe(true);
     }
+  });
+
+  test('state-changing job controls declare mutating metadata', () => {
+    for (const name of ['pause_job', 'resume_job', 'replay_job', 'send_job_message']) {
+      const op = operations.find(candidate => candidate.name === name);
+      expect(op, `expected canonical op "${name}" to exist`).toBeDefined();
+      expect(op!.mutating, `state-changing op "${name}" must declare mutating`).toBe(true);
+    }
+  });
+});
+
+describe('job-control operations — dry run never changes queue state', () => {
+  test('pause_job previews without pausing, then a real call pauses', async () => {
+    await engine.setConfig('version', '130');
+    const queue = new MinionQueue(engine);
+    const job = await queue.add('sync', {});
+    const op = operations.find(candidate => candidate.name === 'pause_job')!;
+
+    const preview = await op.handler(makeContext({ remote: false, dryRun: true }), { id: job.id });
+    expect(preview).toEqual({ dry_run: true, action: 'pause_job', id: job.id });
+    expect((await queue.getJob(job.id))!.status).toBe('waiting');
+
+    const result = await op.handler(makeContext({ remote: false }), { id: job.id });
+    expect(result).toEqual({ id: job.id, status: 'paused' });
+    expect((await queue.getJob(job.id))!.status).toBe('paused');
+  });
+
+  test('resume_job previews without resuming, then a real call resumes', async () => {
+    await engine.setConfig('version', '130');
+    const queue = new MinionQueue(engine);
+    const job = await queue.add('sync', {});
+    await queue.pauseJob(job.id);
+    const op = operations.find(candidate => candidate.name === 'resume_job')!;
+
+    const preview = await op.handler(makeContext({ remote: false, dryRun: true }), { id: job.id });
+    expect(preview).toEqual({ dry_run: true, action: 'resume_job', id: job.id });
+    expect((await queue.getJob(job.id))!.status).toBe('paused');
+
+    const result = await op.handler(makeContext({ remote: false }), { id: job.id });
+    expect(result).toEqual({ id: job.id, status: 'waiting' });
+    expect((await queue.getJob(job.id))!.status).toBe('waiting');
   });
 });
 
@@ -277,5 +325,116 @@ describe('handler invocation — historically-broken trust-boundary classes', ()
     expect(threw, 'search_by_image(image_path) with remote=true MUST reject').toBe(true);
     expect(message.toLowerCase()).toContain('image_path');
     expect(message.toLowerCase()).toContain('permission_denied');
+  });
+
+  test('find_orphans / get_recent_salience / find_anomalies hide private pages from remote callers (read-leak class)', async () => {
+    // Admission per the curated-list criterion: a real exploit class fixed
+    // at the handler level — remote callers received private page
+    // slugs/titles/metadata through these list arms (found by the
+    // remote-privacy-sweep on its first run; same class as the delta page
+    // arm). Local trusted callers keep the unfiltered view.
+    //
+    // Two extra WORLD person pages make the corpus 3 same-type pages today:
+    // enough for the anomaly type-cohort to FIRE (count > mean + 1 over an
+    // empty baseline), so the find_anomalies assertions below are proven
+    // non-vacuous by a LOCAL positive control instead of leaning on an
+    // empty result.
+    const put = operations.find(op => op.name === 'put_page')!;
+    const local = makeContext({ remote: false });
+    await put.handler(local, {
+      slug: 'people/tb-priv-example',
+      content: '---\ntitle: TB_PRIVATE_TITLE_PROOF\ntype: person\nvisibility: private\n---\n\n# TB_PRIVATE_TITLE_PROOF\n\nprivate body\n',
+    });
+    await put.handler(local, {
+      slug: 'people/tb-world-a',
+      content: '---\ntitle: TB World A\ntype: person\n---\n\n# TB World A\n\nworld body\n',
+    });
+    await put.handler(local, {
+      slug: 'people/tb-world-b',
+      content: '---\ntitle: TB World B\ntype: person\n---\n\n# TB World B\n\nworld body\n',
+    });
+    const remote = makeContext({ remote: true });
+
+    type OrphanCounts = {
+      orphans: { slug: string }[];
+      total_orphans: number;
+      total_pages: number;
+      total_linkable: number;
+      excluded: number;
+    };
+    const orphans = operations.find(op => op.name === 'find_orphans')!;
+    const orphanResult = (await orphans.handler(remote, {})) as OrphanCounts;
+    const orphanRes = JSON.stringify(orphanResult);
+    expect(orphanRes).not.toContain('people/tb-priv-example');
+    expect(orphanRes).not.toContain('TB_PRIVATE_TITLE_PROOF');
+    // Count self-consistency after filtering: total_orphans mirrors the
+    // filtered list (a stale unfiltered total is a hidden-page count oracle).
+    expect(orphanResult.total_orphans).toBe(orphanResult.orphans.length);
+    const orphanLocalResult = (await orphans.handler(local, {})) as OrphanCounts;
+    const orphanLocal = JSON.stringify(orphanLocalResult);
+    expect(orphanLocal).toContain('people/tb-priv-example');
+    // Hidden orphans VANISH from every published counter: both denominators
+    // shrink by the one hidden page and `excluded` is untouched — folding
+    // hidden rows into `excluded` would be an exact one-call oracle, since
+    // the unfiltered op guarantees excluded counts only pseudo-pages.
+    expect(orphanLocalResult.total_pages - orphanResult.total_pages).toBe(1);
+    expect(orphanLocalResult.total_linkable - orphanResult.total_linkable).toBe(1);
+    expect(orphanResult.excluded).toBe(orphanLocalResult.excluded);
+
+    const salience = operations.find(op => op.name === 'get_recent_salience')!;
+    const salienceRes = JSON.stringify(await salience.handler(remote, {}));
+    expect(salienceRes).not.toContain('people/tb-priv-example');
+    expect(salienceRes).not.toContain('TB_PRIVATE_TITLE_PROOF');
+    const salienceLocal = JSON.stringify(await salience.handler(local, {}));
+    expect(salienceLocal).toContain('people/tb-priv-example');
+
+    const anomalies = operations.find(op => op.name === 'find_anomalies')!;
+    // LOCAL positive control: the person-type cohort anomaly fires and
+    // names the private slug — proving the remote assertions below are
+    // exercising a real filter, not an empty list.
+    const anomaliesLocal = JSON.stringify(await anomalies.handler(local, {}));
+    expect(anomaliesLocal).toContain('people/tb-priv-example');
+    const anomalyRows = (await anomalies.handler(remote, {})) as {
+      count: number;
+      page_slugs: string[];
+    }[];
+    const anomaliesRes = JSON.stringify(anomalyRows);
+    expect(anomaliesRes).not.toContain('people/tb-priv-example');
+    expect(anomaliesRes).toContain('people/tb-world-a'); // non-empty proof
+    for (const row of anomalyRows) {
+      // No empty-row oracle, and for this sub-cap corpus the adjusted count
+      // (original minus removed private slugs) equals the visible list —
+      // a stale unadjusted count would read 3 here and leak the hidden
+      // page's existence.
+      expect(row.page_slugs.length).toBeGreaterThan(0);
+      expect(row.count).toBe(row.page_slugs.length);
+    }
+
+    // find_experts: query the private page's OWN title so the expertise
+    // scorer must rank it if it can see it — a remote caller gets nothing,
+    // a local caller gets the row (deterministic, unlike fuzzy-threshold
+    // sweep topics).
+    const experts = operations.find(op => op.name === 'find_experts')!;
+    const expertsRes = JSON.stringify(
+      await experts.handler(remote, { topic: 'TB_PRIVATE_TITLE_PROOF' }),
+    );
+    expect(expertsRes).not.toContain('people/tb-priv-example');
+    expect(expertsRes).not.toContain('TB_PRIVATE_TITLE_PROOF');
+    const expertsLocal = JSON.stringify(
+      await experts.handler(local, { topic: 'TB_PRIVATE_TITLE_PROOF' }),
+    );
+    expect(expertsLocal).toContain('people/tb-priv-example');
+
+    // Soft-delete bypass (fail-closed probe): the raw salience/anomaly
+    // queries carry no deleted_at predicate, so a soft-deleted private page
+    // still reaches the handler rows — the post-filter must classify it
+    // private-only via includeDeleted:true or it slips through.
+    const del = operations.find(op => op.name === 'delete_page')!;
+    await del.handler(local, { slug: 'people/tb-priv-example' });
+    const salienceAfterDelete = JSON.stringify(await salience.handler(remote, {}));
+    expect(salienceAfterDelete).not.toContain('people/tb-priv-example');
+    expect(salienceAfterDelete).not.toContain('TB_PRIVATE_TITLE_PROOF');
+    const anomaliesAfterDelete = JSON.stringify(await anomalies.handler(remote, {}));
+    expect(anomaliesAfterDelete).not.toContain('people/tb-priv-example');
   });
 });

@@ -27,6 +27,7 @@ import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
 import {
   federatedSearchScope,
+  parseSourceIdParam,
   resolvePerCallMode,
   stampDeepResearchIds,
   stampEvidenceSafe,
@@ -140,10 +141,36 @@ const search: Operation = {
     limit: { type: 'number', description: 'Max results (default 20)' },
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
     mode: { type: 'string', description: 'Search mode (conservative|balanced|tokenmax). Local callers only.' },
+    // #4398: per-call source scope, mirroring `query` — MCP clients passed it
+    // here, got 'unknown parameter ignored', and read UNSCOPED results.
+    source_id: {
+      type: 'string',
+      description:
+        "Scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile); when unset, an unqualified read spans every federated source. Pass '__all__' to span every source for trusted local callers; for remote callers '__all__' spans only your granted sources.",
+    },
     // #3985: multi-type filter (plumbing shipped v0.33; exposed here).
     types: { type: 'array', items: { type: 'string' }, description: TYPES_PARAM_DESCRIPTION },
     // #3800: subagent token economy — per-call snippet cap.
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
+    // #4415: explicit ranking-axis overrides (the same knobs `query` has had
+    // since v0.29.1). The auto-detect banks are English regex, so on a
+    // non-English brain the recency/salience stages never fire — these flags
+    // (CLI: --salience / --recency) are the per-call override; the
+    // search.intent_patterns config is the per-brain fix.
+    salience: {
+      type: 'string',
+      enum: ['off', 'on', 'strong'],
+      description:
+        "Salience boost (emotional_weight + take_count, no time component): 'off' | 'on' | 'strong'. " +
+        'Omit and gbrain auto-detects from query text. Independent of `recency`.',
+    },
+    recency: {
+      type: 'string',
+      enum: ['off', 'on', 'strong'],
+      description:
+        "Recency boost (per-prefix age decay, no mattering signal): 'off' | 'on' | 'strong'. " +
+        'Omit and gbrain auto-detects. Independent of `salience`. Ignored on the keyword-only opt-out path.',
+    },
   },
   handler: async (ctx, p) => {
     const startedAt = Date.now();
@@ -154,8 +181,13 @@ const search: Operation = {
     const types = normalizeTypesParam(p.types);
     // #3800: snippet cap (param > subagent config default > full text).
     const snippetCap = await resolveSnippetCap(ctx, p);
-    // #2561: unqualified trusted-local search spans federated sources.
-    const scope = federatedSearchScope(ctx);
+    // #4398: explicit per-call source_id wins over ctx.sourceId, validated
+    // (invalid ids throw invalid_params) then resolved through the single
+    // trust+grant resolver (resolveRequestedScope inside federatedSearchScope)
+    // — out-of-grant ids throw permission_denied, and #2561's unqualified
+    // trusted-local federated span is unchanged.
+    const sourceIdParam = parseSourceIdParam(p.source_id, 'search', { allowAll: true });
+    const scope = federatedSearchScope(ctx, sourceIdParam);
     // #4352 — untrusted callers never see `visibility: private` pages
     // (config-gated; trusted local CLI unchanged).
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
@@ -204,6 +236,9 @@ const search: Operation = {
       ...(types ? { types } : {}),
       ...scope,
       ...(perCallMode ? { mode: perCallMode } : {}),
+      // #4415: agent-explicit recency + salience (same posture as `query`).
+      salience: p.salience as 'off' | 'on' | 'strong' | undefined,
+      recency: p.recency as 'off' | 'on' | 'strong' | undefined,
       onMeta: (m) => { capturedMeta = m; },
     });
     stampDeepResearchIds(results);
@@ -233,7 +268,22 @@ const query: Operation = {
      *  CLI loads the file, base64-encodes, and passes through `image`). */
     image: { type: 'string', description: 'Base64-encoded image bytes for image-similarity search (CLI: --image <path>).' },
     image_mime: { type: 'string', description: 'MIME type for the image bytes (auto-derived from path on CLI; required when calling op directly).' },
-    limit: { type: 'number', description: 'Max results (default 20)' },
+    // #4356 — the text/hybrid path no longer hard-defaults this to 20; an
+    // omitted OR falsy (0) `limit` resolves from the active search mode's
+    // searchLimit (10/25/50 for conservative/balanced/tokenmax by default,
+    // overridable via the `search.searchLimit` config key — see mode.ts
+    // `pick()`). 0 is treated as "unset" rather than "return zero rows",
+    // matching the existing convention on every other limit surface with
+    // this same shape (`search`'s own limit below, and the image-
+    // similarity branch below it) — none of which support a literal
+    // empty-result request today; introducing that only here would be a
+    // new, undocumented asymmetry rather than a limit-consistency fix.
+    // (`search_by_image`, a separate op in src/core/ops/image.ts, has the
+    // same convention but isn't "in this file".) The image-similarity path
+    // (`image` param) is unaffected by this change and still hard-defaults
+    // to 20 regardless of mode — out of scope here, tracked separately
+    // (#4356 Problem 2).
+    limit: { type: 'number', description: 'Max results. For text queries, omitted or 0 resolves from the active search mode (10 conservative / 25 balanced / 50 tokenmax by default, or the configured `search.searchLimit` override). For image-similarity queries (`image` param), always defaults to 20 regardless of mode.' },
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
     // #3985: multi-type filter (plumbing shipped v0.33; exposed here).
     types: { type: 'array', items: { type: 'string' }, description: TYPES_PARAM_DESCRIPTION },
@@ -282,7 +332,7 @@ const query: Operation = {
     source_id: {
       type: 'string',
       description:
-        "v0.34: scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile). Pass '__all__' to span every source for trusted local callers; for remote callers '__all__' spans only your granted sources.",
+        "v0.34: scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile). Pass '__all__' to span every source for trusted local callers. For remote callers, '__all__' uses the same scope as omission: an OAuth grant when present, otherwise the transport-computed federated sources for grantless local stdio.",
     },
     cross_modal: {
       type: 'string',
@@ -399,7 +449,15 @@ const query: Operation = {
     // Plain hybridSearch remains the bare API for callers that opt out.
     // (#1663: `let` — the CRAG gate below may swap in an escalated run.)
     let results = await hybridSearchCached(ctx.engine, queryText, {
-      limit: (p.limit as number) || 20,
+      // #4356 — was a hard `|| 20`, independent of the mode-resolution
+      // hybridSearchCached applies when `limit` is falsy (undefined OR 0):
+      // `opts?.limit || resolvedMode.searchLimit` (hybrid.ts). Passing
+      // `undefined` through instead of hard-defaulting to 20 lets that
+      // resolution apply (10/25/50 for conservative/balanced/tokenmax).
+      // `(p.limit as number) || undefined` keeps 0 in that same "unset"
+      // bucket rather than requesting a literal empty result — see the
+      // `limit` param description above for why.
+      limit: (p.limit as number) || undefined,
       offset: (p.offset as number) || 0,
       excludePrivate,
       expansion: expand,

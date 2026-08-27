@@ -813,6 +813,15 @@ test('every CREATE INDEX column in PGLITE_SCHEMA_SQL is covered by CREATE TABLE 
 // ─────────────────────────────────────────────────────────────────
 
 const COLUMN_EXEMPTIONS = new Set<string>([
+  // takes.embedding: the takes table is migration-only (no CREATE TABLE in
+  // PGLITE_SCHEMA_SQL / src/schema.sql), so there is no schema-blob forward
+  // reference for the bootstrap to trip on. The column is created inline in
+  // the takes CREATE TABLE and re-created by migration v126's handler with
+  // the CONFIGURED embedding dimension (dynamic width — cannot be a static
+  // blob column), and idx_takes_embedding_hnsw is created in the same
+  // migration block. Fresh installs and upgrades both get the column + index
+  // from the migration chain, never from the bootstrap.
+  'takes.embedding',
   // T7 — search_telemetry rank-1 drift columns (migration v111). search_telemetry
   // is created entirely by migration v57 (not in the schema blob), so the v57+v111
   // chain handles fresh + upgrade; no CREATE INDEX references these columns, so
@@ -922,6 +931,14 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'dream_verdicts.entities',
   'dream_verdicts.model',
   'dream_verdicts.triage_version',
+  // #4482 (migration v141) — expected-limit stop counter. Same precedent as
+  // query_cache.knobs_hash et al: extract_rollup_7d is migration-created
+  // (v106, absent from PGLITE_SCHEMA_SQL), so no schema-blob forward
+  // reference can exist; no index references the column; and both consumers
+  // handle absence explicitly (the rollup writer retries the pre-v141
+  // statement shape, doctor's extract_health falls back to a 0-column
+  // query). Column-only, no bootstrap probe needed.
+  'extract_rollup_7d.expected_limit_count',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {
@@ -1050,7 +1067,10 @@ test('extractAlterAddColumnsFromSql handles representative migration SQL shapes'
 test('postgres-engine.ts bootstrap carries the private-queue ALTERs and probes (guard symmetry with pglite-engine.ts)', async () => {
   const { readFileSync } = await import('fs');
   const { resolve: resolvePath } = await import('path');
-  const enginePath = resolvePath(process.cwd(), 'src/core/postgres-engine.ts');
+  // #4477 peeled the Postgres forward-reference bootstrap out of the
+  // postgres-engine.ts façade into its module dir; the guard follows the
+  // block to its current home.
+  const enginePath = resolvePath(process.cwd(), 'src/core/postgres-engine/forward-reference-bootstrap.ts');
   const engineSrc = readFileSync(enginePath, 'utf-8');
   const normalized = engineSrc.replace(/\s+/g, ' ');
 

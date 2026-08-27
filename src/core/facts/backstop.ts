@@ -358,10 +358,8 @@ export async function runFactsBackstop(
       try {
         await runPipeline(parsedPage, ctx, signal);
       } catch (err) {
-        const { classifyFactsAbsorbError, writeFactsAbsorbLog } = await import('./absorb-log.ts');
-        const reason = classifyFactsAbsorbError(err);
-        const msg = err instanceof Error ? err.message : String(err);
-        await writeFactsAbsorbLog(ctx.engine, parsedPage.slug, reason, msg, ctx.sourceId);
+        const { writeFactsAbsorbFailure } = await import('./absorb-log.ts');
+        await writeFactsAbsorbFailure(ctx.engine, parsedPage.slug, err, ctx.sourceId);
       }
     }, ctx.sessionId ?? parsedPage.slug);
 
@@ -499,6 +497,29 @@ async function runPipelineWithBody(
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
 ): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
+  // #4210: outside a withBudgetTracker scope (extract_facts op, sweep,
+  // put_page backstop, checkpoint harvest, file/code import) the gateway's
+  // chat/embed calls were budget no-ops — real spend, zero audit rows.
+  // Install a record-only fallback tracker labeled by the entry point so
+  // every pipeline invocation is visible to accounting. Uncapped, so it can
+  // never throw BudgetExhausted (cost/runtime gates need a cap); the
+  // pipeline's failure surface is unchanged. An ambient tracker (cycle
+  // phases, transcripts ingest) wins — no double scope, labels preserved.
+  const { getCurrentBudgetTracker, withBudgetTracker } = await import('../ai/gateway.ts');
+  if (!getCurrentBudgetTracker()) {
+    const { BudgetTracker } = await import('../budget/budget-tracker.ts');
+    const fallback = new BudgetTracker({ label: `facts:${ctx.source}` });
+    return withBudgetTracker(fallback, () => runPipelineBodyInner(input, ctx, abortSignal));
+  }
+  return runPipelineBodyInner(input, ctx, abortSignal);
+}
+
+/** The actual pipeline body — always runs inside a BudgetTracker scope (#4210). */
+async function runPipelineBodyInner(
+  input: { turnText: string; isDreamGenerated: boolean; ref?: string },
+  ctx: FactsBackstopCtx,
+  abortSignal?: AbortSignal,
+): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
   const { extractFactsFromTurnWithOutcome, FactsExtractionError } = await import('./extract.ts');
   const { resolveEntitySlug } = await import('../entities/resolve.ts');
   const { cosineSimilarity } = await import('./classify.ts');
@@ -508,6 +529,10 @@ async function runPipelineWithBody(
     return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], entity_slugs: [] };
   }
 
+  const filter = ctx.notabilityFilter ?? 'all';
+  const notabilityAdmission = filter === 'high-only'
+    ? { allowed: ['high'] as const, invalid: 'drop' as const }
+    : undefined;
   const outcome = await extractFactsFromTurnWithOutcome({
     turnText: input.turnText,
     sessionId: ctx.sessionId,
@@ -517,6 +542,7 @@ async function runPipelineWithBody(
     engine: ctx.engine,
     abortSignal,
     model: ctx.model,
+    notabilityAdmission,
   });
 
   if (!outcome.ok) {
@@ -543,7 +569,6 @@ async function runPipelineWithBody(
 
   const facts = outcome.facts;
 
-  const filter = ctx.notabilityFilter ?? 'all';
   // [ENG-8] Explicit ctx.visibility wins; unset resolves the operator-set
   // facts.default_visibility (fail-closed to 'private').
   const { resolveDefaultVisibility } = await import('./visibility.ts');
@@ -641,10 +666,16 @@ async function runPipelineWithBody(
   const legacyBucket: SurvivedFact[] = [];
   if (localPath === null) {
     if (!writeThroughDisabled) {
+      // #4489: name the REAL remedy. The sources dispatcher has no
+      // "update" verb — attaching a working tree to a path-less source goes
+      // through `gbrain sources add <id> --path <dir>` (the #3903
+      // non-destructive attach path in sources-ops.ts). Pinned by
+      // test/facts-backstop-remedy-verb.test.ts.
       warnOnce(
         'facts:thin-client-fallback',
         '[facts] sources.local_path unset for source_id=' + ctx.sourceId +
-        ' — falling through to DB-only inserts. Configure local_path via `gbrain sources update` to enable system-of-record fence writes.',
+        ' — falling through to DB-only inserts. Attach a working tree via `gbrain sources add ' + ctx.sourceId +
+        ' --path <dir>` to enable system-of-record fence writes.',
       );
     }
     for (const s of survived) legacyBucket.push(s);

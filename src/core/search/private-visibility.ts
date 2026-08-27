@@ -143,3 +143,65 @@ export async function resolveExcludePrivatePages(
   }
   return !expose;
 }
+
+/**
+ * KEEP-list inverse of findPrivateOnlySlugs: of the given slugs, which have
+ * at least one world-visible page row (deleted rows considered — see
+ * findWorldVisibleSlugs' consumers for why)? Fail-closed by construction: a
+ * slug with NO page row at all (e.g. hard-purged between a caller's list
+ * read and this probe) is simply absent from the keep-set, so a
+ * keep-list consumer drops it instead of serving it — the drop-list shape
+ * fails OPEN on exactly that TOCTOU window.
+ */
+export async function findWorldVisibleSlugs(
+  engine: BrainEngine,
+  slugs: string[],
+  scope: { sourceId?: string; sourceIds?: string[] } = {},
+): Promise<Set<string>> {
+  if (slugs.length === 0) return new Set();
+  const params: unknown[] = [slugs];
+  let scopeClause = '';
+  if (scope.sourceIds && scope.sourceIds.length > 0) {
+    params.push(scope.sourceIds);
+    scopeClause = `AND p.source_id = ANY($${params.length}::text[])`;
+  } else if (scope.sourceId) {
+    params.push(scope.sourceId);
+    scopeClause = `AND p.source_id = $${params.length}`;
+  }
+  const rows = await engine.executeRaw<{ slug: string }>(
+    `SELECT p.slug FROM pages p
+      WHERE p.slug = ANY($1::text[])
+        ${scopeClause}
+      GROUP BY p.slug
+      HAVING bool_or(${privatePagesFilterFragment('p')})`,
+    params,
+  );
+  return new Set(rows.map(r => r.slug));
+}
+
+/**
+ * Shared post-filter for list-shaped read ops (find_orphans,
+ * get_recent_salience, find_experts): one gate read + one batched KEEP-list
+ * probe, keeping only rows whose slug has a world-visible page row.
+ *
+ * Deleted rows are considered by the probe on purpose: some callers' raw
+ * list queries carry no `deleted_at` predicate, so a soft-deleted private
+ * page can still be IN the rows — a live-rows-only probe would never see
+ * it and the filter would fail open (same fail-closed reasoning as
+ * slugHiddenFromCaller above). And the keep-list shape means a slug whose
+ * page row vanished entirely (concurrent purge) drops out too, instead of
+ * being served because "no row" looked like "not private".
+ */
+export async function dropPrivateOnlyRows<T>(
+  engine: BrainEngine,
+  remote: boolean | undefined,
+  rows: T[],
+  slugOf: (row: T) => string,
+  scope: { sourceId?: string; sourceIds?: string[] } = {},
+): Promise<T[]> {
+  if (rows.length === 0) return rows;
+  if (!(await resolveExcludePrivatePages(engine, remote))) return rows;
+  const keep = await findWorldVisibleSlugs(engine, rows.map(slugOf), scope);
+  if (keep.size === rows.length) return rows;
+  return rows.filter(r => keep.has(slugOf(r)));
+}
