@@ -2916,14 +2916,13 @@ export async function buildChecks(
     const _cfg = _loadCfg();
     const bytesBlock = _cfg?.content_sanity?.bytes_block ?? 500_000;
     // #1871: engine.executeRaw, not the dead-on-PGLite postgres singleton.
-    // Local policy keeps intentionally non-embedded pages out of the oversize warning.
     const rows = await engine.executeRaw<{ slug: string; source_id: string; bytes: number }>(
       `SELECT p.slug, p.source_id,
               octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, '')) AS bytes
        FROM pages p
        WHERE p.deleted_at IS NULL
-        AND ${EMBED_SKIP_FILTER_FRAGMENT}
-        AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) > $1
+         AND ${EMBED_SKIP_FILTER_FRAGMENT}
+         AND (octet_length(p.compiled_truth) + octet_length(COALESCE(p.timeline, ''))) > $1
        ORDER BY bytes DESC
        LIMIT 100`,
       [bytesBlock],

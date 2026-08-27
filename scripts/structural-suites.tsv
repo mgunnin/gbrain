@@ -33,7 +33,7 @@ test/bootstrap-opencode-door.serial.test.ts	opencode door — rendered AGENTS.md
 test/brain-repo-durability.serial.test.ts	hardenBrainRepo	16	readFileSync
 test/brain-score-breakdown.test.ts	Bug 11 — BrainHealth type shape	1	bun-file
 test/brain-score-breakdown.test.ts	Bug 11 — doctor renders brain_score breakdown	1	doctor-source-helper
-test/brain-score-breakdown.test.ts	Bug 11 — orphan_pages is "no inbound links"	3	doctor-source-helper
+test/brain-score-breakdown.test.ts	Bug 11 — orphan_pages is "no inbound links"	4	doctor-source-helper
 test/brain-score-breakdown.test.ts	linkable scope — archive pages do not drag the score	3	doctor-source-helper
 test/brainstorm-timeout.test.ts	orchestrator entry-point wrap (CV11 single-point classification)	2	bun-file
 test/build-llms.test.ts	CLAUDE.md restructure content contracts	5	readFileSync
