@@ -420,7 +420,12 @@ export async function listStaleTakes(deps: PgTakesDeps): Promise<StaleTakeRow[]>
       ORDER BY t.id
       LIMIT 100000
     `;
-    return rows as unknown as StaleTakeRow[];
+    return rows.map((row) => ({
+      take_id: Number(row.take_id),
+      page_slug: String(row.page_slug),
+      row_num: Number(row.row_num),
+      claim: String(row.claim),
+    }));
   }
 
 export async function updateTakeEmbeddings(
