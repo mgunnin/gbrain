@@ -44,6 +44,18 @@ export function isSensitiveConfigKey(key: string): boolean {
  * Keep in sync with the `envFromConfig` mappings in
  * src/core/ai/build-gateway-config.ts.
  */
+/** Dotted keys that are FILE-plane canonical (nested under a group in
+ * ~/.gbrain/config.json) — read by engine-free processes via
+ * loadConfigFileOnly. ONE list for both the `set` and `unset` lanes so the
+ * next key cannot be added to only one branch (which would silently route
+ * `unset` to the DB plane). */
+const FILE_PLANE_DOTTED_KEYS: ReadonlySet<string> = new Set([
+  'push.allow_unverified_remote',
+  'hooks.stop_push_debounce_min',
+  'backup.check_enabled',
+  'backup.check_interval_days',
+]);
+
 export const FILE_PLANE_API_KEYS: readonly string[] = [
   'openai_api_key',
   'anthropic_api_key',
@@ -121,10 +133,10 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       console.error('Usage: gbrain config unset <key> | --pattern <prefix>');
       process.exit(1);
     }
-    if (key === 'push.allow_unverified_remote' || key === 'hooks.stop_push_debounce_min') {
+    if (FILE_PLANE_DOTTED_KEYS.has(key)) {
       const { loadConfigFileOnly, saveConfig } = await import('../core/config.ts');
       const cfg = loadConfigFileOnly();
-      const [top, leaf] = key.split('.') as ['push' | 'hooks', string];
+      const [top, leaf] = key.split('.') as ['push' | 'hooks' | 'backup', string];
       const branch = cfg?.[top] as Record<string, unknown> | undefined;
       if (cfg && branch && leaf in branch) {
         delete branch[leaf];
@@ -222,7 +234,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     // `sources push` child) via loadConfigFileOnly, which never sees the DB
     // plane — and the DB plane is unreadable anyway while a `gbrain serve`
     // holds the single-writer lock. Route them to ~/.gbrain/config.json.
-    if (key === 'push.allow_unverified_remote' || key === 'hooks.stop_push_debounce_min') {
+    if (FILE_PLANE_DOTTED_KEYS.has(key)) {
       const { loadConfigFileOnly, saveConfig, isConfigTruthy } = await import('../core/config.ts');
       const cfg = (loadConfigFileOnly() ?? { engine: 'pglite' }) as Parameters<typeof saveConfig>[0];
       if (key === 'push.allow_unverified_remote') {
@@ -237,6 +249,20 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
               'gbrain config set push.allow_unverified_remote false',
           );
         }
+      } else if (key === 'backup.check_enabled') {
+        const on = isConfigTruthy(value);
+        cfg.backup = { ...(cfg.backup ?? {}), check_enabled: on };
+        saveConfig(cfg);
+        console.log(`Set ${key} = ${on} (file plane: ~/.gbrain/config.json)`);
+      } else if (key === 'backup.check_interval_days') {
+        const n = Number.parseInt(value, 10);
+        if (!Number.isFinite(n) || n < 1) {
+          console.error(`[config] ${key} must be an integer >= 1 (days between automatic backup checks)`);
+          process.exit(1);
+        }
+        cfg.backup = { ...(cfg.backup ?? {}), check_interval_days: n };
+        saveConfig(cfg);
+        console.log(`Set ${key} = ${n} (file plane: ~/.gbrain/config.json)`);
       } else {
         const n = Number.parseInt(value, 10);
         if (!Number.isFinite(n) || n < 0) {

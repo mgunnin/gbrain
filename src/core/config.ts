@@ -33,6 +33,9 @@ export interface GBrainConfig {
    * `gbrain config set` routes these two dotted keys here, not to the DB. */
   push?: { allow_unverified_remote?: boolean };
   hooks?: { stop_push_debounce_min?: number | string };
+  /** Monthly backup-coverage check (src/core/backup/). File-plane: read by
+   * engine-free render sites (hook children, the cli.ts startup rail). */
+  backup?: { check_enabled?: boolean | string; check_interval_days?: number | string };
   database_url?: string;
   database_path?: string;
   openai_api_key?: string;
@@ -1155,6 +1158,11 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // `config set` — engine-free hook/push children read loadConfigFileOnly).
   'push.allow_unverified_remote',
   'hooks.stop_push_debounce_min',
+  // File-plane backup-check keys (routed to ~/.gbrain/config.json by `config
+  // set` — the engine-free render sites read loadConfigFileOnly). Default ON /
+  // 30 days; interval clamps to >=1 day at read time (backup/status-file.ts).
+  'backup.check_enabled',
+  'backup.check_interval_days',
   // DB-plane (v0.32.3 search modes + related)
   'search.mode',
   'search.cache.enabled',

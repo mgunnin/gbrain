@@ -21,12 +21,59 @@ import {
   buildUnknownParamWarnBlock,
   resolveStrictParamsMode,
 } from './validate-params.ts';
+import { backupCheckDisabled, backupNagGate, backupNoticeText, loadBackupStatus } from '../core/backup/status-file.ts';
+import { maybeRefreshBackupStatusInProcess } from '../core/backup/coverage.ts';
 
 // WP3: normalization + validation moved to validate-params.ts (direct unit
 // surface). Re-exported here so existing imports/tests keep working.
 export { normalizeOptionalParams, validateParams } from './validate-params.ts';
 
 const VERB_NAME_SET: ReadonlySet<string> = new Set(VERB_NAMES);
+
+// ── monthly backup-coverage notice (once per process, agent-facing only) ────
+
+let backupNoticeShown = false;
+let backupNoticeCheckedMs = 0;
+
+/** Test seam: re-arm the once-per-process backup notice. */
+export function __resetBackupNoticeForTests(): void {
+  backupNoticeShown = false;
+  backupNoticeCheckedMs = 0;
+}
+
+/**
+ * Attach the aggregate backup warning as an extra content block. Fail-open:
+ * a notice bug must never break a tool call.
+ *
+ * STDIO transport only: the notice targets local-harness installs (Claude
+ * Code/Codex/OpenClaw/plugin serves are all stdio). HTTP callers are remote
+ * thin clients — the host's backup posture is operational metadata their
+ * token scope doesn't grant (the mcp.publish_advisor discipline), and a
+ * remote-triggered record() must not spend the LOCAL notice budget. Local CLI
+ * callers (`gbrain call`, opts.remote === false) are excluded too — the
+ * cli.ts startup rail owns that surface. The hourly recheck latch keeps the
+ * healthy steady state at zero file reads per tool call.
+ */
+function maybeAttachBackupNotice(out: ToolResult, opts: DispatchOpts): void {
+  try {
+    if (backupNoticeShown || opts.remote === false || opts.transport !== 'stdio') return;
+    const now = Date.now();
+    if (now - backupNoticeCheckedMs < 60 * 60 * 1000) return;
+    backupNoticeCheckedMs = now;
+    if (backupCheckDisabled()) return;
+    const s = loadBackupStatus();
+    if (!s || s.overall !== 'warn') return;
+    const gate = backupNagGate('mcp', s);
+    if (!gate.show) return;
+    const text = backupNoticeText(s, 'aggregate');
+    if (!text) return;
+    out.content.push({ type: 'text', text });
+    backupNoticeShown = true;
+    gate.record();
+  } catch {
+    /* never break dispatch over a notice */
+  }
+}
 
 export interface ToolResult {
   content: { type: 'text'; text: string }[];
@@ -609,6 +656,15 @@ export async function dispatchToolCall(
     // (old thin-clients read content[0] only — skew-safe).
     if (unknownParamWarnings.length > 0) {
       out.content.push({ type: 'text', text: buildUnknownParamWarnBlock(unknownParamWarnings) });
+    }
+    // Monthly backup-coverage: one AGGREGATE model-visible block per process
+    // (counts only — never a local path or source id), riding the same
+    // extra-block mechanism (content[0] untouched, D3/D8 skew rule). The
+    // refresher runs on the stdio transport ONLY — the WP1/D7 locality axis
+    // localOnly ops use; 'http' or an UNSET marker never probes (fail-closed).
+    maybeAttachBackupNotice(out, opts);
+    if (opts.transport === 'stdio') {
+      maybeRefreshBackupStatusInProcess(engine);
     }
     // _meta assembly (WP2 amendment 9): one producer per top-level key,
     // each isolated — handler-emitted keys (retrieval, warnings) attach

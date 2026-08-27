@@ -77,7 +77,9 @@ export const CLI_ONLY = new Set(['init', 'reinit-pglite', 'pglite-repair', 'upgr
 // are ENGINE-FREE (dispatched in handleCliOnly before the connectEngine
 // terminator) and must NEVER enter THIN_CLIENT_REFUSED_COMMANDS. `sweep` is
 // the trusted local sweep entry [CX2-5] and needs the engine (switch case).
-'bootstrap', 'hook', 'sweep']);
+'bootstrap', 'hook', 'sweep',
+// Monthly backup-coverage check (engine via thunk — pre-engine branch, lock-safe).
+'backup']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -168,6 +170,9 @@ const CLI_ONLY_SELF_HELP = new Set([
   // would leave that help dead code behind the generic stub (the init.ts:117
   // trap ENG-2 names).
   'bootstrap', 'hook', 'sweep',
+  // backup ships its own HELP (runBackupCli guard, engine-free — the command
+  // dispatches in the pre-engine lane, so help never touches the PGLite lock).
+  'backup',
   // cathedral-4: transcripts ships its own HELP (the ingest import lane +
   // the v0.29 recent reader). Without this the generic stub hides both.
   'transcripts',
@@ -447,6 +452,13 @@ async function main() {
   // only, fail-open, never blocks. Skips the update path's own commands + sets
   // GBRAIN_SKIP_STARTUP_HOOKS for their children. Runs for every real command.
   maybeEmitUpdateMarker(command);
+
+  // Monthly backup-coverage nag (cache-read-only, bounded by the nag gate;
+  // guards + skip set live inside the helper — one place, every call site).
+  {
+    const { maybeEmitBackupNag } = await import('./core/backup/status-file.ts');
+    maybeEmitBackupNag(command, { quiet: getCliOptions().quiet === true });
+  }
 
   const subArgs = args.slice(1);
 
@@ -2083,6 +2095,14 @@ async function handleCliOnly(command: string, args: string[]) {
     // lives inside runHook.
     const { runHook } = await import('./commands/hook.ts');
     setCliExitVerdict(await runHook(args));
+    return;
+  }
+  if (command === 'backup') {
+    // Monthly backup-coverage check. Engine via thunk: a serve-held PGLite
+    // lock degrades to the cached verdict inside runBackupCli instead of a
+    // connectEngine crash (the primary cohort runs a long-lived stdio serve).
+    const { runBackupCli } = await import('./commands/backup.ts');
+    setCliExitVerdict((await runBackupCli(args, () => connectEngine())).exitCode);
     return;
   }
   if (command === 'sweep' && (args.includes('--help') || args.includes('-h'))) {

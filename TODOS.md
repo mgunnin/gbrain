@@ -1,5 +1,19 @@
 # TODOS
 
+## v0.46.32.0 post-release doc audit follow-ups (filed 2026-08-26)
+
+- [ ] **P2 — `gbrain import --include-hidden` is accepted but silently ignored.**
+  **What:** either parse `--include-hidden` in the import CLI and thread it into
+  `collectSyncableFiles` (which already takes `includeHidden` — the sync path uses
+  it), or drop the flag from import's registry surface. **Why:** the generated
+  flag registry lists the flag for `import`, so the CLI accepts it without effect
+  — a user waiving a dot-directory on a one-shot import gets silent exclusion,
+  the exact silent-kill class #4027 fixed for sync. **Context:** found by the
+  v0.46.32.0 cross-model doc review (follow-up from v0.46.32.0);
+  `src/commands/import.ts` never reads the flag, `src/cli.ts` passes bare args to
+  `runImport`; the library plumbing is done, only arg parsing + one test are
+  missing. **Depends on:** nothing.
+
 ## Daemon env-file lane follow-ups (#2608 / #4443 takeover, filed 2026-08-21)
 
 - [ ] **P3 — Fix the stale `config set` DB-plane claim in the install docs.**
@@ -2217,6 +2231,48 @@ job) and sync. See CLAUDE.md "Pace Mode".
   `embed --stale --pace --progress-json` caps concurrency + emits telemetry;
   single-flight rejects a 2nd concurrent run; lock heartbeat advances during a
   paced sleep (short-TTL). Unit coverage (`db-pacer`/`pace-mode`) already ships.
+## monthly backup-check follow-ups (filed with the backup-coverage feature)
+
+- [ ] **P2 — Opt-in network push-probe for the backup check (`gbrain backup check --probe`).**
+  **What:** authed `pushProbe` (`src/core/git-remote.ts:598`) per asset proving the remote
+  is actually PUSHABLE, with TTL-cached verdicts (the `repo-visibility.ts` 1h-cache idiom).
+  **Why:** "has origin" doesn't prove "can push" — a revoked PAT or protected branch passes
+  today's local-only check while the backup silently rots. **Pros:** turns the verdict from
+  "configured" into "verified". **Cons:** network + auth in a check that is deliberately
+  offline today; must stay opt-in. **Context:** v1 holds the no-network line by design; the
+  seam is `BackupCoverageOpts` in `src/core/backup/coverage.ts` (add a `probe` flag beside
+  `localGitProbes`). Effort: M → S with CC. Depends on: the backup-check feature (landed).
+- [ ] **P2 — Codex/opencode hook lanes for parity with Claude Code.**
+  **What:** flip `CODEX_HAS_HOOKS`/`OPENCODE_HAS_HOOKS` (`src/core/bootstrap/host-specs.ts:341/:421`)
+  and wire `gbrain hook` into codex 0.147+'s hooks.json so those harnesses get the
+  session-start digest + banner rail. **Why:** today their only backup-notice reach is the
+  MCP aggregate block + CLI stderr; Claude Code users get a human-visible systemMessage.
+  **Pros:** closes the harness-reach gap for every hook-borne notice, not just backup.
+  **Cons:** new host-integration surface to maintain per harness release. **Context:** the
+  backup check's render channels are already shaped for it — a codex hook lane would reuse
+  `backupSessionStartNote`/`pendingBackupBanner` unchanged. Effort: L → M with CC.
+- [ ] **P3 — Neutralize repo-local git config execution vectors in the read-only probe env.**
+  **What:** add `-c core.fsmonitor= -c core.hooksPath=` (and consider `core.sshCommand`) to the
+  read-only git probe invocations (`GIT_ENV` / `buildGitInvocation` consumers: `hasOriginRemote`,
+  `isWorkingTreeDirty`, `detectDefaultBranch`, `aheadCount`, the backup-coverage probes).
+  **Why:** `git status` honors `core.fsmonitor` from the TARGET repo's own `.git/config`; the
+  backup check now runs probes automatically and periodically across every source root, so a
+  hostile config planted inside any registered tree executes monthly without user action.
+  **Cons:** touches every existing git caller (sync, doctor, durability) — needs its own test
+  sweep; exploiting already requires local write access (D4 holds), so this is defense-in-depth.
+  **Where to start:** `src/core/git-remote.ts:GIT_ENV` + `src/core/sync-git.ts:buildGitInvocation`.
+- [ ] **P3 — Notice-center rail: one cross-feature nag system.**
+  **What:** extract a shared notice rail (per-channel nag state, dampening, render
+  adapters) and migrate the backup nag, the push-failure banner (`hook.ts`
+  `pendingPushFailureBanner` + `.announced` sidecars), and the upgrade nag
+  (`self-upgrade.ts` snooze) onto it. **Why:** three parallel nag systems with three state
+  formats is debt; every new periodic notice re-invents cadence + budget logic. **Pros:**
+  one budget across ALL notices (no cross-feature nag pileups); one place to test.
+  **Cons:** touches load-bearing hook code; needs migration for existing state files.
+  **Context:** `src/core/backup/status-file.ts`'s gate (per-channel entries + dampener +
+  global monthly cap, enforced uniformly in `record()`) is deliberately shaped as the seed.
+  Effort: M-L. Blocked by: the backup-check feature shipping first.
+
 ## brain-repo durability follow-ups (filed v0.42.48.0)
 
 - [ ] **P3 — gbrain write-path calls commit-push synchronously when durability is on.**

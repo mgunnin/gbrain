@@ -5022,6 +5022,8 @@ See also:
     // v0.42.7 (#1696): brain-wide extraction-lag nudge after the --all wave.
     // Best-effort, stderr-only; skipped on dry-run.
     if (!dryRun) await maybeExtractionNudge(engine);
+    // Monthly backup-coverage stale-only refresh (trusted local engine holder).
+    if (!dryRun) await maybeBackupCoverageRefresh(engine);
 
     // #3068: any source wedged on a failed pull (partial/pull_failed) makes
     // the whole --all run non-zero — it will not self-heal on retry, so a
@@ -5137,6 +5139,10 @@ See also:
     // — NOT just 'synced'; a fresh/--full import (`first_sync`) is the biggest
     // un-extracted backlog. Scoped to this source; best-effort, stderr-only.
     if (shouldNudgeAfterSync(result.status)) await maybeExtractionNudge(engine, sourceId);
+    // Monthly backup-coverage: the sync CLI legitimately holds the engine
+    // (trusted local), so the stale-only compute piggybacks here — covering
+    // active CLI users without any serve involvement. Dry-run stays pure.
+    if (result.status !== 'dry_run') await maybeBackupCoverageRefresh(engine);
     // Issue #2 + eng-review pass-2 finding #1 + Codex P1: manage .gitignore ONLY
     // on successful sync. Skip on dry-run (don't mutate disk in preview mode)
     // and blocked_by_failures (sync state is inconsistent — defer .gitignore
@@ -5542,6 +5548,25 @@ export function manageGitignore(
       `Could not update ${gitignorePath} (${error instanceof Error ? error.message : String(error)}) — ` +
         `please add db_only directories manually:\n  ${linesToAdd.join('\n  ')}`,
     );
+  }
+}
+
+/**
+ * Post-sync backup-coverage refresh (monthly, stale-only). The sync CLI is a
+ * trusted local engine holder (D4), so the compute piggybacks here; the
+ * shared choke point (getBackupStatus) makes a fresh cache a no-op file read.
+ * Best-effort — never blocks or fails a sync.
+ */
+async function maybeBackupCoverageRefresh(engine: BrainEngine): Promise<void> {
+  try {
+    const { backupCheckDisabled, isBackupStatusStale, loadBackupStatus } = await import(
+      '../core/backup/status-file.ts'
+    );
+    if (backupCheckDisabled() || !isBackupStatusStale(loadBackupStatus())) return;
+    const { getBackupStatus } = await import('../core/backup/coverage.ts');
+    await getBackupStatus(engine, { localGitProbes: true, computedBy: 'sync' });
+  } catch {
+    /* best-effort — never block sync on it */
   }
 }
 
