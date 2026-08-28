@@ -40,6 +40,7 @@ import type { SyncManifest, SyncFailure } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { loadConfig } from '../core/config.ts';
+import { DB_ACCESS_MARKER_PREFIX, shouldEmitDbAccessMarker } from '../core/pg-access-classify.ts';
 import {
   autoConcurrency,
   shouldRunParallel,
@@ -1300,6 +1301,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         const cfg = parseGitHubSourceConfig(rawCfg, fallbackDir);
         return await runGitHubSync(engine, srcId, cfg, opts);
       }
+      // v0.47: google source kind (Gmail/Calendar/Contacts). Same shape as
+      // the github branch: API-backed materializer, standard import pipeline.
+      if (rawCfg.kind === 'google') {
+        serr(`[gbrain phase] sync.google_materialize`);
+        const { parseGoogleSourceConfig, runGoogleSync } = await import('../core/google/google-source.ts');
+        const { defaultCloneDir } = await import('../core/sources-ops.ts');
+        const fallbackDir = cfgRows[0].local_path ?? defaultCloneDir(`${srcId}-google`);
+        const cfg = parseGoogleSourceConfig(rawCfg, fallbackDir);
+        return await runGoogleSync(engine, srcId, cfg, opts);
+      }
       if (opts.githubItem) {
         throw new Error(
           `github_item refresh requires a github-kind source, but "${srcId}" is not github-kind.`,
@@ -2342,6 +2353,15 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] banked ${banked} file(s) this run; next 'gbrain sync' resumes from ` +
       `the checkpoint (last_commit unchanged at ${(lastCommit ?? '').slice(0, 8)}).`,
     );
+    // db-availability loop (4b): a dead checkpoint IS a DB-access failure by
+    // construction — the checkpoint writer only gives up after exhausting the
+    // retry-matcher's connection-class retries (#1794), so `conn_dropped` is
+    // asserted structurally, not parsed from an error. The marker lets the
+    // bundled skills/db-repair skill pick this up from an agent-run sync.
+    if (checkpointDead && shouldEmitDbAccessMarker()) {
+      serr(`${DB_ACCESS_MARKER_PREFIX} conn_dropped`);
+      serr('The sync checkpoint pool died mid-run. Run: gbrain db-repair');
+    }
     return buildPartialResult({
       fromCommit: lastCommit,
       toCommit: pin,
@@ -4463,9 +4483,10 @@ See also:
     // gbrain-sync:default — absent — printed "nothing to break", exit 0, and
     // left the dead holder's row on gbrain-sync:<src>; the follow-up sync
     // then refused for the 60s takeover grace. Resolve the SAME source the
-    // sync would lock.
+    // sync would lock. Explicit --source keeps the resolver-free path (no
+    // assertSourceExists) so leftover locks of deleted sources stay breakable.
     const { resolveSourceWithTier: resolveBreakSource } = await import('../core/source-resolver.ts');
-    const sourceId = (await resolveBreakSource(engine, sourceArg || null)).source_id;
+    const sourceId = sourceArg ?? (await resolveBreakSource(engine, null)).source_id;
     const lockKey = `gbrain-sync:${sourceId}`;
     const exit = await runBreakLock(engine, lockKey, sourceId, {
       force: forceBreakLock,

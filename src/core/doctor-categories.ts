@@ -174,6 +174,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'connection',
   'db_only_collector_collision',
   'federation_health',
+  'google_oauth',
   'home_dir_in_worktree',
   'index_audit',
   'npm_squat',
@@ -182,6 +183,9 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_clones',
   'pgbouncer_prepare',
   'pglite_data_dir',
+  // db-availability loop: engine-fit + repair-recurrence signals.
+  'pglite_scale',
+  'db_repair_recurrence',
   'pglite_leftovers',
   'pgvector',
   'plugin_lane_collision',

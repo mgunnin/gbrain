@@ -10,6 +10,10 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, enforceBoundClientOpAllowList } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
+import { classifyPgAccessError, formatDbAccessMarker, type PgAccessDiagnosis } from '../core/pg-access-classify.ts';
+import { resolveBrainId } from '../core/brain-resolver.ts';
+import { redactConnectionInfo } from '../core/audit/redact-connection-info.ts';
+import { redactUrlsInText } from '../core/url-redact.ts';
 import { VERB_NAMES, MEMORY_VERBS_VERSION } from '../core/verbs.ts';
 import { logVerbUsage } from '../core/verbs/usage-log.ts';
 import { sourceGuardBlocksWrite } from '../core/source-resolver.ts';
@@ -27,6 +31,34 @@ import { maybeRefreshBackupStatusInProcess } from '../core/backup/coverage.ts';
 // WP3: normalization + validation moved to validate-params.ts (direct unit
 // surface). Re-exported here so existing imports/tests keep working.
 export { normalizeOptionalParams, validateParams } from './validate-params.ts';
+
+// db-availability loop: the classifier only needs the CONFIGURED url as
+// context (supabase enrichment; fix derivation) plus the resolved brain id
+// (a MOUNT's failure must never read as a host failure — the id rides into
+// the marker). Read once per process — the uncaught-error path must not add
+// disk reads per failure, and serve's routing is fixed for its lifetime.
+let cachedClassifyUrl: string | null | undefined;
+function configuredDbUrlForClassify(): string | null {
+  if (cachedClassifyUrl === undefined) {
+    try {
+      cachedClassifyUrl = loadConfig()?.database_url ?? null;
+    } catch {
+      cachedClassifyUrl = null;
+    }
+  }
+  return cachedClassifyUrl;
+}
+let cachedClassifyBrainId: string | null | undefined;
+function brainIdForClassify(): string | undefined {
+  if (cachedClassifyBrainId === undefined) {
+    try {
+      cachedClassifyBrainId = resolveBrainId(null);
+    } catch {
+      cachedClassifyBrainId = null;
+    }
+  }
+  return cachedClassifyBrainId ?? undefined;
+}
 
 const VERB_NAME_SET: ReadonlySet<string> = new Set(VERB_NAMES);
 
@@ -698,15 +730,51 @@ export async function dispatchToolCall(
     // plain `Error: ${msg}` strings here, which broke any caller that
     // tried JSON.parse(content).
     const msg = e instanceof Error ? e.message : String(e);
+    // db-availability loop: raw pg errors used to land here VERBATIM —
+    // unredacted DSNs/hosts/IPs into agent transcripts, no remediation.
+    // Redact ALL branches; classify DB-access failures into an envelope the
+    // bundled skills/db-repair skill literal-matches (GBRAIN_DB_ACCESS).
+    // Both steps are wrapped: a classifier/redactor bug must degrade to the
+    // prior generic shape, never a worse error.
+    let redactedMsg = msg;
+    let dbDiag: PgAccessDiagnosis | null = null;
+    try {
+      redactedMsg = redactUrlsInText(redactConnectionInfo(msg));
+      const d = classifyPgAccessError(e, { url: configuredDbUrlForClassify(), brainId: brainIdForClassify() });
+      if (d.reason !== 'unknown') dbDiag = d;
+    } catch { /* fall through to the generic envelope */ }
+
+    if (dbDiag && dbDiag.reason === 'schema_missing') {
+      // Mid-operation relation/column errors are usually CODE SKEW, not an
+      // access failure (and connectEngine already runs pending migrations on
+      // every connect) — the withRelationGuard treatment, generalized. No
+      // db-repair marker from this layer; connect-time surfaces own that.
+      const suggestion = 'Run gbrain apply-migrations on the brain host, then retry.';
+      const envelope = isVerb
+        ? { error: 'unavailable', message: dbDiag.message, suggestion, detail: 'schema_missing', protocol_version: MEMORY_VERBS_VERSION }
+        : { error: 'unavailable', message: dbDiag.message, suggestion };
+      return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }], isError: true };
+    }
+
+    if (dbDiag) {
+      const suggestion = `${formatDbAccessMarker(dbDiag)}. ${dbDiag.remediation} Run: gbrain db-repair`;
+      // Verbs keep the FROZEN v1 code set ('unavailable' + reason in detail);
+      // non-verb ops get the first real use of the declared 'database_error'.
+      const envelope = isVerb
+        ? { error: 'unavailable', message: dbDiag.message, suggestion, detail: dbDiag.reason, protocol_version: MEMORY_VERBS_VERSION }
+        : { error: 'database_error', message: dbDiag.message, suggestion };
+      return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }], isError: true };
+    }
+
     // [c7] verbs speak the protocol envelope even for uncaught throws.
     const envelope = isVerb
       ? {
           error: 'internal',
-          message: msg,
+          message: redactedMsg,
           suggestion: 'This is a server-side failure, not a caller mistake. Retry once; if it persists, run `gbrain doctor`.',
           protocol_version: MEMORY_VERBS_VERSION,
         }
-      : { error: 'internal_error', message: msg };
+      : { error: 'internal_error', message: redactedMsg };
     return {
       content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
       isError: true,
