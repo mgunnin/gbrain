@@ -59,9 +59,13 @@ export const HANDLER_DEFAULT_TIMEOUT_MS: Readonly<Record<string, number>> = {
   'embed-backfill': THIRTY_MIN_MS,
   'connector-sync': THIRTY_MIN_MS,
   'autopilot-cycle': THIRTY_MIN_MS,
-  // #2194 fix #3: brain-wide maintenance (embed-all/orphans/purge/…) can run
-  // longer than a single source cycle; give it the same 30-min budget.
-  'autopilot-global-maintenance': THIRTY_MIN_MS,
+  // #2194 fix #3: brain-wide maintenance can run longer than a single source
+  // cycle. On large brains synthesize_concepts alone can legitimately exceed
+  // 30 minutes; using the source-cycle budget made every global pass die
+  // before it could stamp autopilot.last_global_at, creating a redispatch and
+  // spend loop. Keep source cycles at 30m and use the existing 60m long-job
+  // budget for the global lane.
+  'autopilot-global-maintenance': SIXTY_MIN_MS,
   // v0.42.x (#2390) — Life Chronicle: one page = one LLM extraction call + a
   // few writes. Generous 10-min budget (vs the tight null-default) covers a
   // slow gateway without the 30-min loop budget.

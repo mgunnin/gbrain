@@ -194,6 +194,14 @@ describe('autopilot.ts ↔ dispatchPerSource wiring', () => {
     expect(AUTOPILOT_TIMEOUT_SRC).toMatch(/requireHandlerAnchorMs[\s\S]{0,200}defaultTimeoutMsFor\(jobName\)/);
   });
 
+  test('global maintenance has more wall-clock budget than a source cycle', () => {
+    const sourceCycleMs = defaultTimeoutMsFor('autopilot-cycle');
+    const globalMaintenanceMs = defaultTimeoutMsFor('autopilot-global-maintenance');
+    expect(sourceCycleMs).toBe(30 * 60_000);
+    expect(globalMaintenanceMs).toBe(60 * 60_000);
+    expect(globalMaintenanceMs!).toBeGreaterThan(sourceCycleMs!);
+  });
+
   test('does NOT regress to the single-job dispatch on the full-cycle path', () => {
     // Pre-PR: the shouldFullCycle branch did:
     //   const job = await queue.add('autopilot-cycle', { repoPath }, {
