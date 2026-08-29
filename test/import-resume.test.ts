@@ -149,7 +149,8 @@ describe('runImport checkpoint resume — v0.33.2 path-based', () => {
     });
   }, 30_000);
 
-  test('interrupted run preserves its tail below the 100-file boundary', async () => {
+  test.skipIf(typeof process.geteuid === 'function' && process.geteuid() === 0)(
+    'interrupted run preserves its tail below the 100-file boundary', async () => {
     // The periodic checkpoint save fires on `completed.size % 100 === 0`. With
     // fewer than 100 successful files there is no boundary to hit, so before
     // the final save every completed file in a run that ends with errors was

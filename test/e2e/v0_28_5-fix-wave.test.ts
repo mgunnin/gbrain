@@ -34,13 +34,24 @@
  * Run: bun test test/e2e/v0_28_5-fix-wave.test.ts
  */
 
-import { describe, test, expect } from 'bun:test';
+import { afterAll, beforeAll, describe, test, expect } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { LATEST_VERSION } from '../../src/core/migrate.ts';
 import {
   readContentChunksEmbeddingDim,
   embeddingMismatchMessage,
 } from '../../src/core/embedding-dim-check.ts';
+
+// These tests deliberately rewind and replay schema migrations. The Tier 3
+// snapshot fast path starts post-initSchema and would make the replay a no-op.
+const pgliteSnapshot = process.env.GBRAIN_PGLITE_SNAPSHOT;
+beforeAll(() => {
+  delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+});
+afterAll(() => {
+  if (pgliteSnapshot === undefined) delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+  else process.env.GBRAIN_PGLITE_SNAPSHOT = pgliteSnapshot;
+});
 
 describe('v0.28.5 cluster A — PGLite upgrade wedge regression', () => {
   test('pre-v0.20 brain (missing v0.20+v0.26.3+v0.27 columns) re-runs initSchema cleanly', async () => {

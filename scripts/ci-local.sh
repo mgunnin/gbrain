@@ -254,9 +254,14 @@ export GBRAIN_TEST_TIMEOUT_MULTIPLIER=\${GBRAIN_TEST_TIMEOUT_MULTIPLIER:-6}
 echo \"[runner] resolving E2E file selection (--diff aware)\"
 ${DIFF_E2E_PREP}
 mkdir -p /tmp/shard-logs
-echo \"[runner] Tier 1: 4-shard parallel unit + E2E (xargs -P4)\"
+CI_PARALLELISM=\"${GBRAIN_CI_PARALLELISM:-4}\"
+case \"\$CI_PARALLELISM\" in
+  1|2|3|4) ;;
+  *) echo \"[runner] invalid GBRAIN_CI_PARALLELISM=\$CI_PARALLELISM (expected 1..4)\" >&2; exit 2 ;;
+esac
+echo \"[runner] Tier 1: 4 shards, parallelism \$CI_PARALLELISM (unit + E2E)\"
 set +e
-printf '%s\\n' 1 2 3 4 | xargs -P4 -I{} sh -c '
+printf '%s\\n' 1 2 3 4 | xargs -P\"\$CI_PARALLELISM\" -I{} sh -c '
   shard=\$1
   log=/tmp/shard-logs/shard-\${shard}.log
   echo \"[shard \${shard}] start\" > \$log
@@ -317,11 +322,13 @@ fi
 INNER_CMD=$(cat <<'EOF'
 set -euo pipefail
 echo "[runner] bun version: $(bun --version)"
-# The oven/bun image omits git; many unit tests use mkdtemp + git init for fixtures.
-if ! command -v git >/dev/null 2>&1; then
-  echo "[runner] Installing git (debian apt)..."
+# The oven/bun image omits git, jq, procps, and Python. Fixtures create
+# temporary Git repos, fake-git argv logging uses jq, PID-reuse tests require
+# `ps`, and the wave security scanner's JSON/regex lane requires python3.
+if ! command -v git >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v ps >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+  echo "[runner] Installing git + jq + procps + python3 (debian apt)..."
   apt-get update -qq >/dev/null
-  apt-get install -y -qq git ca-certificates >/dev/null
+  apt-get install -y -qq git ca-certificates jq procps python3 >/dev/null
 fi
 # Container runs as root (uid 0) against a host-uid bind-mount; mark repo +
 # any worktree gitdir as safe so `git status` etc. don't refuse.
@@ -333,6 +340,11 @@ fi
 __RUN_PHASES__
 EOF
 )
+# Bash 5.2+ can treat '&' in parameter-substitution replacements as the matched
+# text when patsub_replacement is enabled. RUN_PHASES_CMD contains `2>&1`; without
+# disabling that behavior the placeholder expands it to `2>__RUN_PHASES__1`,
+# drops shard stderr into a repo artifact, and hides the actual test failure.
+shopt -u patsub_replacement 2>/dev/null || true
 INNER_CMD="${INNER_CMD/__RUN_PHASES__/$RUN_PHASES_CMD}"
 
 # Conductor / git-worktree support: when `.git` is a file (not a directory),

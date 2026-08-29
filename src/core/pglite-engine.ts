@@ -5762,7 +5762,7 @@ export class PGLiteEngine implements BrainEngine {
     // linked from) a live one.
     // #4592: out-of-scope endpoints cannot rescue a page from orphan-hood.
     const { rows: pageScopeRows } = await this.db.query(`
-      SELECT p.slug,
+      SELECT p.id, p.slug,
              (NOT EXISTS (SELECT 1 FROM links l
                           JOIN pages src ON src.id = l.from_page_id
                           WHERE l.to_page_id = p.id AND src.deleted_at IS NULL
@@ -5776,6 +5776,18 @@ export class PGLiteEngine implements BrainEngine {
       WHERE p.deleted_at IS NULL
         AND ($1::text[] IS NULL OR p.source_id = ANY($1))
     `, [scope]);
+    const { rows: liveLinkRows } = await this.db.query(`
+      SELECT DISTINCT l.from_page_id, l.to_page_id
+      FROM links l
+      JOIN pages src ON src.id = l.from_page_id
+      JOIN pages tgt ON tgt.id = l.to_page_id
+      WHERE src.deleted_at IS NULL
+        AND tgt.deleted_at IS NULL
+        AND l.from_page_id <> l.to_page_id
+        AND ($1::text[] IS NULL OR (
+          src.source_id = ANY($1) AND tgt.source_id = ANY($1)
+        ))
+    `, [scope]);
 
     const r = h as Record<string, unknown>;
     const pageCount = Number(r.page_count);
@@ -5788,15 +5800,21 @@ export class PGLiteEngine implements BrainEngine {
           this.countStalePagesForExtraction({ sourceId: sid, versionTs: LINK_EXTRACTOR_VERSION_TS }),
         ))).reduce((a, b) => a + b, 0);
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const linkablePages = (pageScopeRows as { slug: string; islanded: boolean; has_timeline: boolean }[])
+    const linkablePages = (pageScopeRows as { id: string; slug: string; islanded: boolean; has_timeline: boolean }[])
       .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
     const linkablePageCount = linkablePages.length;
     const orphanPages = linkablePages.filter(row => row.islanded).length;
     const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
     const deadLinks = Number(r.dead_links);
-    const linkCount = Number(r.link_count);
+    // Link density is measured over the induced curated graph: both endpoints
+    // must be live and linkable, self-links earn no credit, and duplicate
+    // provenance/type rows for one directed pair count once.
+    const linkableIds = new Set(linkablePages.map(row => String(row.id)));
+    const linkCount = (liveLinkRows as { from_page_id: string; to_page_id: string }[]).filter(row =>
+      linkableIds.has(String(row.from_page_id)) && linkableIds.has(String(row.to_page_id)),
+    ).length;
 
-    const linkDensity = pageCount > 0 ? Math.min(linkCount / pageCount, 1) : 0;
+    const linkDensity = linkablePageCount > 0 ? Math.min(linkCount / linkablePageCount, 1) : 1;
     // linkablePageCount === 0 gets full marks for the orphan / timeline
     // components (same vacuous-truth rule as the empty-brain fix below):
     // an all-archive brain has no curated graph to penalize.

@@ -13,6 +13,12 @@ import { join } from 'node:path';
 
 const REPO = process.cwd();
 const CLI = join(REPO, 'src', 'cli.ts');
+// The four-shard container lane intentionally sets this multiplier because
+// subprocess-heavy PGLite tests can receive very little CPU while sibling
+// shards are compiling and seeding. Explicit Bun test timeouts do not inherit
+// the runner's --timeout flag, so scale them here as well.
+const TEST_TIMEOUT_MULTIPLIER = Math.max(1, Number(process.env.GBRAIN_TEST_TIMEOUT_MULTIPLIER ?? 1));
+const scaledTimeout = (milliseconds: number): number => milliseconds * TEST_TIMEOUT_MULTIPLIER;
 let root: string;
 let fixtures: string;
 let gold: string;
@@ -58,7 +64,7 @@ beforeAll(() => {
   writeFileSync(join(root, 'doctored.json'), JSON.stringify(doctored, null, 2));
   // The baseline build spawns a full brainbench run (~10-15s); bun's default
   // 5s hook timeout would SIGTERM it on a loaded shard. Explicit generous cap.
-}, 120_000);
+}, scaledTimeout(120_000));
 
 describe('exit contract over a multi-brain run (PGLite exitCode-hijack guard)', () => {
   test('bundled defaults resolve outside the package working directory', () => {
@@ -69,7 +75,7 @@ describe('exit contract over a multi-brain run (PGLite exitCode-hijack guard)', 
     expect(doc.cells.length).toBeGreaterThan(0);
     expect(doc.seed_failures).toEqual([]);
     expect(r.stderr).not.toContain('not a git repository');
-  }, 60_000);
+  }, scaledTimeout(60_000));
 
   test('clean run: exit 0, --out is complete valid JSON with the glossary block', () => {
     const out = join(root, 'r1.json');
@@ -81,28 +87,28 @@ describe('exit contract over a multi-brain run (PGLite exitCode-hijack guard)', 
     expect(doc._meta.metric_glossary.know_to_ask_failure_rate).toContain('thesis failure mode');
     expect(doc.seed_failures).toEqual([]);
     expect(r.stdout).toContain('# BrainBench scoreboard');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('--update-baseline is byte-deterministic across two runs (decision 10)', () => {
     const b2 = join(root, 'base2.json');
     expect(run(['--fixtures', fixtures, '--gold', gold, '--update-baseline', b2]).exitCode).toBe(0);
     // base1.json was produced by an entirely separate run in beforeAll.
     expect(readFileSync(b2, 'utf-8')).toBe(readFileSync(join(root, 'base1.json'), 'utf-8'));
-  }, 60_000);
+  }, scaledTimeout(60_000));
 
   test('--compare against own baseline: exit 0 PASS', () => {
     const b = join(root, 'base1.json');
     const r = run(['--fixtures', fixtures, '--gold', gold, '--compare', b]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain('## Gate: PASS (same-hash)');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('doctored main baseline (pretends fewer failures): exit 1 REGRESSION with named breach', () => {
     const r = run(['--fixtures', fixtures, '--gold', gold, '--compare', join(root, 'doctored.json')]);
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toContain('## Gate: REGRESSION');
     expect(r.stdout).toContain('newly-failed');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('--allow-regression flips the same comparison to exit 0 and records the reason', () => {
     const r = run([
@@ -112,7 +118,7 @@ describe('exit contract over a multi-brain run (PGLite exitCode-hijack guard)', 
     ]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain('regression allowed: e2e test bless');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('fixtures_hash mismatch without a committed baseline: exit 2 INCONCLUSIVE', () => {
     const foreign = JSON.parse(readFileSync(join(root, 'base1.json'), 'utf-8'));
@@ -126,7 +132,7 @@ describe('exit contract over a multi-brain run (PGLite exitCode-hijack guard)', 
     ]);
     expect(r.exitCode).toBe(2);
     expect(r.stdout).toContain('corpus-bless');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 });
 
 describe('anti-vacuous-pass + error paths (always exit 2, never 0)', () => {
@@ -138,13 +144,13 @@ describe('anti-vacuous-pass + error paths (always exit 2, never 0)', () => {
     const r = run(['--fixtures', empty, '--gold', emptyGold]);
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('vacuous');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('suite filter matching zero fixtures: exit 2', () => {
     const r = run(['--fixtures', fixtures, '--gold', gold, '--suite', 'continuity']);
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('vacuous');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('malformed fixture JSON: exit 2 with the validation error named', () => {
     const badRoot = mkdtempSync(join(tmpdir(), 'bb-bad-'));
@@ -156,13 +162,13 @@ describe('anti-vacuous-pass + error paths (always exit 2, never 0)', () => {
     const r = run(['--fixtures', badF, '--gold', badG]);
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('invalid JSON');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('usage error (unknown flag): exit 2 with usage', () => {
     const r = run(['--frobnicate']);
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('Usage: gbrain eval brainbench');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('seed failure (duplicate slug across seed pages in one source): exit 2, fixture named', () => {
     const dupRoot = mkdtempSync(join(tmpdir(), 'bb-dup-'));
@@ -190,7 +196,7 @@ describe('anti-vacuous-pass + error paths (always exit 2, never 0)', () => {
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('SEED FAILURES');
     expect(r.stderr).toContain('seedfail-001');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 });
 
 describe('holdout discipline (decision 22)', () => {
@@ -215,7 +221,7 @@ describe('holdout discipline (decision 22)', () => {
       harnesses: ['openclaw'], suites: ['know-to-ask'], includeHoldout: true, llm: false,
     });
     expect(pubRun.turn_rows.length).toBeGreaterThan(gateRun.turn_rows.length);
-  }, 60_000);
+  }, scaledTimeout(60_000));
 });
 
 describe('file-vs-file --compare (pure diff, no run, no DB)', () => {
@@ -225,7 +231,7 @@ describe('file-vs-file --compare (pure diff, no run, no DB)', () => {
     expect(r.exitCode).toBe(0);
     const outcome = JSON.parse(r.stdout);
     expect(outcome.verdict).toBe('pass');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('doctored current vs base: exit 1 with breaches listed', () => {
     const r = run(['--compare', join(root, 'doctored.json'), join(root, 'base1.json')]);
@@ -235,7 +241,7 @@ describe('file-vs-file --compare (pure diff, no run, no DB)', () => {
     const outcome = JSON.parse(r.stdout);
     expect(outcome.verdict).toBe('regression');
     expect(outcome.breaches.length).toBeGreaterThan(0);
-  }, 30_000);
+  }, scaledTimeout(30_000));
 });
 
 describe('--json stdout completeness', () => {
@@ -253,7 +259,7 @@ describe('--json stdout completeness', () => {
     expect(doc.cells.length).toBeGreaterThan(0);
     expect(doc.compare.verdict).toBe('pass');
     expect(doc._meta.metric_glossary).toBeDefined();
-  }, 30_000);
+  }, scaledTimeout(30_000));
 });
 
 describe('--llm availability gate', () => {
@@ -270,7 +276,7 @@ describe('--llm availability gate', () => {
     );
     expect(proc.exitCode).toBe(2);
     expect(proc.stderr.toString()).toContain('requires a configured chat model');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 });
 
 describe('render-brainbench-delta.ts (the CI step-summary block)', () => {
@@ -283,14 +289,14 @@ describe('render-brainbench-delta.ts (the CI step-summary block)', () => {
     expect(md).toContain('## BrainBench:');
     expect(md).toContain('| openclaw | production |');
     expect(md).toContain('know_to_ask_failure_rate=');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 
   test('missing path argument: exit 2 with usage', () => {
     const proc = Bun.spawnSync(['bun', 'scripts/render-brainbench-delta.ts'], {
       cwd: REPO, stdout: 'pipe', stderr: 'pipe',
     });
     expect(proc.exitCode).toBe(2);
-  }, 30_000);
+  }, scaledTimeout(30_000));
 });
 
 describe('privacy guard violation branches (negative path)', () => {
@@ -317,7 +323,7 @@ describe('privacy guard violation branches (negative path)', () => {
     const out = proc.stdout.toString();
     expect(out).toContain('explicit dollar amount');
     expect(out).toContain('out-of-range year');
-  }, 30_000);
+  }, scaledTimeout(30_000));
 });
 
 describe('run-all once-per-sweep semantics (decision 16)', () => {
@@ -336,7 +342,7 @@ describe('run-all once-per-sweep semantics (decision 16)', () => {
     expect(record.mode).toBe('n/a');
     expect(record.status).toBe('completed');
     expect(Object.keys(record.params.cells).length).toBe(12);
-  }, 120_000);
+  }, scaledTimeout(120_000));
 });
 
 describe('run-all wiring (decision 16) — full corpus, in-process', () => {
@@ -352,5 +358,5 @@ describe('run-all wiring (decision 16) — full corpus, in-process', () => {
     expect(existsSync('evals/brainbench/baselines/main.json')).toBe(true);
     const baseline = JSON.parse(readFileSync('evals/brainbench/baselines/main.json', 'utf-8'));
     expect(baseline.fixtures_hash).toBe(core.fixtures_hash);
-  }, 120_000);
+  }, scaledTimeout(120_000));
 });

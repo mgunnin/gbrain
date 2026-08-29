@@ -141,6 +141,49 @@ describe('content_hash_duplicates (#2250)', () => {
     expect((c.details as any).distinct_slug_group_count).toBe(1);
   });
 
+  test('source policy allow_all acknowledges intentional archival duplicates', async () => {
+    await engine.executeRaw(
+      `UPDATE sources SET config = $2::jsonb WHERE id = $1`,
+      ['default', JSON.stringify({ doctor: { content_hash_duplicates: { allow_all: true } } })],
+    );
+    await addPage('archive/export-a', { hash: 'same' });
+    await addPage('archive/export-b', { hash: 'same' });
+    const c = await checkContentHashDuplicates(engine);
+    expect(c.status).toBe('ok');
+    expect((c.details as any).exempt_group_count).toBe(1);
+    expect(c.message).toContain('acknowledged by source policy');
+  });
+
+  test('source policy exempt_prefixes hides only all-prefix archival groups', async () => {
+    await engine.executeRaw(
+      `UPDATE sources SET config = $2::jsonb WHERE id = $1`,
+      ['default', JSON.stringify({ doctor: { content_hash_duplicates: { exempt_prefixes: ['raw/'] } } })],
+    );
+    await addPage('raw/export-a', { hash: 'raw-same' });
+    await addPage('raw/export-b', { hash: 'raw-same' });
+    await addPage('notes/authored-a', { hash: 'authored-same' });
+    await addPage('notes/authored-b', { hash: 'authored-same' });
+    const c = await checkContentHashDuplicates(engine);
+    expect(c.status).toBe('warn');
+    expect(c.message).toContain('notes/authored-a == notes/authored-b');
+    expect(c.message).not.toContain('raw/export-a');
+    expect((c.details as any).exempt_group_count).toBe(1);
+    expect((c.details as any).distinct_slug_group_count).toBe(1);
+  });
+
+  test('prefix policy does not suppress a raw copy matching an authored page', async () => {
+    await engine.executeRaw(
+      `UPDATE sources SET config = $2::jsonb WHERE id = $1`,
+      ['default', JSON.stringify({ doctor: { content_hash_duplicates: { exempt_prefixes: ['raw/'] } } })],
+    );
+    await addPage('raw/export-a', { hash: 'same' });
+    await addPage('notes/canonical-a', { hash: 'same' });
+    const c = await checkContentHashDuplicates(engine);
+    expect(c.status).toBe('warn');
+    expect(c.message).toContain('raw/export-a == notes/canonical-a');
+    expect((c.details as any).exempt_group_count).toBe(0);
+  });
+
   test('soft-deleted twin is ignored', async () => {
     await addPage('people/alice-example', { hash: 'same' });
     await addPage('alice-example', { hash: 'same', deleted: true });

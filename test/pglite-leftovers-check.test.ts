@@ -165,22 +165,24 @@ describe('assessPgliteLeftovers', () => {
     expect(a.leftovers[0]?.approx_bytes).toBe(1024); // the symlink target's 8 KB is NOT counted
   });
 
-  test('an unreadable subdirectory marks the size incomplete, never exactly 0 B', () => {
-    const home = makeHome('unreadable');
-    const dir = makeStore(home, 'brain.pglite', [1024]);
-    const locked = join(dir, 'locked');
-    mkdirSync(locked);
-    writeFileSync(join(locked, 'hidden'), Buffer.alloc(4096, 67));
-    chmodSync(locked, 0o000);
-    try {
-      const a = assessPgliteLeftovers('postgres', home);
-      expect(a.status).toBe('warn');
-      expect(a.leftovers[0]?.size_incomplete).toBe(true);
-      expect(a.message).toContain('>=');
-    } finally {
-      chmodSync(locked, 0o755); // so afterAll cleanup can delete it
-    }
-  });
+  test.skipIf(process.platform === 'win32' || (typeof process.geteuid === 'function' && process.geteuid() === 0))(
+    'an unreadable subdirectory marks the size incomplete, never exactly 0 B',
+    () => {
+      const home = makeHome('unreadable');
+      const dir = makeStore(home, 'brain.pglite', [1024]);
+      const locked = join(dir, 'locked');
+      mkdirSync(locked);
+      writeFileSync(join(locked, 'hidden'), Buffer.alloc(4096, 67));
+      chmodSync(locked, 0o000);
+      try {
+        const a = assessPgliteLeftovers('postgres', home);
+        expect(a.status).toBe('warn');
+        expect(a.leftovers[0]?.size_incomplete).toBe(true);
+        expect(a.message).toContain('>=');
+      } finally {
+        chmodSync(locked, 0o755); // so afterAll cleanup can delete it
+      }
+    });
 
   test('size walk is bounded by an injectable assessment-wide budget', () => {
     const home = makeHome('bounded');

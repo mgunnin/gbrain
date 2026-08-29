@@ -1605,8 +1605,9 @@ export interface BrainHealth {
    * Pages inside the linkable scope (src/core/orphan-policy.ts) — the
    * pages expected to participate in the curated link graph. Excludes
    * archive (raw/), generated, and daily-log pages; the same scope the
-   * orphans audit uses. Denominator for the no-orphans and
-   * timeline-coverage score components.
+   * orphans audit uses. Denominator for link density, no-orphans, and
+   * timeline-coverage score components; link density counts only distinct,
+   * non-self directed edges whose two endpoints are in this same scope.
    */
   linkable_page_count: number;
   embed_coverage: number;

@@ -5,6 +5,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { readSupervisorEvents, computeSupervisorAuditFilename } from '../src/core/minions/handlers/supervisor-audit.ts';
 import { calculateBackoffMs, resolveHardStopMaxCrashes, MinionSupervisor, type SupervisorEmission } from '../src/core/minions/supervisor.ts';
+import { RSS_DEFAULT_CEIL_MB } from '../src/core/minions/rss-default.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -502,10 +503,11 @@ describe('MinionSupervisor', () => {
         expect(existsSync(outFile)).toBe(true);
         const argv = readFileSync(outFile, 'utf8').trim();
         expect(argv).toContain(`--max-rss ${expected}`);
-        // Auto-sized value is clamped into the sane range, never the old 2048
-        // unless the box genuinely resolves there.
+        // Auto-sized value is clamped into the configured sane range, never the old 2048
+        // unless the box genuinely resolves there. Matt's local fork deliberately
+        // raises the ceiling to 64GB for observed ~44GB autopilot working sets.
         expect(expected).toBeGreaterThanOrEqual(4096);
-        expect(expected).toBeLessThanOrEqual(16384);
+        expect(expected).toBeLessThanOrEqual(RSS_DEFAULT_CEIL_MB);
       } finally {
         try { unlinkSync(outFile); } catch { /* noop */ }
         h.cleanup();

@@ -222,17 +222,67 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
     // safe); a group WITHOUT that shape (all-nested, or distinct bare slugs)
     // is listed with NO delete hint (#3942 — either copy may be the canonical
     // one that links point at, so deleting one automatically is a guess).
-    const rows = await engine.executeRaw<{ source_id: string; content_hash: string; slugs: string }>(
+    // Archival/raw lanes can legitimately retain byte-identical copies from
+    // different exports. Let an operator acknowledge those lanes explicitly
+    // in sources.config without suppressing ordinary authored-page duplicates:
+    //   doctor.content_hash_duplicates.allow_all: true
+    //   doctor.content_hash_duplicates.exempt_prefixes: ['raw/', '.sources/raw/']
+    // Prefix exemptions apply only when EVERY slug in a hash group is inside an
+    // exempt lane, so a raw copy matching an authored canonical still surfaces.
+    const sourceRows = await engine.executeRaw<{ id: string; config: unknown }>(
+      `SELECT id, config FROM sources`,
+    );
+    const duplicatePolicies = new Map<string, { allowAll: boolean; prefixes: string[] }>();
+    for (const source of sourceRows) {
+      let cfg: Record<string, unknown> = {};
+      try {
+        cfg = typeof source.config === 'string'
+          ? JSON.parse(source.config) as Record<string, unknown>
+          : (source.config ?? {}) as Record<string, unknown>;
+      } catch {
+        cfg = {};
+      }
+      const doctor = (cfg.doctor ?? {}) as Record<string, unknown>;
+      const policy = (doctor.content_hash_duplicates ?? {}) as Record<string, unknown>;
+      duplicatePolicies.set(String(source.id), {
+        allowAll: policy.allow_all === true,
+        prefixes: Array.isArray(policy.exempt_prefixes)
+          ? policy.exempt_prefixes.map(String).filter(Boolean)
+          : [],
+      });
+    }
+
+    const allRows = await engine.executeRaw<{ source_id: string; content_hash: string; slugs: string }>(
       `SELECT source_id, content_hash,
               string_agg(slug, '|' ORDER BY length(slug), slug) AS slugs
          FROM pages
         WHERE deleted_at IS NULL AND content_hash IS NOT NULL AND content_hash <> ''
         GROUP BY source_id, content_hash
-       HAVING count(*) > 1
-        LIMIT 50`,
+       HAVING count(*) > 1`,
     );
+    let exemptGroupCount = 0;
+    const rows = allRows.filter((row) => {
+      const policy = duplicatePolicies.get(String(row.source_id));
+      if (!policy) return true;
+      if (policy.allowAll) {
+        exemptGroupCount++;
+        return false;
+      }
+      const slugs = String(row.slugs).split('|');
+      const exempt = policy.prefixes.length > 0
+        && slugs.every((slug) => policy.prefixes.some((prefix) => slug.startsWith(prefix)));
+      if (exempt) exemptGroupCount++;
+      return !exempt;
+    }).slice(0, 50);
     if (rows.length === 0) {
-      return { name, status: 'ok', message: 'No same-source content-hash duplicate groups' };
+      return {
+        name,
+        status: 'ok',
+        message: exemptGroupCount > 0
+          ? `No unacknowledged same-source content-hash duplicate groups (${exemptGroupCount} archival/raw group(s) acknowledged by source policy)`
+          : 'No same-source content-hash duplicate groups',
+        details: { exempt_group_count: exemptGroupCount },
+      };
     }
     let pairCount = 0;
     const samples: string[] = [];
@@ -275,6 +325,7 @@ export async function checkContentHashDuplicates(engine: BrainEngine): Promise<C
       details: {
         pair_count: pairCount,
         hash_groups: rows.length,
+        exempt_group_count: exemptGroupCount,
         sample_pairs: samples,
         distinct_slug_group_count: otherGroupCount,
         sample_distinct_slug_groups: otherSamples,

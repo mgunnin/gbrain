@@ -64,6 +64,36 @@ describe('Bug 11 — brain_score breakdown sums to total', () => {
     expect(sum).toBe(h.brain_score);
   });
 
+  test('link density uses distinct non-self edges in the induced curated graph', async () => {
+    for (const slug of ['wiki/a', 'wiki/b', 'wiki/c', 'wiki/d']) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: slug, frontmatter: {} });
+    }
+    for (const slug of ['raw/export-a', 'raw/export-b', 'raw/export-c']) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: slug, frontmatter: {} });
+    }
+
+    const ids = Object.fromEntries(
+      ((await (engine as any).db.query(`SELECT id, slug FROM pages`)).rows as Array<{ id: number; slug: string }>)
+        .map((row) => [row.slug, row.id]),
+    );
+    for (const [from, to] of [
+      ['wiki/a', 'wiki/b'],             // the only qualifying edge
+      ['raw/export-a', 'raw/export-b'], // excluded -> excluded
+      ['raw/export-c', 'wiki/c'],       // excluded -> curated
+      ['wiki/d', 'raw/export-a'],       // curated -> excluded
+      ['wiki/c', 'wiki/c'],             // self-link
+    ]) {
+      await (engine as any).db.query(
+        `INSERT INTO links (from_page_id, to_page_id, link_type) VALUES ($1, $2, 'mentions')`,
+        [ids[from], ids[to]],
+      );
+    }
+
+    const h = await engine.getHealth();
+    expect(h.linkable_page_count).toBe(4);
+    expect(h.link_density_score).toBe(6);
+  });
+
   test('brain_score caps at 100', async () => {
     const h = await engine.getHealth();
     expect(h.brain_score).toBeGreaterThanOrEqual(0);

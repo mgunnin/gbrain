@@ -24,9 +24,19 @@
  * brain advances to LATEST_VERSION with no crash. PGLite-only.
  */
 
-import { describe, test, expect } from 'bun:test';
+import { afterAll, beforeAll, describe, test, expect } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { LATEST_VERSION } from '../../src/core/migrate.ts';
+
+// This suite deliberately rewinds a live in-memory schema and calls initSchema
+// again. The CI snapshot fast path is intentionally incompatible with that
+// migration exercise, so opt this file out and restore the runner environment.
+const priorSnapshot = process.env.GBRAIN_PGLITE_SNAPSHOT;
+beforeAll(() => { delete process.env.GBRAIN_PGLITE_SNAPSHOT; });
+afterAll(() => {
+  if (priorSnapshot === undefined) delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+  else process.env.GBRAIN_PGLITE_SNAPSHOT = priorSnapshot;
+});
 
 describe('v0.30.3 wave — pre-v39/v40/v41 forward-reference bootstrap (#741)', () => {
   test('pre-v39 brain (missing modality + embedding_image) re-runs initSchema cleanly', async () => {

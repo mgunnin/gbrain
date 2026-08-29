@@ -23,6 +23,7 @@ import { bootstrapDoctorChecks, type Check } from '../src/commands/doctor.ts';
 import { writeHarnessReceipt } from '../src/core/bootstrap/format.ts';
 import { LATEST_VERSION } from '../src/core/migrate.ts';
 import { VERSION } from '../src/version.ts';
+import { detectExecutionEnvironment } from '../src/core/execution-env.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -555,7 +556,8 @@ describe('bootstrap_durability_job [B7/D7]', () => {
     expect(c?.message).toContain('cloud-sandbox');
   }, T);
 
-  test('local + PERSIST_CRON=yes but NO scheduled job on disk → warn naming `gbrain sources harden`', async () => {
+  test.skipIf(detectExecutionEnvironment() !== 'local')(
+    'local + PERSIST_CRON=yes but NO scheduled job on disk → warn naming `gbrain sources harden`', async () => {
     const { parent, home } = makeHome();
     const ws = makeWorkspace();
     writeReceipt(home, ws);
