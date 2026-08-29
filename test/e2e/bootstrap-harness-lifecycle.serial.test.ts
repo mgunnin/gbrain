@@ -208,11 +208,13 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
     expect((settings.permissions as { allow: string[] }).allow).toContain('mcp__gbrain');
     expect(Object.keys(settings.hooks as object).length).toBe(5);
 
-    // codex lane: managed block with the inline token; preexisting content intact
+    // codex lane: managed block with the inline http_headers credential
+    // (#4574 — never bearer_token); preexisting content intact
     const toml = readFileSync(codexConfig(), 'utf8');
     expect(toml).toContain('# preexisting codex config');
     expect(toml).toContain(CODEX_TOML_BLOCK_BEGIN);
-    expect(toml).toContain(`bearer_token = "${token}"`);
+    expect(toml).toContain(`http_headers = { Authorization = "Bearer ${token}" }`);
+    expect(toml).not.toContain('bearer_token');
 
     // receipt: all confirmed; supplied token → minted:false
     const home = join(parent, '.gbrain');

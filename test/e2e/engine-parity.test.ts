@@ -709,6 +709,78 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     }
   });
 
+  test('#4587 softDeletePages parity: same confirmed-transitioned slugs; ghosts + already-soft-deleted excluded; rows stay recoverable', async () => {
+    const realSlugs = ['wiki/sdp-1', 'wiki/sdp-2', 'wiki/sdp-3'];
+    for (const eng of [pgEngine, pgliteEngine]) {
+      for (const slug of realSlugs) {
+        await eng.putPage(slug, { type: 'note', title: slug, compiled_truth: 'body', timeline: '' });
+      }
+      // Pre-soft-delete one row: the batch must not re-flip it (deleted_at
+      // IS NULL predicate — re-flipping would restart its 72h purge clock).
+      await eng.softDeletePage('wiki/sdp-3', { sourceId: 'default' });
+    }
+
+    const allSlugs = [...realSlugs, 'wiki/sdp-ghost'];
+    const pgFlipped = await pgEngine.softDeletePages(allSlugs, { sourceId: 'default' });
+    const pgliteFlipped = await pgliteEngine.softDeletePages(allSlugs, { sourceId: 'default' });
+
+    expect(pgFlipped.sort()).toEqual(['wiki/sdp-1', 'wiki/sdp-2']);
+    expect(pgliteFlipped.sort()).toEqual(['wiki/sdp-1', 'wiki/sdp-2']);
+
+    for (const eng of [pgEngine, pgliteEngine]) {
+      // Hidden from default reads, but the rows remain (recoverable 72h) —
+      // nothing cascaded.
+      for (const slug of realSlugs) {
+        expect(await eng.getPage(slug)).toBeNull();
+        const peek = await eng.getPage(slug, { includeDeleted: true, sourceId: 'default' });
+        expect(peek).not.toBeNull();
+        expect(peek!.deleted_at).not.toBeNull();
+      }
+      // Empty input short-circuits identically (F1).
+      expect(await eng.softDeletePages([], { sourceId: 'default' })).toEqual([]);
+    }
+  });
+
+  test('#4587 revival parity: delete -> re-add within 72h clears deleted_at, updates content, replaces chunks/links (not duplicated)', async () => {
+    const slug = 'wiki/revive-cycle';
+    const peer = 'wiki/revive-peer';
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.putPage(peer, { type: 'note', title: peer, compiled_truth: 'peer', timeline: '' });
+      await eng.putPage(slug, { type: 'note', title: 'V1', compiled_truth: 'body v1', timeline: '' });
+      await eng.upsertChunks(slug, [
+        { chunk_index: 0, chunk_text: 'v1 chunk a', chunk_source: 'compiled_truth' },
+        { chunk_index: 1, chunk_text: 'v1 chunk b', chunk_source: 'compiled_truth' },
+      ]);
+      await eng.addLink(slug, peer, 'ctx', 'wikilink');
+
+      // Sync-style removal: the removed-file drain soft-deletes.
+      expect(await eng.softDeletePages([slug], { sourceId: 'default' })).toEqual([slug]);
+      expect(await eng.getPage(slug)).toBeNull();
+
+      // Re-add within the window: the import pipeline's upsert revives the
+      // SAME row (deleted_at clears, content updates), then chunk/link
+      // rewrite REPLACES the old sets rather than stacking duplicates.
+      const revived = await eng.putPage(slug, { type: 'note', title: 'V2', compiled_truth: 'body v2', timeline: '' });
+      expect(revived.slug).toBe(slug);
+      const page = await eng.getPage(slug, { sourceId: 'default' });
+      expect(page).not.toBeNull();
+      expect(page!.title).toBe('V2');
+      expect(page!.compiled_truth).toBe('body v2');
+      expect(page!.deleted_at ?? null).toBeNull();
+
+      await eng.upsertChunks(slug, [
+        { chunk_index: 0, chunk_text: 'v2 chunk only', chunk_source: 'compiled_truth' },
+      ]);
+      await eng.addLink(slug, peer, 'ctx v2', 'wikilink');
+
+      const chunks = await eng.getChunks(slug);
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0].chunk_text).toBe('v2 chunk only');
+      const links = await eng.getLinks(slug);
+      expect(links).toHaveLength(1);
+    }
+  });
+
   test('#2555 getChunks sourceIds[] parity: federated grant + scalar floor + unset default identical on both engines', async () => {
     for (const eng of [pgEngine, pgliteEngine]) {
       await eng.executeRaw(`INSERT INTO sources (id, name, local_path) VALUES ('gcp-beta', 'gcp-beta', '/tmp/gcp-beta') ON CONFLICT (id) DO NOTHING`);
@@ -1625,6 +1697,250 @@ describeBoth('Engine parity — CJK keyword fallback (#3986)', () => {
     const pglite = await pgliteEngine.searchKeyword('東京 会議', { limit: 5, sourceIds: ['nonexistent-source'] });
     expect(pg).toEqual([]);
     expect(pglite).toEqual([]);
+  });
+});
+
+// ── D7: traverseGraph / traversePaths parity ─────────────────────────────
+// Both engines run the same WITH RECURSIVE shape but compose it differently
+// (postgres.js sql`` fragments vs positional $N interpolation). A drift in
+// the cycle guard (visited array), the depth bound, or the v0.34.1 #861
+// source-scope fragments would only show against real Postgres. Reality note:
+// traverseGraph is OUT-direction only; the in/out/both matrix lives on
+// traversePaths.
+async function seedTraversal(eng: BrainEngine) {
+  await eng.executeRaw(
+    `INSERT INTO sources (id, name, config) VALUES ('tg-alt', 'tg-alt', '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+  );
+  for (const slug of ['tg/a', 'tg/b', 'tg/c', 'tg/d']) {
+    await eng.putPage(slug, { type: 'note', title: slug, compiled_truth: `${slug} body`, timeline: '' });
+  }
+  await eng.putPage('tg/x', { type: 'note', title: 'tg/x', compiled_truth: 'x body', timeline: '' }, { sourceId: 'tg-alt' });
+  // The CYCLE: a → b → a. Chain b → c → d. Cross-source edge b → x (tg-alt).
+  await eng.addLink('tg/a', 'tg/b', 'fwd-ctx', 'cycle-fwd', 'manual');
+  await eng.addLink('tg/b', 'tg/a', 'back-ctx', 'cycle-back', 'manual');
+  await eng.addLink('tg/b', 'tg/c', 'step-ctx', 'step', 'manual');
+  await eng.addLink('tg/c', 'tg/d', 'deep-ctx', 'deep', 'manual');
+  await eng.addLink('tg/b', 'tg/x', 'x-ctx', 'xsrc', 'manual', undefined, undefined, {
+    fromSourceId: 'default', toSourceId: 'tg-alt',
+  });
+}
+
+describeBoth('Engine parity — traverseGraph / traversePaths (D7)', () => {
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    await seedTraversal(pgEngine);
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+    await seedTraversal(pgliteEngine);
+  }, 90_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  const nodeShape = (nodes: Awaited<ReturnType<BrainEngine['traverseGraph']>>) =>
+    nodes
+      .map(n => `${n.slug}@${n.depth}[${n.links.map(l => `${l.to_slug}:${l.link_type}`).sort().join(',')}]`)
+      .sort();
+
+  const edgeShape = (paths: Awaited<ReturnType<BrainEngine['traversePaths']>>) =>
+    // NOT sorted: ORDER BY depth, from_slug, to_slug is part of the contract.
+    paths.map(p => `${p.from_slug}>${p.to_slug}:${p.link_type}@${p.depth}`);
+
+  test('traverseGraph: identical node/edge sets for depth 1..3 (unscoped), cycle edge present', async () => {
+    for (const depth of [1, 2, 3]) {
+      const pg = await pgEngine.traverseGraph('tg/a', depth);
+      const pglite = await pgliteEngine.traverseGraph('tg/a', depth);
+      expect(nodeShape(pg)).toEqual(nodeShape(pglite));
+    }
+    const pg3 = await pgEngine.traverseGraph('tg/a', 3);
+    // Concrete depth-3 pin: a(0), b(1), c(2), x(2, cross-source — unscoped
+    // walk reaches it), d(3). The cycle edge b→a shows in b's links array but
+    // never re-adds a (visited guard).
+    const byslug = new Map(pg3.map(n => [n.slug, n]));
+    expect([...byslug.keys()].sort()).toEqual(['tg/a', 'tg/b', 'tg/c', 'tg/d', 'tg/x']);
+    expect(byslug.get('tg/a')!.depth).toBe(0);
+    expect(byslug.get('tg/b')!.depth).toBe(1);
+    expect(byslug.get('tg/c')!.depth).toBe(2);
+    expect(byslug.get('tg/x')!.depth).toBe(2);
+    expect(byslug.get('tg/d')!.depth).toBe(3);
+    expect(byslug.get('tg/b')!.links.map(l => `${l.to_slug}:${l.link_type}`).sort())
+      .toEqual(['tg/a:cycle-back', 'tg/c:step', 'tg/x:xsrc']);
+  });
+
+  test('traverseGraph: cycle guard terminates identically at large depth (A→B→A)', async () => {
+    const pg = await pgEngine.traverseGraph('tg/a', 25);
+    const pglite = await pgliteEngine.traverseGraph('tg/a', 25);
+    expect(nodeShape(pg)).toEqual(nodeShape(pglite));
+    // Terminates at the graph's true diameter — no depth-25 explosion, no
+    // duplicate node rows from the cycle.
+    expect(pg.length).toBe(5);
+    expect(new Set(pg.map(n => n.slug)).size).toBe(5);
+    expect(Math.max(...pg.map(n => n.depth))).toBe(3);
+  });
+
+  test('traverseGraph: sourceId + sourceIds scoping identical (seed, step, and links-agg)', async () => {
+    // Scalar scope: tg/x invisible as a node AND inside b's links array.
+    const pgScalar = await pgEngine.traverseGraph('tg/a', 3, { sourceId: 'default' });
+    const pgliteScalar = await pgliteEngine.traverseGraph('tg/a', 3, { sourceId: 'default' });
+    expect(nodeShape(pgScalar)).toEqual(nodeShape(pgliteScalar));
+    expect(pgScalar.map(n => n.slug)).not.toContain('tg/x');
+    expect(pgScalar.find(n => n.slug === 'tg/b')!.links.map(l => l.to_slug)).not.toContain('tg/x');
+
+    // Federated array scope: x back in.
+    const pgFed = await pgEngine.traverseGraph('tg/a', 3, { sourceIds: ['default', 'tg-alt'] });
+    const pgliteFed = await pgliteEngine.traverseGraph('tg/a', 3, { sourceIds: ['default', 'tg-alt'] });
+    expect(nodeShape(pgFed)).toEqual(nodeShape(pgliteFed));
+    expect(pgFed.map(n => n.slug)).toContain('tg/x');
+
+    // Seed out of scope → empty on both.
+    expect(await pgEngine.traverseGraph('tg/a', 3, { sourceIds: ['tg-alt'] })).toEqual([]);
+    expect(await pgliteEngine.traverseGraph('tg/a', 3, { sourceIds: ['tg-alt'] })).toEqual([]);
+  });
+
+  test('traversePaths: identical ordered edges for depth 1..3 × direction in/out/both', async () => {
+    for (const direction of ['in', 'out', 'both'] as const) {
+      for (const depth of [1, 2, 3]) {
+        const pg = await pgEngine.traversePaths('tg/a', { depth, direction });
+        const pglite = await pgliteEngine.traversePaths('tg/a', { depth, direction });
+        expect(edgeShape(pg)).toEqual(edgeShape(pglite));
+      }
+    }
+    // Concrete pins (guard against fixture typos masking a real drift).
+    expect(edgeShape(await pgEngine.traversePaths('tg/a', { depth: 3, direction: 'out' }))).toEqual([
+      'tg/a>tg/b:cycle-fwd@1',
+      'tg/b>tg/a:cycle-back@2', 'tg/b>tg/c:step@2', 'tg/b>tg/x:xsrc@2',
+      'tg/c>tg/d:deep@3',
+    ]);
+    expect(edgeShape(await pgEngine.traversePaths('tg/a', { depth: 3, direction: 'in' }))).toEqual([
+      'tg/b>tg/a:cycle-back@1',
+      'tg/a>tg/b:cycle-fwd@2',
+    ]);
+    // 'both' emits every touched edge in its natural direction; the cycle
+    // pair shows at depth 1 and again from b's frontier at depth 2.
+    expect(edgeShape(await pgEngine.traversePaths('tg/a', { depth: 2, direction: 'both' }))).toEqual([
+      'tg/a>tg/b:cycle-fwd@1', 'tg/b>tg/a:cycle-back@1',
+      'tg/a>tg/b:cycle-fwd@2', 'tg/b>tg/a:cycle-back@2', 'tg/b>tg/c:step@2', 'tg/b>tg/x:xsrc@2',
+    ]);
+  });
+
+  test('traversePaths: cycle guard terminates + linkType filter identical', async () => {
+    const pgDeep = await pgEngine.traversePaths('tg/a', { depth: 25, direction: 'out' });
+    const pgliteDeep = await pgliteEngine.traversePaths('tg/a', { depth: 25, direction: 'out' });
+    expect(edgeShape(pgDeep)).toEqual(edgeShape(pgliteDeep));
+    // Finite: same 5 edges as depth 3 — the visited guard stops the A→B→A loop.
+    expect(pgDeep.length).toBe(5);
+
+    const pgTyped = await pgEngine.traversePaths('tg/b', { depth: 2, direction: 'out', linkType: 'step' });
+    const pgliteTyped = await pgliteEngine.traversePaths('tg/b', { depth: 2, direction: 'out', linkType: 'step' });
+    expect(edgeShape(pgTyped)).toEqual(edgeShape(pgliteTyped));
+    expect(edgeShape(pgTyped)).toEqual(['tg/b>tg/c:step@1']);
+    // context column survives the walk identically.
+    expect(pgTyped[0].context).toBe('step-ctx');
+    expect(pgliteTyped[0].context).toBe('step-ctx');
+  });
+
+  test('traversePaths: sourceId + sourceIds scoping identical', async () => {
+    const pgScalar = await pgEngine.traversePaths('tg/a', { depth: 3, direction: 'out', sourceId: 'default' });
+    const pgliteScalar = await pgliteEngine.traversePaths('tg/a', { depth: 3, direction: 'out', sourceId: 'default' });
+    expect(edgeShape(pgScalar)).toEqual(edgeShape(pgliteScalar));
+    expect(edgeShape(pgScalar)).not.toContain('tg/b>tg/x:xsrc@2');
+
+    const pgFed = await pgEngine.traversePaths('tg/a', { depth: 3, direction: 'out', sourceIds: ['default', 'tg-alt'] });
+    const pgliteFed = await pgliteEngine.traversePaths('tg/a', { depth: 3, direction: 'out', sourceIds: ['default', 'tg-alt'] });
+    expect(edgeShape(pgFed)).toEqual(edgeShape(pgliteFed));
+    expect(edgeShape(pgFed)).toContain('tg/b>tg/x:xsrc@2');
+
+    // Seed out of scope → no paths on either engine. The 'both' branch scopes
+    // BOTH endpoint joins (pf + pt) — cross-source edges drop identically.
+    expect(await pgEngine.traversePaths('tg/a', { depth: 3, direction: 'both', sourceIds: ['tg-alt'] })).toEqual([]);
+    expect(await pgliteEngine.traversePaths('tg/a', { depth: 3, direction: 'both', sourceIds: ['tg-alt'] })).toEqual([]);
+    const pgBoth = await pgEngine.traversePaths('tg/a', { depth: 2, direction: 'both', sourceId: 'default' });
+    const pgliteBoth = await pgliteEngine.traversePaths('tg/a', { depth: 2, direction: 'both', sourceId: 'default' });
+    expect(edgeShape(pgBoth)).toEqual(edgeShape(pgliteBoth));
+    expect(edgeShape(pgBoth)).not.toContain('tg/b>tg/x:xsrc@2');
+  });
+});
+
+// ── D7: restorePage arc parity ───────────────────────────────────────────
+// softDelete → hidden → includeDeleted peek → restore → visible → second
+// restore false. Both engines gate restore on `deleted_at IS NOT NULL` and
+// carry the same scalar sourceCondition — a drift means `gbrain migrate
+// --to supabase` changes trash-can semantics.
+describeBoth('Engine parity — restorePage arc (D7)', () => {
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+  }, 90_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  test('softDelete → getPage null → includeDeleted → restore true → visible → second restore false', async () => {
+    const slug = 'rp/arc';
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.putPage(slug, { type: 'note', title: 'Arc page', compiled_truth: 'arc body', timeline: '' });
+
+      const del = await eng.softDeletePage(slug, { sourceId: 'default' });
+      expect(del).toEqual({ slug });
+      // Idempotent-as-null: a second soft delete finds no active row.
+      expect(await eng.softDeletePage(slug, { sourceId: 'default' })).toBeNull();
+
+      // Hidden from the default read…
+      expect(await eng.getPage(slug, { sourceId: 'default' })).toBeNull();
+      // …but visible with includeDeleted, deleted_at stamped.
+      const peek = await eng.getPage(slug, { sourceId: 'default', includeDeleted: true });
+      expect(peek).not.toBeNull();
+      expect(peek!.title).toBe('Arc page');
+      expect(peek!.deleted_at).toBeInstanceOf(Date);
+
+      // Restore flips it back exactly once.
+      expect(await eng.restorePage(slug, { sourceId: 'default' })).toBe(true);
+      const restored = await eng.getPage(slug, { sourceId: 'default' });
+      expect(restored).not.toBeNull();
+      expect(restored!.title).toBe('Arc page');
+      // SECOND restore: no soft-deleted row left → false on both engines.
+      expect(await eng.restorePage(slug, { sourceId: 'default' })).toBe(false);
+    }
+  });
+
+  test('two-source variant: scalar sourceCondition never crosses sources', async () => {
+    const slug = 'rp/two-source';
+    for (const eng of [pgEngine, pgliteEngine]) {
+      for (const src of ['rp-a', 'rp-b']) {
+        await eng.executeRaw(
+          `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+          [src],
+        );
+        await eng.putPage(slug, { type: 'note', title: `row in ${src}`, compiled_truth: 'b', timeline: '' }, { sourceId: src });
+      }
+      // Soft-delete BOTH rows, then restore only rp-a.
+      expect(await eng.softDeletePage(slug, { sourceId: 'rp-a' })).toEqual({ slug });
+      expect(await eng.softDeletePage(slug, { sourceId: 'rp-b' })).toEqual({ slug });
+      expect(await eng.restorePage(slug, { sourceId: 'rp-a' })).toBe(true);
+
+      // rp-a is back; rp-b is STILL deleted (the scalar condition confined the UPDATE).
+      expect((await eng.getPage(slug, { sourceId: 'rp-a' }))?.title).toBe('row in rp-a');
+      expect(await eng.getPage(slug, { sourceId: 'rp-b' })).toBeNull();
+      expect((await eng.getPage(slug, { sourceId: 'rp-b', includeDeleted: true }))?.title).toBe('row in rp-b');
+
+      // Second scoped restore on rp-a: false. rp-b restores independently.
+      expect(await eng.restorePage(slug, { sourceId: 'rp-a' })).toBe(false);
+      expect(await eng.restorePage(slug, { sourceId: 'rp-b' })).toBe(true);
+      expect((await eng.getPage(slug, { sourceId: 'rp-b' }))?.title).toBe('row in rp-b');
+    }
   });
 });
 

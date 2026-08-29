@@ -88,19 +88,24 @@ export const TARGETS: Record<string, HostSpecTarget> = {
       'docs/mcp/CODEX.md',
       'https://developers.openai.com/codex/mcp',
       'codex-cli 0.147.0 (binary serde field scan + live inline bearer_token wiring, issue #4043)',
+      'codex-cli 0.149.1 (reporter 3-variant probe in issue #4574: inline bearer_token is REJECTED ' +
+        'at config load for streamable_http; http_headers inline table loads on 0.147.x and 0.149.x)',
     ],
     note:
       'Local stdio MCP registration: `codex mcp add <name> [--env K=V]... -- ' +
       '<command> [args...]`, which writes [mcp_servers.<name>] into ' +
       '(CODEX_HOME || ~/.codex)/config.toml — codex resolves CODEX_HOME as ' +
       'the config dir itself. Streamable-HTTP servers are configured with ' +
-      '`url` plus `bearer_token` (inline) or `bearer_token_env_var`; the ' +
-      'config parser uses deny-unknown-fields, so writers must emit ONLY ' +
-      'verified keys and `KEY = "value"` spacing. The CX2-17 revisit trigger ' +
-      'FIRED (#4043): `codex mcp add` cannot express an inline bearer_token ' +
-      '(verified against codex-cli 0.147.0 --help), so the harness lane owns ' +
-      'a managed marker-delimited TOML block (codex-toml.ts) — the ONE ' +
-      'direct config.toml writer. One owner per server name: `codex mcp ' +
+      '`url` plus an inline `http_headers = { Authorization = "Bearer <t>" }` ' +
+      'table or `bearer_token_env_var` — inline `bearer_token` was accepted ' +
+      'by 0.147.x but is REJECTED AT CONFIG LOAD by >=0.149 (#4574, bricking ' +
+      'every codex session on the machine); the http_headers shape loads on ' +
+      'both. The config parser uses deny-unknown-fields, so writers must emit ' +
+      'ONLY verified keys and `KEY = "value"` spacing. The CX2-17 revisit ' +
+      'trigger FIRED (#4043): `codex mcp add` cannot express an inline ' +
+      'credential (verified against codex-cli 0.147.0 --help), so the harness ' +
+      'lane owns a managed marker-delimited TOML block (codex-toml.ts) — the ' +
+      'ONE direct config.toml writer. One owner per server name: `codex mcp ' +
       'remove` rewrites config.toml wholesale and drops comments, so the ' +
       'stdio lane (runHooks) must never manage a name the harness block ' +
       'owns, and vice versa. Codex 0.147.0 also ships a real hook system ' +

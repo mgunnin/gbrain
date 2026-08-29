@@ -35,6 +35,7 @@ import {
   resolveAlias,
   type ModelTier,
 } from '../core/model-config.ts';
+import { resolveExtractAtomsModelWithSource } from '../core/cycle/extract-atoms.ts';
 import { maybeAttachVersionSuffixHint } from '../core/ai/base-url-probe.ts';
 import type { AIGatewayConfig } from '../core/ai/types.ts';
 
@@ -52,6 +53,19 @@ interface PerTaskModelRoute {
    * resolution so the dashboard reports the ACTUAL spending route.
    */
   overrideKey?: string;
+  /**
+   * A caller whose runtime resolution DOESN'T go through resolveModel()'s
+   * fuller chain (models.tier.<tier> / models.default / env var) — only
+   * `key`'s own DB config, then a tier-default fallback. Reporting via the
+   * generic chain here would show a resolved value that can diverge from
+   * what the caller actually uses in partially-configured installs, so this
+   * calls the caller's own resolver instead. The resolver returns model AND
+   * attribution from the same call so the reported `source` — rendered as
+   * `config: <key>` or `tier.<tier> (caller-specific)` to make the narrower
+   * chain visible rather than implying full resolveModel() coverage — can
+   * never disagree with the resolved value.
+   */
+  narrowResolver?: (engine: BrainEngine) => Promise<{ model: string; source: 'config' | 'tier_default' }>;
 }
 
 const PER_TASK_KEYS: PerTaskModelRoute[] = [
@@ -64,6 +78,12 @@ const PER_TASK_KEYS: PerTaskModelRoute[] = [
     overrideKey: 'models.dream.triage',
   },
   { key: 'models.dream.patterns',           tier: 'reasoning', description: 'Pattern discovery (cross-take themes)' },
+  {
+    key: 'models.dream.extract_atoms',
+    tier: 'utility',
+    description: 'Atom extraction from transcripts/pages (extract_atoms phase)',
+    narrowResolver: resolveExtractAtomsModelWithSource,
+  },
   { key: 'models.drift',                    tier: 'reasoning', description: 'Drift LLM judge (v0.29 scaffold)' },
   { key: 'models.auto_think',               tier: 'deep',      description: 'Auto-think question answering' },
   { key: 'models.think',                    tier: 'deep',      description: '`gbrain think` synthesis op' },
@@ -141,7 +161,19 @@ async function buildReport(engine: BrainEngine): Promise<ModelsReport> {
 
   const per_task: ModelsReport['per_task'] = [];
   for (const route of PER_TASK_KEYS) {
-    const { key, tier, description, deprecatedConfigKey, envVar, overrideKey } = route;
+    const { key, tier, description, deprecatedConfigKey, envVar, overrideKey, narrowResolver } = route;
+    // A caller with its own narrower resolution (doesn't honor models.tier.*
+    // / models.default / env var) reports via that exact resolver, not the
+    // generic resolveModel() chain — see PerTaskModelRoute.narrowResolver.
+    if (narrowResolver) {
+      // ONE resolver call feeds both the resolved model and the attribution,
+      // so the label can never disagree with what `resolved` actually
+      // reflects (previously a separate getConfig truthiness re-check).
+      const { model: resolved, source: narrowSource } = await narrowResolver(engine);
+      const source = narrowSource === 'config' ? `config: ${key}` : `tier.${tier} (caller-specific)`;
+      per_task.push({ key, tier, resolved, source, description });
+      continue;
+    }
     // Explicit pre-read override (loadSynthConfig 2A parity): when set, it IS
     // the effective spending route and must be reported as such.
     const overrideValue = overrideKey ? await engine.getConfig(overrideKey) : null;

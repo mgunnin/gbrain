@@ -120,6 +120,15 @@ const schema_lint: Operation = {
       // Locate by name without trust-gating per-call schema_pack opt
       // (that's a separate axis — this is just file lookup).
       const packName = p.pack as string;
+      // SECURITY: `pack` is caller-supplied on a remote-reachable read op and
+      // is joined into a filesystem path below — an unguarded '../'-shaped
+      // name escapes $GBRAIN_HOME/schema-packs/ (existence oracle + arbitrary
+      // pack.yaml parse). Reuse the SAME name guard the mutate path uses
+      // (isValidPackName in schema-pack/mutate.ts) BEFORE any join.
+      // Anti-enumeration: invalid names answer EXACTLY like missing packs
+      // (pack_not_found, no path echo), never a distinct "bad name" shape.
+      const { isValidPackName } = await import('../schema-pack/mutate.ts');
+      if (!isValidPackName(packName)) return { error: 'pack_not_found', pack: packName };
       const candidates = ['pack.yaml', 'pack.yml', 'pack.json'];
       let path: string | null = null;
       for (const c of candidates) {

@@ -1366,6 +1366,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // operator had to discover these by reading source. Registered so `config
   // set` accepts them directly. See docs/operations/spend-controls.md.
   'spend.posture',
+  'pricing.overrides',
   // Life Chronicle (v0.42.56.0, #2390). The release notes' enable command is
   // `gbrain config set auto_chronicle true`, but the key was never registered
   // — so the documented command failed with "Unknown config key" and the
@@ -1398,6 +1399,13 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'sync.cost_gate_min_usd',
   'sync.federated_v2',
   'sync.include_working_tree',
+  // Persisted indexing scope (comma/newline-separated glob list; trailing '/'
+  // normalizes to a '/**' subtree glob). Read best-effort at the top of
+  // performSyncInner and UNIONED with any per-call --exclude so internal
+  // callers (autopilot, minion sync jobs, dream cycle) honor the same scope.
+  // Registering it here is what makes `gbrain config set sync.exclude ...`
+  // work — the operator path to the feature (unregistered-key class).
+  'sync.exclude',
   // #2179: clamp window for DCR-requested per-client token TTLs. Read by
   // `gbrain serve --http` at startup; unset min defaults to 300s, unset max
   // defaults fail-closed to max(--token-ttl, min).

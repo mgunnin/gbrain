@@ -87,9 +87,12 @@ function mkRepo(files: Record<string, string>): string {
 
 const SYNC_OPTS = { noPull: true, noEmbed: true, noExtract: true, sourceId: 'default' } as const;
 
+// LIVE rows only: the assertions using this pin "no live duplicate", and
+// since #4587 the reconcile SOFT-deletes the stale row (72h recovery window)
+// — the row stays in the table with deleted_at set until the purge phase.
 async function countPages(): Promise<number> {
   const rows = await engine.executeRaw<{ n: number | string }>(
-    `SELECT count(*)::int AS n FROM pages WHERE source_id = 'default'`,
+    `SELECT count(*)::int AS n FROM pages WHERE source_id = 'default' AND deleted_at IS NULL`,
   );
   return Number(rows[0]?.n ?? 0);
 }
@@ -134,9 +137,16 @@ describe('#3056: rename fallback reconciles the stale old row', () => {
     expect(dana).not.toBeNull();
     expect(dana!.compiled_truth).toContain('Carol is a person.');
 
-    // ...and the stale old row is gone — no live duplicate.
+    // ...and the stale old row is no longer live — no live duplicate.
     expect(await engine.getPage('people/carol')).toBeNull();
     expect(await countPages()).toBe(1);
+    // #4587: the reconcile SOFT-deletes — the row is recoverable for 72h
+    // (deleted_at set), not hard-deleted.
+    const staleRows = await engine.executeRaw<{ deleted_at: string | Date | null }>(
+      `SELECT deleted_at FROM pages WHERE source_id = 'default' AND slug = 'people/carol'`,
+    );
+    expect(staleRows).toHaveLength(1);
+    expect(staleRows[0].deleted_at).not.toBeNull();
   });
 
   test('dedup-skip against the old row must NOT reconcile: the only copy survives', async () => {
@@ -237,14 +247,15 @@ describe('#3056: rename fallback reconciles the stale old row', () => {
     execSync('git mv people/carol.md people/dana.md', { cwd: repo, stdio: 'pipe' });
     execSync('git commit -m "rename carol to dana"', { cwd: repo, stdio: 'pipe' });
 
-    // Inject a transient failure into the reconcile delete.
-    const origDelete = engine.deletePage.bind(engine);
-    engine.deletePage = async () => { throw new Error('injected transient delete failure'); };
+    // Inject a transient failure into the reconcile delete (#4587: the
+    // reconcile soft-deletes via softDeletePages now).
+    const origDelete = engine.softDeletePages.bind(engine);
+    engine.softDeletePages = async () => { throw new Error('injected transient delete failure'); };
     let blocked;
     try {
       blocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     } finally {
-      engine.deletePage = origDelete;
+      engine.softDeletePages = origDelete;
     }
 
     // The failed reconcile is not checkpointed past: the run blocks and the
@@ -330,8 +341,8 @@ describe('#3479 blocker 1: a permanent reconcile failure has a documented operat
     // environment where UPDATE still works but this DELETE never will):
     // every retry fails the same way. Capture stderr to pin that the
     // blocked message documents the operator exit, not just the retry.
-    const origDelete = engine.deletePage.bind(engine);
-    engine.deletePage = async () => { throw new Error('permission denied for table pages (injected permanent failure)'); };
+    const origDelete = engine.softDeletePages.bind(engine);
+    engine.softDeletePages = async () => { throw new Error('permission denied for table pages (injected permanent failure)'); };
     const stderrChunks: string[] = [];
     const origWrite = process.stderr.write.bind(process.stderr);
     const origConsoleError = console.error;
@@ -366,7 +377,7 @@ describe('#3479 blocker 1: a permanent reconcile failure has a documented operat
     } finally {
       process.stderr.write = origWrite;
       console.error = origConsoleError;
-      engine.deletePage = origDelete;
+      engine.softDeletePages = origDelete;
     }
     const stderrText = stderrChunks.join('');
     expect(stderrText).toContain("'gbrain delete <stale-slug>'");
@@ -402,13 +413,13 @@ describe('#3479 blocker 2: an orphaned rename sentinel self-clears; a real dupli
     }, { sourceId: 'default' });
     execSync('git mv people/carol.md people/dana.md', { cwd: repo, stdio: 'pipe' });
     execSync('git commit -m "rename carol to dana"', { cwd: repo, stdio: 'pipe' });
-    const origDelete = engine.deletePage.bind(engine);
-    engine.deletePage = async () => { throw new Error('injected transient delete failure'); };
+    const origDelete = engine.softDeletePages.bind(engine);
+    engine.softDeletePages = async () => { throw new Error('injected transient delete failure'); };
     try {
       const blocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
       expect(blocked.status).toBe('blocked_by_failures');
     } finally {
-      engine.deletePage = origDelete;
+      engine.softDeletePages = origDelete;
     }
     expect(openRenameRows()).toHaveLength(1);
 
@@ -548,13 +559,13 @@ describe('#3479: non-unique source_path — a soft-deleted row must not mask a l
     }, { sourceId: 'default' });
     execSync('git mv people/carol.md people/dana.md', { cwd: repo, stdio: 'pipe' });
     execSync('git commit -m "rename carol to dana"', { cwd: repo, stdio: 'pipe' });
-    const origDelete = engine.deletePage.bind(engine);
-    engine.deletePage = async () => { throw new Error('injected transient delete failure'); };
+    const origDelete = engine.softDeletePages.bind(engine);
+    engine.softDeletePages = async () => { throw new Error('injected transient delete failure'); };
     try {
       const blocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
       expect(blocked.status).toBe('blocked_by_failures');
     } finally {
-      engine.deletePage = origDelete;
+      engine.softDeletePages = origDelete;
     }
     expect(openRenameRows()).toHaveLength(1);
 

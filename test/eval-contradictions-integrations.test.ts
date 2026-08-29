@@ -13,7 +13,14 @@ import { operations, operationsByName, type OperationContext } from '../src/core
 import { loadTrend, writeRunRow } from '../src/core/eval-contradictions/trends.ts';
 import type { ProbeReport } from '../src/core/eval-contradictions/types.ts';
 
-/** Minimal OperationContext for hermetic op-handler tests. */
+/** Minimal OperationContext for hermetic op-handler tests.
+ *
+ * Trusted local BRAIN-WIDE ctx (no sourceId): these tests pin the op's
+ * MECHANICS (severity/slug/limit filters over the probe report). Since the
+ * A7 source-isolation fix, a scoped ctx (sourceId or federated grant) only
+ * surfaces findings whose BOTH endpoints resolve to in-scope pages — that
+ * contract is pinned in test/salience-source-scope.test.ts; the fixtures
+ * here deliberately seed only the run row, no pages. */
 function mkCtx(): OperationContext {
   return {
     engine,
@@ -21,8 +28,10 @@ function mkCtx(): OperationContext {
     logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as unknown as OperationContext['logger'],
     dryRun: false,
     remote: false,
-    sourceId: 'default',
-  };
+    // Unset source scope: sourceScopeOpts treats a falsy ctx.sourceId as
+    // "no scalar scope", which is exactly the trusted brain-wide shape.
+    sourceId: undefined as unknown as string,
+  } as OperationContext;
 }
 
 let engine: PGLiteEngine;

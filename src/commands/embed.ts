@@ -4,6 +4,12 @@ import type { ChunkInput } from '../core/types.ts';
 import { carryChunkMetadata, probeEmbedder } from '../core/embed-stale.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 import { resolveMaxChunkTokens } from '../core/embedding-input-limit.ts';
+import { healOversizedPageChunks, healedChunksToStaleRows } from '../core/embed-oversize-heal.ts';
+import {
+  createEmbedStallWatchdog,
+  resolveEmbedStallAbortSeconds,
+  EMBED_STALL_CLEANUP_DEADLINE_MS, type EmbedStallInfo,
+} from '../core/embed-stall.ts';
 import { createProgress, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
@@ -60,6 +66,7 @@ export type { EmbedBatchWithBackoffOpts } from '../core/embed-retry.ts';
 
 /** #3037: cap failure samples so a corpus-wide outage doesn't bloat --json. */
 const FAILURE_SAMPLE_CAP = 10;
+const DEFAULT_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS = 30_000;
 
 /**
  * #3037: record embed failures on the run result. `chunkCount` is the number
@@ -259,6 +266,12 @@ export interface EmbedResult {
    * corpus-wide outage doesn't bloat structured output. Additive field.
    */
   failure_samples: string[];
+  /**
+   * SUP-3874 heals performed this run (oversized chunks split in place).
+   * Also feeds the stall watchdog's progress key: a mass-heal prelude is
+   * real forward progress, so it must not read as a stall. Additive field.
+   */
+  healed_splits?: number;
   /** True if this run was a dry-run. */
   dryRun: boolean;
   /**
@@ -303,6 +316,17 @@ export interface EmbedResult {
     /** High-water mark of acquirers blocked on the permit (sync path). */
     maxWaiters: number;
   };
+  /**
+   * #4599: set when the progress-keyed stall watchdog aborted the drain (no
+   * successful embed progress for GBRAIN_EMBED_STALL_ABORT_SECONDS). The
+   * watchdog already released the single-flight locks and flushed the
+   * summary; partial progress is banked and the run is resumable. Error
+   * RESULT, not a throw (X6): the CLI wrapper maps it to a non-zero exit;
+   * minion handlers throw via `assertEmbedNotStalled` to fail the job.
+   * `failures`/`failure_samples` also carry a stall entry so existing
+   * failures>0 consumers surface it unchanged.
+   */
+  reason?: 'stall_timeout';
 }
 
 /**
@@ -488,10 +512,25 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
     const activeLocks: DbLockHandle[] = callerHeld ? [...(opts.heldLocks ?? [])] : sfLocks;
     const lockAbort = new AbortController();
     let heartbeat: ReturnType<typeof setInterval> | undefined;
+    let heartbeatTickAbort: AbortController | undefined;
+    let stoppingHeartbeat = false;
+    const stopHeartbeat = (): void => {
+      stoppingHeartbeat = true;
+      if (heartbeat !== undefined) {
+        clearInterval(heartbeat);
+        heartbeat = undefined;
+      }
+      if (heartbeatTickAbort && !heartbeatTickAbort.signal.aborted) {
+        heartbeatTickAbort.abort();
+      }
+    };
     // Test seam: default 5 min; tests shrink it to exercise the loss path.
     const heartbeatMs = Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS) > 0
       ? Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS)
       : 5 * 60 * 1000;
+    const heartbeatTimeoutMs = Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS) > 0
+      ? Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS)
+      : DEFAULT_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS;
     if (activeLocks.length > 0 && !opts.dryRun) {
       let consecutiveErrors = 0;
       let beating = false;
@@ -499,32 +538,51 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
         if (beating) return; // a slow tick must not stack
         beating = true;
         void (async () => {
+          const tickAbort = new AbortController();
+          heartbeatTickAbort = tickAbort;
+          let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<never>((_, reject) => {
+            timeoutTimer = setTimeout(() => {
+              tickAbort.abort();
+              reject(new Error('refresh_timeout'));
+            }, heartbeatTimeoutMs);
+            (timeoutTimer as unknown as { unref?: () => void }).unref?.();
+          });
           try {
             if (lockAbort.signal.aborted) return;
             for (const h of activeLocks) {
-              const ok = await h.refresh();
+              const ok = await Promise.race([h.refresh({ signal: tickAbort.signal }), timeout]);
               if (!ok) {
                 result.lock_lost = true;
                 serr('  [embed] single-flight lock was stolen or released mid-run; aborting the drain (partial progress is banked — re-run to resume).');
-                if (heartbeat !== undefined) clearInterval(heartbeat);
+                stopHeartbeat();
                 lockAbort.abort();
                 return;
               }
             }
             consecutiveErrors = 0;
           } catch {
+            if (stoppingHeartbeat) return;
             consecutiveErrors += 1;
             if (consecutiveErrors >= 3) {
               result.lock_lost = true;
               serr('  [embed] lock heartbeat failed 3 consecutive times; aborting the drain rather than running without mutual exclusion.');
-              if (heartbeat !== undefined) clearInterval(heartbeat);
+              stopHeartbeat();
               lockAbort.abort();
             }
           } finally {
+            if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+            if (heartbeatTickAbort === tickAbort) heartbeatTickAbort = undefined;
             beating = false;
           }
         })();
       }, heartbeatMs);
+      // Deliberately NOT unref'd: if the drain promise is lost (#4599 class),
+      // the referenced interval keeps the process alive as a LOUD hang instead
+      // of a silent exit-0 that leaks the single-flight locks. The per-tick
+      // timeout timer above IS unref'd — the interval already anchors the
+      // event loop, so the 30s tick timeout must not extend process lifetime
+      // past stopHeartbeat().
     }
     const drainSignal = anySignal(lockAbort.signal, opts.signal);
 
@@ -562,46 +620,147 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
         pacer = createNoopPacer();
       }
     }
-    try {
-      await embedAll(engine, !!opts.stale, !!opts.dryRun, result, opts.onProgress, opts.sourceId, {
-        batchSize: opts.batchSize,
-        priority: opts.priority,
-        catchUp: opts.catchUp,
-        pacer,
-        paceMaxConcurrency,
-        quiet: opts.quiet,
-        includeNullSignature: opts.includeNullSignature,
-      }, drainSignal);
-    } catch (e) {
-      // A heartbeat-triggered abort is a clean, resumable stop (lock_lost is
-      // already set + explained on stderr) — not an error to propagate.
-      if (!(result.lock_lost && e instanceof AbortError)) throw e;
-    } finally {
-      if (heartbeat !== undefined) clearInterval(heartbeat);
-      // E1: surface pacing telemetry (human + structured) when pacing was on.
-      const snap = pacer.snapshot();
-      if (snap.enabled) {
-        result.pacing = {
-          maxConcurrency: snap.maxConcurrency,
-          samples: snap.sampleCount,
-          ewmaMs: snap.ewmaMs,
-          totalSleptMs: snap.totalSleptMs,
-          sleeps: snap.sleepCount,
-          maxWaiters: snap.maxWaiters,
-        };
-        serr(
-          `  [embed] pacing: cap=${snap.maxConcurrency} samples=${snap.sampleCount} ` +
-            `ewma=${snap.ewmaMs === null ? 'n/a' : Math.round(snap.ewmaMs) + 'ms'} ` +
-            `slept=${snap.totalSleptMs}ms/${snap.sleepCount}`,
-        );
-      }
-      pacer.dispose();
+    // Shared end-of-drain cleanup: heartbeat stop, pacing summary flush,
+    // single-flight lock release (self-acquired only — caller-held locks stay
+    // with the caller per the heldLocks contract). Idempotent so the normal
+    // drain finally and the #4599 stall watchdog path can both call it: the
+    // stall path must never rely on a dead drain's finally (X5), and a
+    // late-resolving drain must not double-release after the watchdog cleaned
+    // up. Never throws (all steps best-effort).
+    let drainCleanupDone = false;
+    const flushAndRelease = async (): Promise<void> => {
+      if (drainCleanupDone) return;
+      drainCleanupDone = true;
+      stopHeartbeat();
+      try {
+        // E1: surface pacing telemetry (human + structured) when pacing was on.
+        const snap = pacer.snapshot();
+        if (snap.enabled) {
+          result.pacing = {
+            maxConcurrency: snap.maxConcurrency,
+            samples: snap.sampleCount,
+            ewmaMs: snap.ewmaMs,
+            totalSleptMs: snap.totalSleptMs,
+            sleeps: snap.sleepCount,
+            maxWaiters: snap.maxWaiters,
+          };
+          serr(
+            `  [embed] pacing: cap=${snap.maxConcurrency} samples=${snap.sampleCount} ` +
+              `ewma=${snap.ewmaMs === null ? 'n/a' : Math.round(snap.ewmaMs) + 'ms'} ` +
+              `slept=${snap.totalSleptMs}ms/${snap.sleepCount}`,
+          );
+        }
+        pacer.dispose();
+      } catch { /* telemetry must never block cleanup */ }
       // E-2: release single-flight locks (reverse order). Best-effort; the
       // lock TTL is the backstop if a release fails.
       for (const h of sfLocks.reverse()) {
         try { await h.release(); } catch { /* best-effort; TTL covers it */ }
       }
+    };
+
+    // #4599: progress-keyed stall watchdog (mirror of sync's #1950 — see
+    // src/core/embed-stall.ts for the two-clock design and the operator
+    // notes). Armed for real drains only; dryRun never embeds so "no
+    // successful progress" is its normal state, and 0/negative disables.
+    const stallSeconds = opts.dryRun ? 0 : resolveEmbedStallAbortSeconds();
+    const watchdog = stallSeconds > 0
+      ? createEmbedStallWatchdog({
+          thresholdSeconds: stallSeconds,
+          // Heals count as forward progress: a corpus-wide oversize-heal
+          // prelude (thousands of getChunks+upsertChunks before the first
+          // embed) is healthy work, not a stall — without this it would
+          // abort deterministically at the same point on every resume.
+          readProgress: () => result.embedded + (result.healed_splits ?? 0),
+        })
+      : undefined;
+
+    // The drain runs as a captured promise so the watchdog can RACE it: a
+    // wedged drain (#4599 class — lost promise, abort-ignoring HTTP call)
+    // never returns, so awaiting it directly would also never return. Errors
+    // are captured, not thrown, so a post-stall late rejection can never
+    // become an unhandled rejection.
+    let drainError: { err: unknown } | undefined;
+    const drain = (async () => {
+      try {
+        await embedAll(engine, !!opts.stale, !!opts.dryRun, result, opts.onProgress, opts.sourceId, {
+          batchSize: opts.batchSize,
+          priority: opts.priority,
+          catchUp: opts.catchUp,
+          pacer,
+          paceMaxConcurrency,
+          quiet: opts.quiet,
+          includeNullSignature: opts.includeNullSignature,
+        }, drainSignal);
+      } catch (e) {
+        // A heartbeat-triggered abort is a clean, resumable stop (lock_lost is
+        // already set + explained on stderr) — not an error to propagate.
+        if (!(result.lock_lost && e instanceof AbortError)) drainError = { err: e };
+      } finally {
+        await flushAndRelease();
+      }
+    })();
+
+    if (!watchdog) {
+      await drain;
+      if (drainError) throw drainError.err;
+      return result;
     }
+    let outcome: 'drained' | 'stalled';
+    let stallInfo: EmbedStallInfo | undefined;
+    try {
+      outcome = await Promise.race([
+        drain.then(() => 'drained' as const),
+        watchdog.stalled.then((info) => {
+          stallInfo = info;
+          return 'stalled' as const;
+        }),
+      ]);
+    } finally {
+      watchdog.stop();
+    }
+    if (outcome === 'drained') {
+      if (drainError) throw drainError.err;
+      return result;
+    }
+
+    // Stall fired. The drain may be dead — perform the watchdog's OWN bounded
+    // cleanup (X5/T5) instead of waiting on the drain's finally: abort
+    // whatever is still listening, release the single-flight locks via the
+    // direct engine-backed handles, flush the summary, and return an error
+    // RESULT (X6 — no process.exit below the CLI layer). If cleanup itself
+    // wedges (same dead pool), the ~10s deadline forces the return and the
+    // lock TTL is the backstop. A late-resolving drain finds
+    // drainCleanupDone=true and skips.
+    const apiNote = stallInfo?.msSinceLastApiResponse == null
+      ? 'no embedding-API responses observed this run (drain wedged before/inside a call)'
+      : `last embedding-API response ${Math.round(stallInfo.msSinceLastApiResponse / 1000)}s ago ` +
+        '(alive but not succeeding — retry storms trip this by design)';
+    serr(
+      `  [embed] no successful embed progress for ${stallSeconds}s — aborting (stall watchdog, refs #4599); ${apiNote}. ` +
+        `Partial progress is banked (embedded=${result.embedded}); single-flight locks released; re-run to resume. ` +
+        'Tune via GBRAIN_EMBED_STALL_ABORT_SECONDS (0 disables).',
+    );
+    lockAbort.abort();
+    // Deadline timer is REFERENCED on purpose: after stop()/stopHeartbeat it
+    // may be the only live handle — unref'ing it could let a wedged cleanup
+    // become a silent exit-0 instead of reaching the force path.
+    let cleanupDeadline: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      flushAndRelease(),
+      new Promise<void>((r) => { cleanupDeadline = setTimeout(r, EMBED_STALL_CLEANUP_DEADLINE_MS); }),
+    ]);
+    if (cleanupDeadline !== undefined) clearTimeout(cleanupDeadline);
+    if (!drainCleanupDone) {
+      serr('  [embed] stall cleanup exceeded its deadline; lock TTL is the release backstop.');
+    }
+    recordFailure(
+      result,
+      1,
+      '<stall-watchdog>',
+      new Error(`stall_timeout: no successful embed progress for ${stallSeconds}s`),
+    );
+    result.reason = 'stall_timeout';
     return result;
   }
   if (opts.slug) {
@@ -779,6 +938,15 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
     if (result.failures > 0) {
       serr(`[embed] ${result.failures} chunk(s) failed to embed. First error: ${result.failure_samples[0] ?? 'unknown'}`);
     }
+    // #4599 (X6): the stall watchdog returns an error RESULT from core; ONLY
+    // this CLI wrapper maps it to a hard non-zero process exit. Hard exit on
+    // purpose: the wedged drain may hold handles that would keep an exited-
+    // verdict process alive forever. The watchdog already released the
+    // single-flight locks and flushed the summary.
+    if (result.reason === 'stall_timeout') {
+      serr('[embed] exiting non-zero: stall watchdog aborted the drain (reason: stall_timeout); partial progress banked — re-run to resume.');
+      process.exit(1);
+    }
     return result;
   } catch (e) {
     if (progressStarted) progress.finish();
@@ -846,6 +1014,14 @@ async function embedPage(
       await engine.upsertChunks(slug, inputs, opts);
       chunks = await engine.getChunks(slug, opts);
     }
+  } else if (!dryRun) {
+    // SUP-3874: legacy chunks may predate the model input-cap. Split them
+    // before the embed call so one oversized row can't fail the page/sweep.
+    const healed = await healOversizedPageChunks(engine, slug, {
+      sourceId,
+      onSplit: (n) => serr(`  ${slug}: split ${n} oversized chunk(s) to fit embedding input limit`),
+    });
+    if (healed.changed) chunks = healed.chunks;
   }
 
   // Embed chunks without embeddings. embedding_is_null is the stored-vector
@@ -1739,10 +1915,32 @@ async function embedAllStale(
       result.total_chunks += batch.length;
 
       async function embedOneKey(key: string) {
-        const stale = byKey.get(key)!;
+        let stale = byKey.get(key)!;
         const keySourceId = stale[0]?.source_id ?? 'default';
         const slug = stale[0].slug;
         try {
+          // SUP-3874: split legacy oversized chunk_text BEFORE the embed call.
+          // `--stale` reuses stored rows; without this, one pre-cap chunk
+          // (e.g. a long pre-cap notes page on a 512-token model) fails
+          // forever and exits the sweep non-zero.
+          const healed = await observed(pacer, () =>
+            healOversizedPageChunks(engine, slug, {
+              sourceId: keySourceId,
+              onSplit: (n) => {
+                result.healed_splits = (result.healed_splits ?? 0) + n;
+                serr(`\n  ${slug}: split ${n} oversized chunk(s) to fit embedding input limit`);
+              },
+            }),
+          );
+          if (healed.changed) {
+            stale = healedChunksToStaleRows(healed.chunks, slug, keySourceId);
+            if (stale.length === 0) {
+              totalProcessedPages++;
+              result.pages_processed++;
+              return;
+            }
+          }
+
           // #3507: fetch the page row for its title + stored CR mode so the
           // re-embed reproduces the page's wrapping convention instead of
           // silently stripping contextual prefixes — `embed --stale` is the

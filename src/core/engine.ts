@@ -894,6 +894,39 @@ export interface BrainEngine {
    */
   softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null>;
   /**
+   * #4587 — batch soft-delete: single SQL round-trip via
+   * `UPDATE pages SET deleted_at = now() WHERE slug = ANY($1::text[])
+   *  AND source_id = $2 AND deleted_at IS NULL RETURNING slug`.
+   *
+   * The batch twin of `softDeletePage`, mirroring the `deletePages` contract
+   * exactly so `gbrain sync`'s delete lanes (which previously hard-deleted
+   * through `deletePages`/`deletePage`, bypassing the 72h recovery window)
+   * can swap in place:
+   *
+   * - SINGLE-BATCH PRIMITIVE: caller chunks input to `<= DELETE_BATCH_SIZE`
+   *   entries per call (see `src/core/engine-constants.ts`); larger input
+   *   THROWS. Empty input short-circuits to `[]` without touching the DB.
+   * - Returns the slugs ACTUALLY FLIPPED active→soft-deleted (order
+   *   undefined). Rows already soft-deleted — or absent — are silently
+   *   excluded (idempotent, matching `softDeletePage`'s idempotent-as-null),
+   *   so callers' `pagesAffected` tracking only sees real transitions.
+   * - `deleted_at IS NULL` predicate is load-bearing: a re-run must never
+   *   refresh `deleted_at` on an already-soft-deleted row, which would
+   *   silently extend (or restart) its 72h purge clock.
+   * - sourceId is REQUIRED (no `'default'` fallback), same as `deletePages`.
+   * - ATOMICITY: one statement, one transaction — same coarseness note as
+   *   `deletePages`; sync's decompose-on-batch-failure falls back to
+   *   one-element batches per slug.
+   *
+   * Unlike `deletePages`, NOTHING cascades: chunks/links/timeline rows stay
+   * intact behind the `deleted_at` filters (68 read-side filters, #1702
+   * class), the autopilot purge phase hard-deletes after 72h via
+   * `purgeDeletedPages`, and a re-import within the window revives the page
+   * through `putPage`'s ON CONFLICT `deleted_at = NULL`.
+   * `deletePage`/`deletePages` remain the purge/teardown primitives.
+   */
+  softDeletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]>;
+  /**
    * v0.26.5 — clear `deleted_at` on a soft-deleted page. Returns true iff a
    * row was restored. False if the slug is unknown OR the page is not
    * currently soft-deleted (idempotent-as-false).
@@ -2182,8 +2215,16 @@ export interface BrainEngine {
   revertToVersion(slug: string, versionId: number, opts?: { sourceId?: string }): Promise<void>;
 
   // Stats + health
-  getStats(): Promise<BrainStats>;
-  getHealth(): Promise<BrainHealth>;
+  /**
+   * #4592: both diagnostics take an optional source scope (same shape as
+   * sourceScopeOpts). Omitted = brain-wide (trusted local). Scoped = EVERY
+   * counter/coverage/degree confines to the grant — including derived-table
+   * counts via their page joins, and link-derived numbers only when BOTH
+   * endpoints are in scope — so an excluded source's numbers can't be
+   * recovered by subtraction.
+   */
+  getStats(opts?: { sourceId?: string; sourceIds?: string[] }): Promise<BrainStats>;
+  getHealth(opts?: { sourceId?: string; sourceIds?: string[] }): Promise<BrainHealth>;
 
   // Ingest log
   logIngest(entry: IngestLogInput): Promise<void>;

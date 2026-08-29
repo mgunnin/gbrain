@@ -18,6 +18,7 @@ import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import { _resetAdmissionCacheForTest } from '../src/core/minions/admission.ts';
+import { idTakingJobsOps } from './helpers/ops-registry.ts';
 
 let engine: PGLiteEngine;
 
@@ -145,5 +146,64 @@ describe('submit_job — owner-token redaction', () => {
     expect(body.id).toBeGreaterThan(0);
     expect(body.private_queue_owner_token).toBeNull();
     expect(body.private_queue_owner_token).not.toBe('[redacted]');
+  });
+});
+
+/** A2 (test-gap wave 1): status-variant seeder for the cancel/retry pair. */
+async function seedPrivateJobWithStatus(status: string): Promise<number> {
+  const rows = await engine.executeRaw<{ id: number }>(
+    `INSERT INTO minion_jobs (name, queue, status, data, private_queue_owner_token, private_queue_lease_until)
+     VALUES ('subagent', 'dream-inline-1700000000000-cafe0002', $1, '{}'::jsonb, $2, now() + interval '10 minutes')
+     RETURNING id`,
+    [status, RAW_TOKEN],
+  );
+  return Number(rows[0].id);
+}
+
+describe('cancel_job / retry_job — owner-token redaction (A2)', () => {
+  it('cancel_job redacts a present token across the whole envelope', async () => {
+    const id = await seedPrivateJobWithStatus('waiting');
+    const res = await dispatchToolCall(engine, 'cancel_job', { id }, { ...STDIO });
+    expect(res.isError ?? false).toBe(false);
+    expect(parsed(res).private_queue_owner_token).toBe('[redacted]');
+    expect(res.content[0].text).not.toContain(RAW_TOKEN);
+  });
+
+  it('retry_job redacts a present token across the whole envelope', async () => {
+    const id = await seedPrivateJobWithStatus('failed');
+    const res = await dispatchToolCall(engine, 'retry_job', { id }, { ...STDIO });
+    expect(res.isError ?? false).toBe(false);
+    expect(parsed(res).private_queue_owner_token).toBe('[redacted]');
+    expect(res.content[0].text).not.toContain(RAW_TOKEN);
+  });
+
+  it('null passthrough on both ops: tokenless jobs report null, never the string [redacted]', async () => {
+    const waiting = await seedPlainJob();
+    const cancelRes = await dispatchToolCall(engine, 'cancel_job', { id: waiting }, { ...STDIO });
+    expect(parsed(cancelRes).private_queue_owner_token).toBeNull();
+    const failedRows = await engine.executeRaw<{ id: number }>(
+      `INSERT INTO minion_jobs (name, queue, status, data) VALUES ('embed', 'default', 'failed', '{}'::jsonb) RETURNING id`,
+    );
+    const retryRes = await dispatchToolCall(engine, 'retry_job', { id: Number(failedRows[0].id) }, { ...STDIO });
+    expect(parsed(retryRes).private_queue_owner_token).toBeNull();
+  });
+});
+
+describe('registry sweep ratchet — no jobs op envelope may carry the raw token', () => {
+  it('every id-taking jobs op, against waiting AND failed token-bearing jobs, never leaks', async () => {
+    const idOps = idTakingJobsOps();
+    // The ratchet's teeth: if a new id-taking jobs op lands, it is swept
+    // automatically — an unredacted return shows up here, not in prod.
+    expect(idOps.length).toBeGreaterThanOrEqual(6);
+    for (const status of ['waiting', 'failed'] as const) {
+      for (const op of idOps) {
+        const id = await seedPrivateJobWithStatus(status);
+        const args: Record<string, unknown> = { id };
+        if ((op.params as Record<string, unknown>).message) args.message = 'sweep-probe';
+        // Success OR error envelope — the raw capability must appear in neither.
+        const res = await dispatchToolCall(engine, op.name, args, { ...STDIO });
+        expect(res.content[0].text).not.toContain(RAW_TOKEN);
+      }
+    }
   });
 });

@@ -22,7 +22,7 @@ import type { SqlValue } from '../sql-query.ts';
 import { deriveResolutionTuple, finalizeScorecard } from '../takes-resolution.ts';
 import { normalizeWeightForStorage } from '../takes-fence.ts';
 import { buildTakeRows } from '../batch-rows.ts';
-import { takeRowToTake, takeHitRowToHit, tryParseEmbedding } from '../utils.ts';
+import { staleTakeRowToRow, takeRowToTake, takeHitRowToHit, tryParseEmbedding } from '../utils.ts';
 
 /** Narrow slice of PostgresEngine the takes operations use. */
 export interface PgTakesDeps {
@@ -420,12 +420,7 @@ export async function listStaleTakes(deps: PgTakesDeps): Promise<StaleTakeRow[]>
       ORDER BY t.id
       LIMIT 100000
     `;
-    return rows.map((row) => ({
-      take_id: Number(row.take_id),
-      page_slug: String(row.page_slug),
-      row_num: Number(row.row_num),
-      claim: String(row.claim),
-    }));
+    return rows.map((row) => staleTakeRowToRow(row as Record<string, unknown>));
   }
 
 export async function updateTakeEmbeddings(

@@ -5,7 +5,8 @@
 //      via a single raw SQL query (NOT EXISTS subquery filters out
 //      pages already extracted by content hash — see "Idempotency" below).
 //   2. Dedup by content_hash; transcripts win on collision.
-//   3. Per work-item, ask Haiku for 1-3 atoms.
+//   3. Per work-item, ask the configured extract_atoms model (key-aware
+//      utility-tier default, see resolveExtractAtomsModel below) for 1-3 atoms.
 //   4. Write each atom via importFromContent(slug, markdown, {sourceId})
 //      with sourceId threaded so federated brains route correctly. The
 //      canonical import path (not engine.putPage) is what chunks and embeds
@@ -50,6 +51,7 @@
 // which made the NOT EXISTS guard ineffective on federated brains.
 
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
+import { stripReasoningBlocks } from '../llm-json.ts';
 import type { PhaseResult } from '../cycle.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { ProgressReporter } from '../progress.ts';
@@ -447,6 +449,40 @@ export async function atomsExistingForHashes(
 }
 
 /**
+ * The exact two-step model resolution `runPhaseExtractAtoms` uses:
+ * `models.dream.extract_atoms` DB config wins if set (same plain-`||`
+ * truthiness as always — a whitespace-only value IS "configured"), else the
+ * key-aware `resolveTierDefault('utility')`. Deliberately NOT
+ * `resolveModel()`'s fuller chain (which also honors `models.tier.utility`,
+ * `models.default`, and an env var) — extract_atoms has never read those, and
+ * unifying the two behaviors is a separate, larger change. Exported so
+ * `gbrain models` can report the actual routing instead of a generic chain
+ * that can diverge from it in partially-configured installs; `source` comes
+ * from the SAME call as `model` so the report's attribution can never
+ * disagree with the resolved value. Fail-soft: a throwing config read routes
+ * to the tier default (the same end state runPhaseExtractAtoms's config-read
+ * try/catch has always produced).
+ */
+export async function resolveExtractAtomsModelWithSource(
+  engine: BrainEngine,
+): Promise<{ model: string; source: 'config' | 'tier_default' }> {
+  let configuredModel: string | null = null;
+  try {
+    configuredModel = await engine.getConfig('models.dream.extract_atoms');
+  } catch {
+    // Fail-soft — fall through to the tier default.
+  }
+  return configuredModel
+    ? { model: configuredModel, source: 'config' }
+    : { model: resolveTierDefault('utility'), source: 'tier_default' };
+}
+
+/** String-returning wrapper for runtime callers (`runPhaseExtractAtoms`). */
+export async function resolveExtractAtomsModel(engine: BrainEngine): Promise<string> {
+  return (await resolveExtractAtomsModelWithSource(engine)).model;
+}
+
+/**
  * v0.41 minimal extract_atoms body, rebuilt for v0.41.2.1.
  *
  * Test-driven minimum: takes _transcripts AND _pages directly when set,
@@ -607,7 +643,7 @@ export async function runPhaseExtractAtoms(
     };
   }
 
-  // 4. Per work-item: extract atoms via Haiku
+  // 4. Per work-item: extract atoms via the configured extract_atoms model
   let totalAtomsExtracted = 0;
   let transcriptsProcessed = 0;
   let pagesProcessed = 0;
@@ -618,6 +654,9 @@ export async function runPhaseExtractAtoms(
   let budgetExhausted = false;
   // #3813: key-aware tier default, not a hardcoded Anthropic model — an
   // OPENAI_API_KEY-only install must not route to an unservable provider.
+  // Pre-computed so a config-read failure inside the try below (caught, see
+  // "Keep safe defaults" comment) still leaves extractModel on this default,
+  // matching the pre-refactor fail-soft behavior exactly.
   let extractModel = resolveTierDefault('utility');
   let budgetCap = DEFAULT_BUDGET_USD;
   // #4529/#4540: the per-item input/output caps were hardcoded (slice(0, 50_000) +
@@ -627,12 +666,7 @@ export async function runPhaseExtractAtoms(
   let maxOutputTokens = DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS;
   let pacingMs = 0;
   try {
-    const configuredModel = await engine.getConfig('models.dream.extract_atoms');
-    if (configuredModel) extractModel = configuredModel;
-    // `models.dream.extract_atoms` is DB-plane/operator-selected config.
-    // The gateway no longer has a model allowlist/extended-model registry:
-    // configured per-task chat models resolve like `models.default`, so local
-    // user-managed providers (e.g. Ollama tags) need no registration here.
+    extractModel = await resolveExtractAtomsModel(engine);
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
     if (configuredBudget) {
       const n = Number(configuredBudget);
@@ -669,7 +703,7 @@ export async function runPhaseExtractAtoms(
     }
   } catch {
     // Keep safe defaults on any config-read failure: key-aware utility-tier
-    // model, $0.30 cap, default max_source_chars.
+    // model, $0.30 cap, default input cap (max_input_chars).
   }
   // A cost cap is only meaningful for a model the tracker can price.
   // BudgetTracker.reserve() hard-fails with BudgetExhausted(reason:'no_pricing')
@@ -1086,6 +1120,23 @@ export type AtomsParseOutcome =
   | { ok: false; reason: string };
 
 export function parseAtomsOutcome(raw: string): AtomsParseOutcome {
+  const direct = parseAtomsOutcomeInner(raw);
+  if (direct.ok) return direct;
+  // Same reasoning-block hazard as the facts extractor: `indexOf('[')` below
+  // finds a bracket inside <think> when the model drafts its array while
+  // reasoning, so the parse fails and the page is halted. Ladder, not a
+  // pre-filter: raw first, stripped only on failure — and the ORIGINAL
+  // outcome is returned when the retry also fails, so error reasons are
+  // unchanged for non-reasoning models.
+  const stripped = stripReasoningBlocks(raw);
+  if (stripped && stripped !== raw.trim()) {
+    const retry = parseAtomsOutcomeInner(stripped);
+    if (retry.ok) return retry;
+  }
+  return direct;
+}
+
+function parseAtomsOutcomeInner(raw: string): AtomsParseOutcome {
   // Strip markdown code fences if the LLM wrapped JSON in them.
   let cleaned = raw.trim();
   const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);

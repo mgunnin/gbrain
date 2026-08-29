@@ -330,7 +330,7 @@ export async function checkProviderSunset(engine: BrainEngine, now: number = Dat
         message: 'Check suppressed via doctor.suppress_provider_sunset (unset it to re-enable).',
       };
     }
-    const { DEFAULT_EMBEDDING_MODEL, ZEROENTROPY_SUNSET_DATE } = await import('../../../core/ai/defaults.ts');
+    const { DEFAULT_EMBEDDING_MODEL, ZEROENTROPY_SUNSET_DATE, sunsetDateHasPassed } = await import('../../../core/ai/defaults.ts');
     // Effective model: gateway when configured (file/env plane, the runtime
     // truth); the shipped default otherwise — an unset-config brain resolves
     // to the default at runtime, so it is just as affected.
@@ -375,7 +375,9 @@ export async function checkProviderSunset(engine: BrainEngine, now: number = Dat
         message: `No configured provider has an announced shutdown (embedding: ${model}).`,
       };
     }
-    const past = now >= Date.parse(`${ZEROENTROPY_SUNSET_DATE}T00:00:00Z`);
+    // Shared date-itself-counts comparison with the gateway's rerank
+    // short-circuit (defaults.ts:sunsetDateHasPassed) — the two cannot drift.
+    const past = sunsetDateHasPassed(ZEROENTROPY_SUNSET_DATE, new Date(now));
     const parts: string[] = [];
     let hasVectors = false;
     if (onSunsetEmbedding) {

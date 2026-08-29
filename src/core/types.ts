@@ -447,6 +447,10 @@ export interface DomainBankRow {
 }
 
 export interface SalienceOpts {
+  /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
+  sourceId?: string;
+  /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
+  sourceIds?: string[];
   /** Window in days. Default 14. */
   days?: number;
   /** Max rows to return (clamped at 100). Default 20. */
@@ -462,10 +466,6 @@ export interface SalienceOpts {
    * Default preserves v0.29.0 ranking; 'on' is opt-in.
    */
   recency_bias?: 'flat' | 'on';
-  /** Source scope (canonical precedence: array wins over scalar). Undefined =
-   *  unscoped (trusted local callers). */
-  sourceId?: string;
-  sourceIds?: string[];
 }
 
 export interface SalienceResult {
@@ -551,17 +551,18 @@ export const ENRICH_ORDER_SQL: Record<EnrichCandidatesOpts['order'], string> = {
  * current count exceeds `mean + sigma * stddev`. Year cohort deferred to v0.30.
  */
 export interface AnomaliesOpts {
+  /** Scalar source scope. Ignored when `sourceIds` is set (array wins). */
+  sourceId?: string;
+  /** Federated source scope — the op layer passes `ctx.auth.allowedSources`. */
+  sourceIds?: string[];
   /** ISO date (YYYY-MM-DD). Default = today (UTC). */
   since?: string;
   /** Days of history for the baseline. Default 30. */
   lookback_days?: number;
-  /** Sigma threshold. Default 3.0. */
+  /** Sigma threshold. Default 3.0. Scope note: the source scope above is
+   *  applied to BOTH the baseline and today windows so the anomaly math
+   *  stays consistent. */
   sigma?: number;
-  /** Source scope (canonical precedence: array wins over scalar). Applied to
-   *  BOTH the baseline and today windows so the anomaly math stays consistent.
-   *  Undefined = unscoped (trusted local callers). */
-  sourceId?: string;
-  sourceIds?: string[];
 }
 
 export interface AnomalyResult {
@@ -649,7 +650,7 @@ export interface StaleChunkRow {
   slug: string;
   chunk_index: number;
   chunk_text: string;
-  chunk_source: 'compiled_truth' | 'timeline';
+  chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code';
   model: string | null;
   token_count: number | null;
   /** v0.31.12: source_id so embed --stale can thread it through getChunks/upsertChunks. */

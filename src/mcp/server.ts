@@ -14,6 +14,7 @@ import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
 import { gcSessionContextState } from '../core/context/session-state.ts';
 import { bindResolveIpcForServe } from './resolve-ipc-binding.ts';
+import { GBRAIN_MCP_INSTRUCTIONS } from './instructions.ts';
 import { isEngineDegraded, onEngineRecovered } from '../core/degraded-marker.ts';
 
 export async function resolveMcpStdioSourceScope(
@@ -134,7 +135,10 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     // gate-hidden catalog (stdioVisibleTools fail-closes every publishGateKey
     // op on engine failure) and caches it — recovery sends the notification
     // so the full catalog comes back without a harness restart.
-    { capabilities: { tools: { listChanged: true } } },
+    {
+      capabilities: { tools: { listChanged: true } },
+      instructions: GBRAIN_MCP_INSTRUCTIONS,
+    },
   );
 
   // MEMORY_VERBS v1 surface mode: 'full' (default — every op, byte-identical

@@ -109,6 +109,18 @@ export const RERANKER_SUNSETS: ReadonlyArray<RerankerSunset> = Object.freeze([
   }),
 ]);
 
+/**
+ * Date-itself-counts sunset comparison, shared by the gateway's post-sunset
+ * rerank short-circuit and the doctor's `provider_sunset` check so the two
+ * surfaces cannot drift: the hosted API "shuts down ON this date", so the
+ * date itself already counts as past. `dateStr` is an ISO date (YYYY-MM-DD)
+ * compared against UTC midnight; `now` defaults to the wall clock (callers
+ * with an injected clock/test seam pass their own).
+ */
+export function sunsetDateHasPassed(dateStr: string, now: Date = new Date()): boolean {
+  return now.getTime() >= Date.parse(`${dateStr}T00:00:00Z`);
+}
+
 /** Sunset entry matching a reranker model string, or null when it is live. */
 export function rerankerSunset(model: string | null | undefined): RerankerSunset | null {
   if (!model) return null;

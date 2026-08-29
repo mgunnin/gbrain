@@ -247,13 +247,17 @@ describe('E2E: find_contradictions MCP op on Postgres', () => {
   test('returns "no probe runs" note on empty table', async () => {
     if (!engine) return;
     const op = operationsByName['find_contradictions'];
+    // Trusted local brain-wide ctx: these tests pin op MECHANICS against a
+    // seeded report with no page rows. A scoped/remote ctx would (correctly)
+    // drop every finding under the both-endpoints-in-scope pass — that
+    // contract is pinned in test/salience-source-scope.test.ts, not here.
     const ctx: OperationContext = {
       engine,
       config: {} as OperationContext['config'],
       logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as unknown as OperationContext['logger'],
       dryRun: false,
-      remote: true,
-      sourceId: 'default',
+      remote: false,
+      sourceId: undefined as unknown as string,
     };
     const result = await op.handler(ctx, {}) as { contradictions: unknown[]; note?: string };
     expect(result.contradictions).toEqual([]);
@@ -300,13 +304,17 @@ describe('E2E: find_contradictions MCP op on Postgres', () => {
     }), 100);
 
     const op = operationsByName['find_contradictions'];
+    // Trusted local brain-wide ctx: these tests pin op MECHANICS against a
+    // seeded report with no page rows. A scoped/remote ctx would (correctly)
+    // drop every finding under the both-endpoints-in-scope pass — that
+    // contract is pinned in test/salience-source-scope.test.ts, not here.
     const ctx: OperationContext = {
       engine,
       config: {} as OperationContext['config'],
       logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as unknown as OperationContext['logger'],
       dryRun: false,
-      remote: true,
-      sourceId: 'default',
+      remote: false,
+      sourceId: undefined as unknown as string,
     };
 
     const all = await op.handler(ctx, {}) as { contradictions: unknown[]; total_in_run: number };

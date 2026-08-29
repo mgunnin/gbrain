@@ -60,7 +60,7 @@ Isolation model:
 
 The write fence is a **write** boundary within a source. It is not a privacy
 boundary, and it does not make every side effect prefix-clean. As of
-v0.42.73.2:
+v0.47.1.0:
 
 - **The fence follows a delegated write.** When a client with `agent` scope
   hands work to a subagent via `submit_agent`, that subagent runs under its own
@@ -86,12 +86,17 @@ v0.42.73.2:
   page content. Unreachable in the layout above (the `agents` source is
   path-less and holds no code pages); it applies only if you point employee
   writes at a code-synced source.
-- **A few read ops are still brain-wide** and ignore the federated grant:
-  `get_recent_salience`, `find_anomalies`, `find_contradictions`, and
-  `sources_list`/`sources_status` (which expose source ids, paths and URLs).
-  A read-scoped client can learn facts derived from sources it was not
-  granted. Pre-existing, not introduced by the fence; if that matters for
-  your deployment, withhold those tools at the harness layer for now.
+- **Contradiction findings are matched by slug, not source.** The read ops
+  that used to be brain-wide — `get_recent_salience`, `find_anomalies`,
+  `find_contradictions`, and `sources_list`/`sources_status` — now honor the
+  federated grant (`sources_status` answers `not_found` for an out-of-grant
+  id, indistinguishable from a nonexistent source). The residual is
+  `find_contradictions`: findings carry no source attribution, so the scope
+  check is slug existence within the grant — a finding derived from an
+  ungranted source stays visible when a granted source holds a page with
+  the same slug. Per-endpoint source attribution is the filed follow-up
+  (TODOS.md); withhold `find_contradictions` at the harness layer if that
+  residual matters for your deployment.
 - **Reads touch `last_retrieved_at`** on the pages they return, including
   pages in read-only sources. Freshness/usage signals are therefore
   writable-by-reading; nothing else about the page is.

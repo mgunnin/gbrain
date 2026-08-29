@@ -233,6 +233,19 @@ const sources_status: Operation = {
   },
   scope: 'read',
   handler: async (ctx, p) => {
+    // Source isolation, mirroring sources_list's #4433 wave-L posture
+    // exactly (the maintainer decision that superseded the wave-g "scalar
+    // callers keep the full listing" carve-out): EVERY untrusted caller
+    // (anything not strictly remote === false) is confined through the
+    // canonical sourceScopeOpts ladder — federated grant > scalar bound
+    // source. Trusted local CLI keeps the full operator view. Out-of-scope
+    // ids answer not_found, indistinguishable from a nonexistent source
+    // (anti-enumeration), matching get_agent_job's shape.
+    const scope = ctx.remote === false ? {} : sourceScopeOpts(ctx);
+    const allowed = scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : null);
+    if (allowed && !allowed.includes(p.id as string)) {
+      throw new OperationError('not_found', `Unknown source: ${p.id}`);
+    }
     const { getSourceStatus } = await import('../sources-ops.ts');
     return getSourceStatus(ctx.engine, p.id as string);
   },

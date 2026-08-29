@@ -117,7 +117,10 @@ import {
   NEW_INSTALL_DEFAULT_EMBEDDING_MODEL,
   LEGACY_DEFAULT_RERANKER_MODEL,
   renderCanonicalMigrationCommands,
+  rerankerSunset, sunsetDateHasPassed,
+  type RerankerSunset,
 } from './defaults.ts';
+import { logRerankFailure } from '../rerank-audit.ts';
 const DEFAULT_EXPANSION_MODEL = 'anthropic:claude-haiku-4-5-20251001';
 const DEFAULT_CHAT_MODEL = 'anthropic:claude-sonnet-4-6';
 // v0.35.0.0+: reranker default. Used only when search.reranker.enabled is set
@@ -1564,6 +1567,62 @@ export const perplexityCompatFetch = (async (input: RequestInfo | URL, init?: Re
 const _sunsetWarned = new Set<string>();
 export function _resetSunsetWarningsForTest(): void {
   _sunsetWarned.clear();
+  _sunsetShortCircuited.clear();
+}
+
+/**
+ * #3657 post-sunset rerank short-circuit. Once a listed reranker's hosted API
+ * has passed its announced shutdown date, every gateway.rerank() call against
+ * it can only burn the per-query timeout (up to 5s) before failing — so the
+ * check below skips the HTTP call entirely and applyReranker fails open at
+ * once. It runs where the EFFECTIVE model is resolved (inside rerank(), after
+ * `input.model ?? getRerankerModel() ?? DEFAULT_RERANKER_MODEL`) because the
+ * main case is an ABSENT per-call model landing on the configured/legacy
+ * default. Same base-URL-override suppression as warnSunsetOnce: a
+ * self-hosted wire-compatible endpoint outlives the hosted shutdown.
+ *
+ * Traceability (F3): the FIRST short-circuit per process per model writes one
+ * `sunset_short_circuit` row to the rerank-failures audit JSONL (doctor's
+ * reranker_health signal) and one stderr line — per-query rows would flood
+ * the audit file on every search until the user migrates. The injected clock
+ * (`__setSunsetClockForTests`) exists for date-matrix tests only.
+ */
+const _sunsetShortCircuited = new Set<string>();
+let _sunsetClock: (() => Date) | null = null;
+export function __setSunsetClockForTests(fn: (() => Date) | null): void {
+  _sunsetClock = fn;
+}
+function sunsetHasPassed(sunset: RerankerSunset): boolean {
+  // Shared date-itself-counts comparison with doctor's provider_sunset check
+  // (defaults.ts:sunsetDateHasPassed) so the two surfaces cannot drift.
+  return sunsetDateHasPassed(sunset.date, _sunsetClock ? _sunsetClock() : undefined);
+}
+function sunsetShortCircuitOnce(
+  modelStr: string,
+  sunset: RerankerSunset,
+  query: string,
+  docCount: number,
+): void {
+  try {
+    if (_sunsetShortCircuited.has(modelStr)) return;
+    _sunsetShortCircuited.add(modelStr);
+    logRerankFailure({
+      model: modelStr,
+      reason: 'sunset_short_circuit',
+      query_hash: createHash('sha256').update(query, 'utf8').digest('hex').slice(0, 8),
+      doc_count: docCount,
+      error_summary:
+        `provider sunset ${sunset.date} passed — rerank calls skipped this process ` +
+        `(results pass through unreranked); switch: gbrain config set search.reranker.model ${sunset.replacement}`,
+    });
+    process.stderr.write(
+      `[gbrain] reranker ${modelStr} passed its ${sunset.date} provider sunset — rerank calls ` +
+        `are skipped (results pass through unreranked). ` +
+        `Switch: \`gbrain config set search.reranker.model ${sunset.replacement}\`\n`,
+    );
+  } catch {
+    // Traceability must never block the fail-open path.
+  }
 }
 function warnSunsetOnce(recipe: Recipe, touchpoint: 'embedding' | 'reranker'): void {
   try {
@@ -4362,7 +4421,7 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
  * loud-fail (auth — should have been caught by doctor). Mirror of the
  * RemoteMcpError pattern in src/core/mcp-client.ts. */
 export class RerankError extends Error {
-  reason: 'auth' | 'rate_limit' | 'network' | 'timeout' | 'payload_too_large' | 'unknown';
+  reason: 'auth' | 'rate_limit' | 'network' | 'timeout' | 'payload_too_large' | 'sunset_short_circuit' | 'unknown';
   status?: number;
   constructor(message: string, reason: RerankError['reason'], status?: number) {
     super(message);
@@ -4462,6 +4521,20 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
       `Model "${parsed.modelId}" is not listed for ${recipe.name} reranker. ` +
       `Known: ${tp.models.join(', ')}.`,
       'unknown',
+    );
+  }
+  // #3657 post-sunset short-circuit (see sunsetShortCircuitOnce): past the
+  // provider's announced shutdown, skip the HTTP call entirely and throw the
+  // dedicated fail-open reason. Checked HERE — the effective model is resolved
+  // by now — and suppressed under a base-URL override (self-host continuity,
+  // same rule warnSunsetOnce applies).
+  const sunset = rerankerSunset(modelStr);
+  if (sunset && !_config?.base_urls?.[recipe.id] && sunsetHasPassed(sunset)) {
+    sunsetShortCircuitOnce(modelStr, sunset, input.query, input.documents.length);
+    throw new RerankError(
+      `Reranker ${modelStr} passed its ${sunset.date} provider sunset — rerank skipped. ` +
+        `Switch: gbrain config set search.reranker.model ${sunset.replacement}`,
+      'sunset_short_circuit',
     );
   }
   warnSunsetOnce(recipe, 'reranker');

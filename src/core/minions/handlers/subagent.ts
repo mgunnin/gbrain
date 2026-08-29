@@ -214,6 +214,26 @@ async function runLoopConvertingLeaseLoss<T>(
     if (wasLeaseLost()) {
       throw new RateLeaseUnavailableError(leaseKey, maxConcurrent, maxConcurrent);
     }
+    // Same terminal classification the legacy raw-SDK path applies below
+    // (see isPromptTooLongError's call site): a 400 "prompt is too long" is
+    // unrecoverable — retrying with the same prompt will always fail the
+    // same way. `e` here is already normalizeAIError()-wrapped (thrown by
+    // gateway.chat()'s catch boundary), which copies only the OUTER message
+    // onto the new error and stores the raw provider error on `.cause` —
+    // isPromptTooLongError() walks that cause chain so the SDK's inner
+    // `.error.message` shape (Anthropic's actual wire shape) still matches
+    // post-wrap. Without this, a gateway-native subagent job (required for
+    // any non-Anthropic model) retries a prompt-too-long condition like any
+    // other transient failure up to max_stalled instead of fast-failing —
+    // the exact dream-cycle queue-clog class the legacy-path fix was built
+    // to prevent, just on the newer path.
+    // Single walk: extractPromptTooLongDetail is non-null exactly when
+    // isPromptTooLongError matches (both wrap the same matcher). The detail is
+    // the matched provider text ("prompt is too long: N tokens > max"), not
+    // `e.message` — post-normalizeAIError that is only the generic outer
+    // wrapper; the useful token counts live on `.cause`, same as the match.
+    const detail = extractPromptTooLongDetail(e);
+    if (detail !== null) throw new UnrecoverableError(`prompt_too_long: ${detail}`);
     throw e;
   }
 }
@@ -1790,16 +1810,53 @@ export { RateLeaseUnavailableError } from '../rate-leases.ts';
  * Case-insensitive on the phrase. Also matches `request_too_large` and
  * `invalid_request_error` types when accompanied by the same message.
  *
+ * Walks up to 3 levels of `.cause` (bounded, same depth as
+ * classifyGlobalLlmError in errors.ts): gateway.chat()'s catch boundary
+ * wraps every error via normalizeAIError(), which copies only the OUTER
+ * `.message` onto the new AIConfigError/AITransientError and stores the
+ * original raw error on `.cause` — the SDK's `.error.message` inner shape
+ * (the one Anthropic actually uses, per the existing "matches when message
+ * is on the inner .error.message field" unit test below) is otherwise lost
+ * post-normalization, silently defeating detection on the gateway-native
+ * path where callers only ever see the already-normalized error.
+ *
  * Exported for unit testing.
  */
 export function isPromptTooLongError(err: unknown): boolean {
-  if (!err) return false;
+  return findPromptTooLongMatch(err) !== null;
+}
+
+/**
+ * Same bounded `.cause` walk as isPromptTooLongError, but returns the
+ * matched phrase-bearing text (e.g. "prompt is too long: 1707509 tokens >
+ * 1000000 maximum") instead of a boolean — used at the terminal-classification
+ * call site so a normalizeAIError()-wrapped error's dead-letter message
+ * carries the actually useful provider detail instead of the generic outer
+ * wrapper text (e.g. "BadRequestError"). Returns null when no match (mirrors
+ * isPromptTooLongError returning false for the same input).
+ */
+export function extractPromptTooLongDetail(err: unknown): string | null {
+  return findPromptTooLongMatch(err);
+}
+
+function findPromptTooLongMatch(err: unknown): string | null {
+  let cur: unknown = err;
+  for (let depth = 0; depth < 3 && cur != null; depth++) {
+    const matched = matchesPromptTooLong(cur);
+    if (matched !== null) return matched;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
+function matchesPromptTooLong(err: unknown): string | null {
+  if (!err) return null;
   // Walk both `.message` and `.error?.message` shapes.
   const msg = (err as { message?: unknown })?.message;
   const inner = (err as { error?: { message?: unknown } })?.error?.message;
   const candidates = [msg, inner].filter((s): s is string => typeof s === 'string');
   for (const c of candidates) {
-    if (/prompt is too long/i.test(c)) return true;
+    if (/prompt is too long/i.test(c)) return c;
   }
   // Anthropic SDK wraps with .status; 400 + 'invalid_request_error' /
   // 'request_too_large' types both indicate the same class. Only treat
@@ -1809,10 +1866,10 @@ export function isPromptTooLongError(err: unknown): boolean {
   const errType = (err as { error?: { type?: unknown } })?.error?.type;
   if (status === 400 && (errType === 'invalid_request_error' || errType === 'request_too_large')) {
     for (const c of candidates) {
-      if (/too long|exceed|maximum/i.test(c)) return true;
+      if (/too long|exceed|maximum/i.test(c)) return c;
     }
   }
-  return false;
+  return null;
 }
 
 // ── Testing surface ─────────────────────────────────────────

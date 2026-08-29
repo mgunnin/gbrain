@@ -87,7 +87,25 @@ const submit_job: Operation = {
   scope: 'admin',
   handler: async (ctx, p) => {
     const name = typeof p.name === 'string' ? p.name.trim() : '';
-    const jobData = (p.data as Record<string, unknown>) || {};
+    const jobData = { ...((p.data as Record<string, unknown>) || {}) };
+    // Derived-identity fence for `data.client_id` (same posture as
+    // send_job_message's sender fence): it is a spend-attribution identity —
+    // handlers settle LLM/embedding spend against it via getJobClientId →
+    // recordMinionJobSpend (minion-spend.ts), charging that OAuth client's
+    // mcp_spend_log / daily cap. A remote caller must NEVER pick it
+    // (spoofing another client's bill/cap): overwrite with the
+    // AUTHENTICATED client id — the same identity source run_onboard's A23
+    // stamping uses — or strip the key when no authenticated identity
+    // exists (spend then records clientId=null, global accounting only).
+    // Trusted local callers (ctx.remote === false) pass through unchanged.
+    if (ctx.remote !== false) {
+      const authClientId = ctx.auth?.clientId;
+      if (typeof authClientId === 'string' && authClientId.length > 0) {
+        jobData.client_id = authClientId;
+      } else {
+        delete jobData.client_id;
+      }
+    }
     const translateAdmissionError = (e: unknown): never => {
       if (e instanceof InvalidEmbedBackfillSourceIdError) {
         throw new OperationError('invalid_params', e.message);
@@ -638,7 +656,9 @@ const cancel_job: Operation = {
     // root cascade as usual). Foreign and missing ids share one envelope.
     const cancelled = await queue.cancelJob(p.id as number, owner !== null ? { ownerClientId: owner } : undefined);
     if (!cancelled) throw new OperationError('invalid_params', `Cannot cancel job ${p.id} (may already be in terminal status)`);
-    return cancelled;
+    // private_queue_owner_token is a capability credential (lease renewal /
+    // attach), not job data — never expose it over MCP envelopes.
+    return { ...cancelled, private_queue_owner_token: cancelled.private_queue_owner_token == null ? null : '[redacted]' };
   },
 };
 
@@ -656,7 +676,9 @@ const retry_job: Operation = {
     const queue = new MinionQueue(ctx.engine);
     const retried = await queue.retryJob(p.id as number);
     if (!retried) throw new OperationError('invalid_params', `Cannot retry job ${p.id} (must be failed or dead)`);
-    return retried;
+    // private_queue_owner_token is a capability credential (lease renewal /
+    // attach), not job data — never expose it over MCP envelopes.
+    return { ...retried, private_queue_owner_token: retried.private_queue_owner_token == null ? null : '[redacted]' };
   },
 };
 
@@ -685,8 +707,8 @@ const pause_job: Operation = {
   params: {
     id: { type: 'number', required: true, description: 'Job ID' },
   },
-  scope: 'admin',
   mutating: true,
+  scope: 'admin',
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'pause_job', id: p.id };
     const { MinionQueue } = await import('../minions/queue.ts');
@@ -703,8 +725,8 @@ const resume_job: Operation = {
   params: {
     id: { type: 'number', required: true, description: 'Job ID' },
   },
-  scope: 'admin',
   mutating: true,
+  scope: 'admin',
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'resume_job', id: p.id };
     const { MinionQueue } = await import('../minions/queue.ts');
@@ -740,7 +762,7 @@ const send_job_message: Operation = {
   params: {
     id: { type: 'number', required: true, description: 'Job ID to message' },
     payload: { type: 'object', required: true, description: 'Message payload (arbitrary JSON)' },
-    sender: { type: 'string', required: false, description: 'Sender identity (default: admin)' },
+    sender: { type: 'string', required: false, description: 'Sender identity — honored for trusted local callers only (default: admin). Remote callers always send as their authenticated identity (mcp:<clientId8>); the param is ignored.' },
   },
   scope: 'admin',
   mutating: true,
@@ -748,6 +770,39 @@ const send_job_message: Operation = {
     if (ctx.dryRun) return { dry_run: true, action: 'send_job_message', id: p.id };
     const { MinionQueue } = await import('../minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
+
+    // Sidechannel sender fence (fail-closed, A9). A remote caller must NEVER
+    // pick its own sender (impersonation) nor inherit the trusted-local
+    // 'admin' default — the persisted sender is the AUTHENTICATED identity,
+    // derived exactly like the ops/schema-packs.ts audit actor
+    // (mcp:<clientId8>). No authenticated identity → refuse before any write.
+    if (ctx.remote !== false) {
+      const clientId = ctx.auth?.clientId;
+      if (!clientId) {
+        throw new OperationError(
+          'permission_denied',
+          'send_job_message requires an authenticated client identity when called remotely',
+        );
+      }
+      const sender = `mcp:${clientId.slice(0, 8)}`;
+      // The queue-level sender auth only admits in-band identities ('admin' /
+      // the parent job id) — see MinionQueue.sendMessage. The op layer has
+      // already authenticated this caller, so it validates job state the same
+      // way and persists the derived identity itself (same insert shape,
+      // raw payload object — never JSON.stringify into jsonb).
+      const job = await queue.getJob(p.id as number);
+      if (!job || ['completed', 'dead', 'cancelled', 'failed'].includes(job.status)) {
+        throw new OperationError('invalid_params', `Job not found or not messageable: ${p.id}`);
+      }
+      const rows = await ctx.engine.executeRaw<{ id: number }>(
+        `INSERT INTO minion_inbox (job_id, sender, payload)
+         VALUES ($1, $2, $3)
+         RETURNING id`,
+        [p.id, sender, p.payload],
+      );
+      return { sent: true, message_id: Number(rows[0].id), job_id: p.id };
+    }
+
     const msg = await queue.sendMessage(p.id as number, p.payload, (p.sender as string) ?? 'admin');
     if (!msg) throw new OperationError('invalid_params', `Job not found, not messageable, or sender unauthorized: ${p.id}`);
     return { sent: true, message_id: msg.id, job_id: p.id };

@@ -45,6 +45,8 @@ import { LINK_CANDIDATES_HEADER } from '../../cycle/link-manifest.ts';
 import { acquireLease, releaseLease, RateLeaseUnavailableError } from '../rate-leases.ts';
 import { isRetryableConnError } from '../../retry-matcher.ts';
 import { logSubagentHeartbeat } from './subagent-audit.ts';
+import { UnrecoverableError } from '../types.ts';
+import { extractPromptTooLongDetail } from './subagent.ts';
 import {
   persistMessage,
   persistToolExecComplete,
@@ -353,6 +355,21 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
       // against the whole job.
       logSubagentHeartbeat({ job_id: ctx.id, event: 'oneshot_timeout', turn_idx: 0, ms_elapsed: Date.now() - t0 });
       return { kind: 'fallback', reason: 'oneshot_timeout' };
+    }
+    // Same terminal classification as the gateway-loop path's
+    // runLoopConvertingLeaseLoss (subagent.ts): `chat()` here is the SAME
+    // gateway.chat() entrypoint, so a 400 "prompt is too long" arrives
+    // normalizeAIError()-wrapped the same way — isPromptTooLongError() walks
+    // the `.cause` chain to still match the SDK's inner shape. Without this,
+    // a prompt-too-long condition on the oneshot dispatch path retries like
+    // any other transient failure up to max_stalled, recreating the same
+    // dream-cycle queue-clog class the legacy and gateway-loop paths already
+    // fast-fail on.
+    // Single walk: extractPromptTooLongDetail is non-null exactly when
+    // isPromptTooLongError matches (both wrap the same matcher).
+    const detail = extractPromptTooLongDetail(err);
+    if (detail !== null) {
+      throw new UnrecoverableError(`prompt_too_long: ${detail}`);
     }
     // Job-level abort or transport error: the job machinery owns these — a
     // provider outage would break the fallback identically (don't double-pay).

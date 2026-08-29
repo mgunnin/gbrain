@@ -1,5 +1,6 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
+import type { DbLockHandle } from '../src/core/db-lock.ts';
 
 // Mock the embedding module BEFORE importing runEmbed, so runEmbed picks up
 // the mocked embedBatch. We track max concurrent invocations via a counter
@@ -83,6 +84,9 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.GBRAIN_EMBED_CONCURRENCY;
   delete process.env.GBRAIN_EMBED_TIME_BUDGET_MS;
+  delete process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS;
+  delete process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS;
+  delete process.env.GBRAIN_EMBED_STALL_ABORT_SECONDS;
 });
 
 describe('runEmbed --all (parallel)', () => {
@@ -204,6 +208,63 @@ describe('runEmbed --all (parallel)', () => {
     await runEmbedCore(engine, { stale: true, signal: ac.signal });
 
     expect(invalidateCalled).toBe(false);
+  });
+
+  test('#4599 --stale: cleanup aborts an in-flight single-flight heartbeat refresh', async () => {
+    process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS = '5';
+    process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS = '1000';
+
+    let refreshCalls = 0;
+    let refreshSawSignal = false;
+    let finishRefresh: (outcome: string) => void = () => {};
+    const refreshOutcome = new Promise<string>((resolve) => { finishRefresh = resolve; });
+    const fakeLock: DbLockHandle = {
+      id: 'fake-hanging-refresh',
+      acquiredAt: '0',
+      release: async () => {},
+      refresh: async (opts?: { signal?: AbortSignal }) => {
+        refreshCalls++;
+        if (!opts?.signal) {
+          finishRefresh('missing-signal');
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          return true;
+        }
+        refreshSawSignal = true;
+        return await new Promise<boolean>((resolve) => {
+          opts.signal!.addEventListener('abort', () => {
+            finishRefresh('aborted');
+            resolve(true);
+          }, { once: true });
+          setTimeout(() => {
+            finishRefresh('not-aborted');
+            resolve(true);
+          }, 200);
+        });
+      },
+    };
+    const engine = mockEngine({
+      countChunklessPagesWithContent: async () => 0,
+      countStaleChunks: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return 0;
+      },
+    });
+
+    const result = await runEmbedCore(engine, {
+      stale: true,
+      singleFlight: true,
+      quiet: true,
+      heldLocks: [fakeLock],
+    });
+    const outcome = await Promise.race([
+      refreshOutcome,
+      new Promise<string>((resolve) => setTimeout(() => resolve('timeout'), 500)),
+    ]);
+
+    expect(result.embedded).toBe(0);
+    expect(refreshCalls).toBeGreaterThan(0);
+    expect(refreshSawSignal).toBe(true);
+    expect(outcome).toBe('aborted');
   });
 
   test('respects GBRAIN_EMBED_CONCURRENCY=1 (serial)', async () => {
@@ -1222,4 +1283,224 @@ describe('#3796 — attempt-scaled 429 wait floors (rolling TPM window)', () => 
     // Negative attempt (defensive) clamps to the first rung.
     expect(rateLimitDelayMs('try again in 1ms', -1, mid)).toBe(RATE_LIMIT_ATTEMPT_FLOOR_MS[0]);
   });
+});
+
+// ────────────────────────────────────────────────────────────────
+// #4599 stall watchdog — integration through runEmbedCore.
+// The wedge shape: an embed HTTP call that never settles and ignores its
+// abort signal (lost promise / dead pooler connection). The drain's own
+// finally is unreachable, so the watchdog must clean up ITSELF (X5) and
+// return an error RESULT (X6), never a process exit below the CLI layer.
+// ────────────────────────────────────────────────────────────────
+
+describe('#4599 stall watchdog (runEmbedCore --stale)', () => {
+  const staleRow = {
+    slug: 'wedged-page',
+    chunk_index: 0,
+    chunk_text: 'hello',
+    chunk_source: 'compiled_truth' as const,
+    model: null,
+    token_count: 1,
+    source_id: 'default',
+    page_id: 1,
+  };
+  const wedgedChunks = [
+    { chunk_index: 0, chunk_text: 'hello', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
+  ];
+
+  /**
+   * Emulated gbrain_cycle_locks table speaking the exact SQL shapes
+   * db-lock.ts's PGLite branch issues, so tryAcquireDbLock / release run the
+   * REAL lock code against an inspectable table.
+   */
+  function lockTableEmulator() {
+    const table = new Map<string, { fence: string }>();
+    const db = {
+      query: async (sql: string, params?: unknown[]) => {
+        if (/^\s*INSERT INTO gbrain_cycle_locks/i.test(sql)) {
+          const id = String(params?.[0]);
+          if (table.has(id)) return { rows: [] }; // held; steal predicate not emulated
+          const fence = `${Date.now()}.${Math.random()}`;
+          table.set(id, { fence });
+          return { rows: [{ id, fence }] };
+        }
+        if (/^\s*UPDATE gbrain_cycle_locks/i.test(sql)) {
+          const id = String(params?.[1]);
+          return { rows: table.has(id) ? [{ id }] : [] };
+        }
+        if (/^\s*DELETE FROM gbrain_cycle_locks/i.test(sql)) {
+          table.delete(String(params?.[0]));
+          return { rows: [] };
+        }
+        return { rows: [] };
+      },
+    };
+    return { table, db };
+  }
+
+  test('stall fires: single-flight locks released via the lock table, summary flushed, reason surfaces', async () => {
+    process.env.GBRAIN_EMBED_STALL_ABORT_SECONDS = '1';
+    // The #4599 wedge: never settles, ignores the abort signal entirely.
+    embedBatchBehavior = () => new Promise<Float32Array[]>(() => {});
+
+    const { table, db } = lockTableEmulator();
+    const engine = mockEngine({
+      kind: 'pglite',
+      db,
+      listAllSources: async () => [{ id: 'default' }],
+      countStaleChunks: async () => 1,
+      listStaleChunks: async () => [staleRow],
+      getChunks: async () => wedgedChunks,
+      upsertChunks: async () => {},
+    });
+
+    const stderrChunks: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    const origConsoleError = console.error;
+    (process.stderr as any).write = (chunk: any, ...rest: any[]) => {
+      stderrChunks.push(String(chunk));
+      return origWrite(chunk, ...rest);
+    };
+    console.error = (...args: any[]) => {
+      stderrChunks.push(args.map(String).join(' '));
+      origConsoleError(...args);
+    };
+    try {
+      const result = await runEmbedCore(engine, { stale: true, singleFlight: true, quiet: true });
+
+      // Error RESULT, not a throw — reason surfaces for structured callers.
+      expect(result.reason).toBe('stall_timeout');
+      // failures>0 consumers (cli verdict, cycle phase, jobs payload) light up too.
+      expect(result.failures).toBeGreaterThanOrEqual(1);
+      expect(result.failure_samples.some((s) => s.includes('stall_timeout'))).toBe(true);
+      expect(result.embedded).toBe(0);
+      // The lock was actually acquired for this run...
+      expect(result.lock_skipped).toBeUndefined();
+      // ...and the WATCHDOG released it (the wedged drain's finally is dead) —
+      // asserted against the lock table the real db-lock code wrote to.
+      expect(table.size).toBe(0);
+      // Summary flushed to stderr.
+      const err = stderrChunks.join('\n');
+      expect(err).toContain('stall watchdog');
+      expect(err).toContain('locks released');
+    } finally {
+      (process.stderr as any).write = origWrite;
+      console.error = origConsoleError;
+    }
+  }, 20_000);
+
+  test('non-CLI caller path: returns the error result without process exit; handlers fail the job via assertEmbedNotStalled', async () => {
+    process.env.GBRAIN_EMBED_STALL_ABORT_SECONDS = '1';
+    embedBatchBehavior = () => new Promise<Float32Array[]>(() => {});
+
+    const engine = mockEngine({
+      countStaleChunks: async () => 1,
+      listStaleChunks: async () => [staleRow],
+      getChunks: async () => wedgedChunks,
+      upsertChunks: async () => {},
+    });
+
+    // The minion/cycle shape: no singleFlight, plain runEmbedCore call. The
+    // fact that this await RESOLVES is the no-process-exit proof; the
+    // watchdog's referenced interval is also the only handle keeping the
+    // lost-promise hang alive here (the not-unref'd design).
+    const result = await runEmbedCore(engine, { stale: true, quiet: true });
+    expect(result.reason).toBe('stall_timeout');
+
+    // X6: the handler layer converts the error result into a FAILED JOB.
+    const { assertEmbedNotStalled } = await import('../src/core/embed-stall.ts');
+    expect(() => assertEmbedNotStalled(result)).toThrow(/stall_timeout/);
+  }, 20_000);
+
+  test('watchdog does not fire while successful progress keeps landing', async () => {
+    process.env.GBRAIN_EMBED_STALL_ABORT_SECONDS = '1';
+    // Normal-speed embeds: progress ticks, threshold never crossed.
+    const pages = Array.from({ length: 3 }, (_, i) => ({ slug: `ok-${i}` }));
+    const rows = pages.map((p, i) => ({ ...staleRow, slug: p.slug, page_id: i + 1 }));
+    let served = false;
+    const engine = mockEngine({
+      countStaleChunks: async () => rows.length,
+      listStaleChunks: async () => {
+        if (served) return [];
+        served = true;
+        return rows;
+      },
+      getChunks: async () => wedgedChunks,
+      upsertChunks: async () => {},
+    });
+
+    const result = await runEmbedCore(engine, { stale: true, quiet: true });
+    expect(result.reason).toBeUndefined();
+    expect(result.embedded).toBeGreaterThan(0);
+    expect(result.failures).toBe(0);
+  }, 20_000);
+});
+
+// ────────────────────────────────────────────────────────────────
+// #4647: single-flight lock heartbeat — per-tick refresh timeout
+// ────────────────────────────────────────────────────────────────
+//
+// The incident shape: a wedged pooler connection makes `refresh()` hang
+// FOREVER (it never settles and ignores the abort signal). Without the
+// per-tick timeout race, the first hung tick would leave `beating = true`
+// permanently — no consecutive-error accounting, no lock_lost, and the drain
+// runs unbounded without mutual exclusion. The fix bounds every tick with
+// GBRAIN_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS; three consecutive refresh_timeouts
+// must flip lock_lost and abort the drain.
+describe('#4647: heartbeat tick timeout — never-settling refresh', () => {
+  test('3 consecutive refresh timeouts → lock_lost + drain abort', async () => {
+    process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS = '5';
+    process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS = '10';
+
+    let refreshCalls = 0;
+    const fakeLock: DbLockHandle = {
+      id: 'wedged-pool-refresh',
+      acquiredAt: '0',
+      release: async () => {},
+      // The #4647 shape: never settles, never observes the abort signal.
+      refresh: () => {
+        refreshCalls++;
+        return new Promise<boolean>(() => {});
+      },
+    };
+
+    // Infinite stale feed at batchSize=1: the drain can ONLY terminate via
+    // the lock-loss abort. If the per-tick timeout regresses, this test
+    // hangs (and fails on its own timeout) instead of returning.
+    let listStaleCalls = 0;
+    let pageId = 0;
+    const engine = mockEngine({
+      countChunklessPagesWithContent: async () => 0,
+      listChunklessPagesWithContent: async () => [],
+      countStaleChunks: async () => 999999, // non-zero: pass the early "nothing stale" return
+      invalidateContentDriftEmbeddings: async () => 0,
+      listStaleChunks: async () => {
+        listStaleCalls++;
+        await new Promise((r) => setTimeout(r, 10));
+        pageId++;
+        return [{
+          slug: `p-${pageId}`, chunk_index: 0, chunk_text: 'hi',
+          chunk_source: 'compiled_truth' as const, model: null, token_count: 1,
+          source_id: 'default', page_id: pageId,
+        }];
+      },
+      getChunks: async () => [],
+      upsertChunks: async () => {},
+    });
+
+    const result = await runEmbedCore(engine, {
+      stale: true,
+      quiet: true,
+      batchSize: 1,
+      heldLocks: [fakeLock],
+    });
+
+    // Mutual exclusion is gone → the drain ABORTED with lock_lost set.
+    expect(result.lock_lost).toBe(true);
+    // The consecutive-error threshold (3) was actually exercised.
+    expect(refreshCalls).toBeGreaterThanOrEqual(3);
+    // The abort cut the infinite feed short (sanity bound: the drain did not
+    // keep looping after lock loss).
+    expect(listStaleCalls).toBeLessThan(200);
+  }, 15_000);
 });

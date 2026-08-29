@@ -14,6 +14,7 @@
 
 import { embedBatch } from './embedding.ts';
 import { serr } from './console-prefix.ts';
+import { noteEmbedApiResponse } from './embed-stall.ts';
 import { titleTierCorpusGeneration } from './contextual-retrieval-service.ts';
 import type { BrainEngine } from './engine.ts';
 import type { Page } from './types.ts';
@@ -213,8 +214,15 @@ export async function embedBatchWithBackoff(
       // D4a + D8: maxRetries:0 disables the SDK's stacked retries (so this
       // wrapper is the single source of truth) and abortSignal threads
       // through to the gateway so an in-flight HTTP request cancels mid-fetch.
-      return await embedBatch(texts, { maxRetries: 0, ...(signal && { abortSignal: signal }) });
+      const out = await embedBatch(texts, { maxRetries: 0, ...(signal && { abortSignal: signal }) });
+      // #4599: every SETTLED embed attempt ticks the stall watchdog's
+      // liveness clock (T6 — API-response grain, successes here, errors in
+      // the catch). Liveness is diagnostic; the stall TRIGGER stays keyed on
+      // successful chunk progress in the caller.
+      noteEmbedApiResponse();
+      return out;
     } catch (e: unknown) {
+      noteEmbedApiResponse();
       // If the budget fired we may have been aborted mid-fetch; bubble out.
       // This check is what keeps caller-initiated aborts out of BOTH retry
       // branches below (#3374) — an abort is never reclassified as transient.

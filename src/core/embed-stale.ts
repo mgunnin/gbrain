@@ -21,6 +21,7 @@ import type { BrainEngine } from './engine.ts';
 import type { Chunk, ChunkInput } from './types.ts';
 import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from './embed-retry.ts';
 import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
+import { healOversizedPageChunks, healedChunksToStaleRows } from './embed-oversize-heal.ts';
 import { invalidateStaleSignatureEmbeddingsGuarded } from './embedding-invalidation.ts';
 import {
   resolveActiveEmbeddingColumnFromEngine,
@@ -225,6 +226,9 @@ export async function embedStalePages(
       return result;
     }
     try {
+      // SUP-3874: split legacy oversized rows before embedding so a single
+      // pre-cap chunk cannot permanently fail the page.
+      await healOversizedPageChunks(engine, slug, { sourceId });
       const existing = await engine.getChunks(slug, { sourceId });
       const staleIdx = new Set(
         (await engine.executeRaw<{ chunk_index: number }>(
@@ -385,10 +389,22 @@ export async function embedStaleForSource(
     let nextIdx = 0;
 
     async function embedOneKey(key: string): Promise<void> {
-      const stale = byKey.get(key)!;
+      let stale = byKey.get(key)!;
       const keySourceId = stale[0]?.source_id ?? sourceId;
       const slug = stale[0].slug;
       try {
+        // SUP-3874: split legacy oversized chunk_text before embedding.
+        const healed = await observed(pacer, () =>
+          healOversizedPageChunks(engine, slug, { sourceId: keySourceId }),
+        );
+        if (healed.changed) {
+          stale = healedChunksToStaleRows(healed.chunks, slug, keySourceId);
+          if (stale.length === 0) {
+            result.pagesProcessed += 1;
+            return;
+          }
+        }
+
         // #3507: fetch the page row for its title + stored CR mode so the
         // re-embed reproduces the page's wrapping convention instead of
         // silently stripping contextual prefixes (mirrors

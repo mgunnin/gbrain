@@ -229,8 +229,15 @@ async function executeAutoFix(rec: FeatureRecommendation, engine: BrainEngine): 
     switch (rec.id) {
       case 'missing-embeddings':
       case 'low-coverage': {
-        const { runEmbed } = await import('./embed.ts');
-        await runEmbed(engine, ['--stale']);
+        // X6 (#4599): go through the CORE seam, not the CLI wrapper —
+        // runEmbed maps a stall-watchdog abort to process.exit(1), which
+        // would kill this whole auto-fix loop mid-run. The core returns an
+        // error RESULT; assertEmbedNotStalled turns it into a throw that
+        // this function's catch reports as { success: false }.
+        const { runEmbedCore } = await import('./embed.ts');
+        const { assertEmbedNotStalled } = await import('../core/embed-stall.ts');
+        const result = await runEmbedCore(engine, { stale: true, singleFlight: true });
+        assertEmbedNotStalled(result);
         return { success: true, output: 'Stale embeddings refreshed' };
       }
       case 'zero-links': {

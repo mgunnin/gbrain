@@ -40,7 +40,12 @@ The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to m
 "no limit" — no more setting sentinel values like `100000`.
 
 - `0` is **not** "off". On `sync.cost_gate_min_usd`, `0` means "block on any nonzero
-  spend" (a real choice). On the backfill caps, `0` falls back to the default.
+  spend" (a real choice). On the backfill caps, `0` falls back to the default — and on
+  `embed.backfill_max_usd` specifically, any present-but-invalid value (`0`, a
+  negative, garbage text) is treated as a typo'd cap: the $10 default applies and is
+  **never dropped**, even for unpriced models (see "Default caps vs unpriced models"
+  below). Only the off tokens (`off`/`unlimited`/`none`, case-insensitive) remove
+  that ceiling.
 - Internally "no limit" is the string `unlimited` in any printed/JSON output and "no
   cap" inside the budget tracker — never a raw `Infinity` (which would serialize to
   `null` in ledger rows).
@@ -51,7 +56,7 @@ The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to m
 |------|-----------|---------|---------|-----------|----------|
 | Sync inline-embed cost gate | `sync.cost_gate_min_usd` | `0.50` | TTY prompt / non-TTY auto-defer | `off` (or `0` = block-on-any) | informational |
 | Backfill 24h per-source spend cap | `embed.backfill_max_usd_per_source_24h` | `25` | refuses submission | `off` (`0` → default) | bypassed (still ledgered) |
-| Backfill per-job budget | `embed.backfill_max_usd` | `10` | caps the job's tracker | `off` (`0` → default) | uncapped (still ledgered) |
+| Backfill per-job budget | `embed.backfill_max_usd` | `10` | caps the job's tracker | `off` (`0`/garbage → default, fail-closed) | uncapped (still ledgered) |
 | Backfill cooldown | `embed.backfill_cooldown_min` | `10` | skips re-submission inside window | — (latency knob, not spend) | **not** bypassed |
 | `reindex-code` cost gate | — (preview before re-embed) | — | TTY prompt / non-TTY refuse + exit 2 | `--max-cost off` | informational |
 | `migrate embeddings` consent gate | — (plan + estimate before provider migration) | — | TTY y/N prompt / non-TTY refuse + exit 2 | `--yes` | estimate marked informational, but **still prompts** (guards a destructive schema rebuild, not just spend) |
@@ -81,9 +86,12 @@ underestimate an explicit working-tree run.
 
 Behavior above the floor:
 - **TTY:** prompts `[y/N]`.
-- **Non-interactive (cron/agent):** **auto-defers** embeds to capped backfill jobs and
-  exits 0 — it never wedges the pipeline. The backlog drains via the jobs worker or
-  `gbrain embed --stale`. Pass `--yes` to embed inline instead.
+- **Non-interactive (cron/agent):** **auto-defers** embeds (rows stay stale; exits 0 —
+  it never wedges the pipeline). A capped backfill job is submitted only when a
+  worker-backed surface exists; otherwise the result reports
+  `manual_drain_required` (`reason: no_worker_surface` on PGLite/no-worker setups, or
+  `auto_submit_disabled`) with the paste-ready drain command. The backlog drains via
+  the jobs worker or `gbrain embed --stale`. Pass `--yes` to embed inline instead.
 
 Output format splits on the explicit `--json` flag: `--json` emits a structured
 envelope; otherwise human text. Every gate message carries paste-ready knobs.
@@ -144,9 +152,35 @@ Semantics:
 - Models with neither a table row nor an override stay fail-closed under a cap.
 - Invalid entries (negative, non-numeric) are dropped; those models keep the
   fail-closed behavior.
-- Consumed by `BudgetTracker` construction (enrich and the cycle's
-  `enrich_thin` phase load it automatically); both chat and embed routes price
-  through it.
+- Consumed by `BudgetTracker` construction; both chat and embed routes price
+  through it. The key is registered in `KNOWN_CONFIG_KEYS`, and it is loaded
+  automatically by enrich and the cycle's `enrich_thin` phase, the
+  `embed-backfill` job handler, and every conversation-facts entry point
+  (`gbrain extract-conversation-facts`, the cycle's
+  `conversation_facts_backfill` phase, transcript facts ingest) — an override
+  declared once in config reaches the queued/background lanes too, not just
+  interactive enrich.
+
+### Default caps vs unpriced models (embed backfill)
+
+The `embed-backfill` job's per-job cap defaults to $10 — an IMPLICIT ceiling
+nobody chose. When the configured embedding model has no shipped pricing row
+and no `pricing.overrides` entry (the `isModelPriceable` contract), enforcing
+that implicit cap would fail-close every job for a model that may well be
+free or self-hosted. So the handler drops the DEFAULT cap and runs uncapped,
+with a stderr warning naming both fixes (add a `pricing.overrides` entry, or
+set `embed.backfill_max_usd` to an explicit number). An EXPLICIT cap is a
+different contract: you chose a ceiling, so an unpriced model stays
+fail-closed (`no_pricing`) — declare the model's rate in `pricing.overrides`
+to proceed. Spend is ledgered by the tracker either way; only the ceiling
+changes.
+
+A present-but-unparsable value is a third contract, and it is fail-closed:
+when `embed.backfill_max_usd` is SET but not a positive number (`"ten"`, `0`,
+a negative), the operator clearly intended a cap, so the $10 default applies
+and is NEVER dropped — even for unpriced models — with a stderr warning
+naming both fixes (correct the value, or set it to `off` to remove the
+ceiling). A typo must not silently degrade to uncapped spend.
 
 ## Escape hatches at a glance
 

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, resolve, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { Page } from '../types.ts';
@@ -24,12 +24,27 @@ function extractRawTranscriptPath(page: Page): string | null {
  * (`../`-style traversal in frontmatter is untrusted data — a page synced
  * from a mounted repo must not read arbitrary host files). Returns the
  * resolved absolute path, or null on escape.
+ *
+ * Symlink hardening: lexical containment alone is not enough — a symlink
+ * INSIDE the root can point OUTSIDE it. When the candidate exists, its
+ * realpath must also stay inside the root's realpath; the realpath is what
+ * gets returned so the read hits the verified target.
  */
 function resolveWithinRoot(root: string, rel: string): string | null {
   const rootAbs = resolve(root);
   const candidate = resolve(rootAbs, rel);
-  if (candidate === rootAbs || candidate.startsWith(rootAbs + sep)) return candidate;
-  return null;
+  if (candidate !== rootAbs && !candidate.startsWith(rootAbs + sep)) return null;
+  try {
+    if (existsSync(candidate)) {
+      const rootReal = realpathSync(rootAbs);
+      const fileReal = realpathSync(candidate);
+      if (fileReal !== rootReal && !fileReal.startsWith(rootReal + sep)) return null;
+      return fileReal;
+    }
+  } catch {
+    return null;
+  }
+  return candidate;
 }
 
 /**
@@ -50,6 +65,8 @@ function resolveWithinRoot(root: string, rel: string): string | null {
  * A RELATIVE path that ESCAPES its root is rejected outright (returns null →
  * caller falls back to the summary body); it does not retry lower tiers.
  * An ABSOLUTE path may sit in either root (containment, not resolution).
+ * Every containment check is realpath-hardened (see resolveWithinRoot), so a
+ * symlink inside a root that points outside it is refused, not followed.
  */
 async function resolveTranscriptPath(
   engine: BrainEngine,
@@ -95,6 +112,13 @@ export async function readConversationBodyForParsing(
     if (resolved && existsSync(resolved)) {
       const rawBody = readFileSync(resolved, 'utf8').trim();
       if (rawBody.length > 0) return rawBody;
+    }
+    if (!resolved) {
+      // Refusal is loud but class-only: never echo the attempted path
+      // (existence-oracle discipline) — frontmatter is untrusted data.
+      console.warn(
+        '[conversation-parser] raw_transcript refused (containment); falling back to summary body',
+      );
     }
   }
   return readSummaryBody(page);

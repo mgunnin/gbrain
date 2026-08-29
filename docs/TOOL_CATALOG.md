@@ -10,8 +10,8 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `get_health` | Brain health dashboard (embed coverage, stale pages, orphans). | admin |  |  |
-| `get_stats` | Brain statistics (page count, chunk count, etc.) | admin |  |  |
+| `get_health` | Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. | admin |  |  |
+| `get_stats` | Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant. | admin |  |  |
 | `get_status_snapshot` | Snapshot for `gbrain status` thin-client mode: sync freshness + last cycle + queue depths + worker liveness. | admin |  |  |
 | `get_usage` | Aggregate chat usage + cost from the chat_usage_log ledger (per-model and per-phase token counts, cache reads/writes, USD estimates) with explicit coverage fields. | admin |  |  |
 | `quarantine_list` | List quarantined (hidden) and optionally content-flagged pages by scanning page frontmatter, newest-updated first. | admin |  |  |
@@ -64,7 +64,7 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `get_brain_identity` | Brain identity + counters for thin-client banner. | read |  |  |
+| `get_brain_identity` | Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. | read |  |  |
 | `whoami` | Introspect the calling identity. | read | yes |  |
 
 ## ingest
@@ -164,7 +164,7 @@ Every non-localOnly operation on the MCP surface: 121 tools across 23 areas. **S
 | `get_raw_data` | Retrieve raw data for a page | read |  |  |
 | `get_versions` | Page version history | read |  |  |
 | `list_pages` | List pages with optional filters. | read | yes |  |
-| `put_page` | Write/update a page (markdown with frontmatter). | write | yes |  |
+| `put_page` | Write or replace a page (markdown with frontmatter). | write | yes |  |
 | `put_raw_data` | Store raw API response data for a page | write |  |  |
 | `resolve_slugs` | Fuzzy-resolve a partial slug to matching page slugs | read | yes |  |
 | `restore_page` | v0.26.5 — restore a soft-deleted page (clear deleted_at). | write |  |  |

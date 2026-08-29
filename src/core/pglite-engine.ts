@@ -1334,7 +1334,7 @@ export class PGLiteEngine implements BrainEngine {
         && !needsMinionJobsTimeoutAt && !needsMinionJobsIdempotencyKey
         && !needsMinionJobsPrivateQueue) return;
 
-    process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
+    process.stderr.write('  Schema forward-reference gap detected, applying bootstrap\n');
 
     if (needsPagesBootstrap) {
       // Mirror schema-embedded.ts shape for `sources` so the subsequent
@@ -1874,6 +1874,29 @@ export class PGLiteEngine implements BrainEngine {
     );
     if (rows.length === 0) return null;
     return { slug: (rows[0] as { slug: string }).slug };
+  }
+
+  /**
+   * #4587 — batch soft-delete primitive. See BrainEngine.softDeletePages
+   * JSDoc. Parity implementation with PostgresEngine.softDeletePages:
+   * deletePages' shape (empty-array early-return, batch-size throw,
+   * RETURNING slug) with softDeletePage's `deleted_at IS NULL` idempotency
+   * predicate. Nothing cascades — the 72h purge phase owns the eventual
+   * hard delete. PGLite binds `slug = ANY($1)` array params natively
+   * (deletePages already proves this).
+   */
+  async softDeletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `softDeletePages: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const { rows } = await this.db.query<{ slug: string }>(
+      'UPDATE pages SET deleted_at = now() WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL RETURNING slug',
+      [slugs, opts.sourceId],
+    );
+    return rows.map(r => r.slug);
   }
 
   async restorePage(slug: string, opts?: { sourceId?: string }): Promise<boolean> {
@@ -4768,17 +4791,23 @@ export class PGLiteEngine implements BrainEngine {
   // builder idiom): JOIN depth page (deleted_at IS NULL), LEFT JOIN event page,
   // hide soft-deleted event projections, order by COALESCE(event effective_date,
   // date). Source scope: federated sourceIds[] > scalar sourceId > unscoped.
-  private pushChronicleSource(where: string[], params: unknown[], opts?: { sourceId?: string; sourceIds?: string[] }): void {
+  // Returns the ep-side fragment (same param slot): the event-page LEFT JOIN carries
+  // the caller's scope so out-of-scope event fields null out (#2200 origin-join shape).
+  private pushChronicleSource(where: string[], params: unknown[], opts?: { sourceId?: string; sourceIds?: string[] }): string {
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
       where.push(`p.source_id = ANY($${params.length}::text[])`);
+      return ` AND ep.source_id = ANY($${params.length}::text[])`;
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
       where.push(`p.source_id = $${params.length}`);
+      return ` AND ep.source_id = $${params.length}`;
     }
+    return '';
   }
 
-  private static CHRONICLE_SELECT = `
+  private static chronicleSelect(epScope: string): string {
+    return `
     SELECT te.date::text AS date, te.summary, te.detail, te.source,
            te.page_id, p.slug AS page_slug,
            te.event_page_id, ep.slug AS event_slug,
@@ -4786,7 +4815,8 @@ export class PGLiteEngine implements BrainEngine {
            ep.frontmatter->'event'->>'kind' AS kind
     FROM timeline_entries te
     JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-    LEFT JOIN pages ep ON ep.id = te.event_page_id`;
+    LEFT JOIN pages ep ON ep.id = te.event_page_id${epScope}`;
+  }
 
   async getTimelineForDate(date: string, opts?: ChronicleTimelineOpts): Promise<ChronicleTimelineRow[]> {
     const limit = opts?.limit ?? 200;
@@ -4798,10 +4828,10 @@ export class PGLiteEngine implements BrainEngine {
       `te.date <= ${upper}`,
       `(te.event_page_id IS NULL OR ep.deleted_at IS NULL)`,
     ];
-    this.pushChronicleSource(where, params, opts);
+    const epScope = this.pushChronicleSource(where, params, opts);
     params.push(limit);
     const result = await this.db.query(
-      `${PGLiteEngine.CHRONICLE_SELECT}
+      `${PGLiteEngine.chronicleSelect(epScope)}
        WHERE ${where.join(' AND ')}
        ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC
        LIMIT $${params.length}`,
@@ -4821,10 +4851,10 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.kind);
       where.push(`ep.frontmatter->'event'->>'kind' = $${params.length}`);
     }
-    this.pushChronicleSource(where, params, opts);
+    const epScope = this.pushChronicleSource(where, params, opts);
     params.push(limit);
     const result = await this.db.query(
-      `${PGLiteEngine.CHRONICLE_SELECT}
+      `${PGLiteEngine.chronicleSelect(epScope)}
        WHERE ${where.join(' AND ')}
        ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC
        LIMIT $${params.length}`,
@@ -4845,10 +4875,10 @@ export class PGLiteEngine implements BrainEngine {
       `te.date < ${target}`,
       `(te.event_page_id IS NULL OR ep.deleted_at IS NULL)`,
     ];
-    this.pushChronicleSource(where, params, opts);
+    const epScope = this.pushChronicleSource(where, params, opts);
     params.push(limit);
     const result = await this.db.query(
-      `${PGLiteEngine.CHRONICLE_SELECT}
+      `${PGLiteEngine.chronicleSelect(epScope)}
        WHERE ${where.join(' AND ')}
        ORDER BY te.date DESC, te.id ASC
        LIMIT $${params.length}`,
@@ -4874,12 +4904,12 @@ export class PGLiteEngine implements BrainEngine {
     if (opts?.asof) { params.push(opts.asof); seenThrough = `$${params.length}::date`; }
     else { seenThrough = `current_date`; }
     where.push(`te.date <= ${seenThrough}`);
-    this.pushChronicleSource(where, params, opts);
+    const epScope = this.pushChronicleSource(where, params, opts);
     const result = await this.db.query(
       `SELECT te.date::text AS last_date, ep.slug AS last_event_slug
        FROM timeline_entries te
        JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL
-       LEFT JOIN pages ep ON ep.id = te.event_page_id
+       LEFT JOIN pages ep ON ep.id = te.event_page_id${epScope}
        WHERE ${where.join(' AND ')}
        ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) DESC, te.id DESC
        LIMIT 1`,
@@ -5179,7 +5209,8 @@ export class PGLiteEngine implements BrainEngine {
               score, content_type, segments, entities, model, triage_version
        FROM dream_verdicts
        WHERE file_path = $1 AND content_hash = $2
-         AND expires_at > now()`,
+         -- NULL = pre-TTL row in the #4657 bootstrap window; a miss here re-judges the corpus
+         AND (expires_at IS NULL OR expires_at > now())`,
       [filePath, contentHash]
     );
     if (result.rows.length === 0) return null;
@@ -5563,26 +5594,42 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Stats + health
-  async getStats(): Promise<BrainStats> {
+  async getStats(opts?: { sourceId?: string; sourceIds?: string[] }): Promise<BrainStats> {
+    // #4592: optional source scope — parity with postgres-engine.getStats.
+    // Bound as $1 (NEVER interpolated: remote callers influence the value).
+    const scope: string[] | null = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : null);
     // S2: embedded_count keys on the registry-ACTIVE column (fallback to
     // legacy on a broken registry — diagnostics never crash).
     const colId = await this.activeEmbeddingColId({ fallbackToLegacy: true });
     const { rows: [stats] } = await this.db.query(`
       SELECT
         -- v0.26.5: exclude soft-deleted from page_count (mirrors postgres-engine).
-        (SELECT count(*) FROM pages WHERE deleted_at IS NULL) as page_count,
-        (SELECT count(*) FROM content_chunks) as chunk_count,
+        (SELECT count(*) FROM pages p WHERE p.deleted_at IS NULL
+           AND ($1::text[] IS NULL OR p.source_id = ANY($1))) as page_count,
+        (SELECT count(*) FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+          WHERE ($1::text[] IS NULL OR p.source_id = ANY($1))) as chunk_count,
         -- Keyed on the stored VECTOR, not embedded_at (parity with
         -- postgres-engine): a schema rebuild NULLs every vector without
         -- touching embedded_at.
-        (SELECT count(*) FROM content_chunks WHERE ${colId} IS NOT NULL) as embedded_count,
-        (SELECT count(*) FROM links) as link_count,
-        (SELECT count(DISTINCT tag) FROM tags) as tag_count,
-        (SELECT count(*) FROM timeline_entries) as timeline_entry_count
-    `);
+        (SELECT count(*) FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+          WHERE cc.${colId} IS NOT NULL
+            AND ($1::text[] IS NULL OR p.source_id = ANY($1))) as embedded_count,
+        -- EXISTS (not JOIN) so a legacy dead link still counts unscoped.
+        (SELECT count(*) FROM links l
+          WHERE ($1::text[] IS NULL
+             OR (EXISTS (SELECT 1 FROM pages pf WHERE pf.id = l.from_page_id AND pf.source_id = ANY($1))
+                 AND EXISTS (SELECT 1 FROM pages pt WHERE pt.id = l.to_page_id AND pt.source_id = ANY($1))))) as link_count,
+        (SELECT count(DISTINCT t.tag) FROM tags t JOIN pages p ON p.id = t.page_id
+          WHERE ($1::text[] IS NULL OR p.source_id = ANY($1))) as tag_count,
+        (SELECT count(*) FROM timeline_entries te JOIN pages p ON p.id = te.page_id
+          WHERE ($1::text[] IS NULL OR p.source_id = ANY($1))) as timeline_entry_count
+    `, [scope]);
 
     const { rows: types } = await this.db.query(
-      `SELECT type, count(*)::int as count FROM pages WHERE deleted_at IS NULL GROUP BY type ORDER BY count DESC`
+      `SELECT type, count(*)::int as count FROM pages p WHERE p.deleted_at IS NULL
+         AND ($1::text[] IS NULL OR p.source_id = ANY($1))
+       GROUP BY type ORDER BY count DESC`,
+      [scope]
     );
     const pages_by_type: Record<string, number> = {};
     for (const t of types as { type: string; count: number }[]) {
@@ -5601,7 +5648,7 @@ export class PGLiteEngine implements BrainEngine {
     };
   }
 
-  async getHealth(): Promise<BrainHealth> {
+  async getHealth(opts?: { sourceId?: string; sourceIds?: string[] }): Promise<BrainHealth> {
     // Combined metrics from master (brain_score components: dead_links, link_count,
     // pages_with_timeline) and v0.10.3 graph layer (link_coverage, timeline_coverage,
     // most_connected). Both coexist: master's brain_score is the composite
@@ -5611,13 +5658,23 @@ export class PGLiteEngine implements BrainEngine {
     // Chunk/link counts stay raw (storage until the purge phase), matching
     // getStats, and destructive-removal counts elsewhere deliberately stay raw.
     // S2: coverage + missing_embeddings key on the registry-ACTIVE column.
+    // #4592: optional source scope — parity with postgres-engine.getHealth
+    // (bound as $1, never interpolated; both-endpoint rule for link-derived
+    // numbers; out-of-scope endpoints can't rescue a page from orphan-hood).
+    const scope: string[] | null = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : null);
     const colId = await this.activeEmbeddingColId({ fallbackToLegacy: true });
     const { rows: [h] } = await this.db.query(`
-      WITH entity_pages AS (
-        SELECT id, slug FROM pages WHERE type IN ('entity', 'person', 'company') AND deleted_at IS NULL
+      WITH scoped_pages AS (
+        SELECT id, slug, frontmatter, deleted_at, source_id FROM pages p
+        WHERE ($1::text[] IS NULL OR p.source_id = ANY($1))
+      ),
+      entity_pages AS (
+        SELECT id, slug FROM scoped_pages WHERE id IN (
+          SELECT id FROM pages WHERE type IN ('entity', 'person', 'company') AND deleted_at IS NULL
+        )
       )
       SELECT
-        (SELECT count(*) FROM pages WHERE deleted_at IS NULL) as page_count,
+        (SELECT count(*) FROM scoped_pages WHERE deleted_at IS NULL) as page_count,
         -- Parity with postgres-engine: stored-VECTOR truth over ELIGIBLE
         -- chunks (embedding, not embedded_at; embed_skip excluded from BOTH
         -- sides; zero eligible = vacuous 100%).
@@ -5629,13 +5686,15 @@ export class PGLiteEngine implements BrainEngine {
               / count(*) FILTER (WHERE NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip'))::float
          END
          FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id) as embed_coverage,
+         JOIN scoped_pages p ON p.id = cc.page_id) as embed_coverage,
         0 as stale_pages,
         -- Bug 11 — orphan = islanded (no inbound AND no outbound). The raw
         -- list is filtered in TS using the shared orphan-reporting policy.
         0 as orphan_pages,
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
+           AND ($1::text[] IS NULL
+                OR EXISTS (SELECT 1 FROM scoped_pages sp WHERE sp.id = l.from_page_id))
         ) as dead_links,
         -- Parity with postgres-engine.ts: same predicate as
         -- buildStaleChunkWhere / countStaleChunks, i.e. what 'embed --stale'
@@ -5643,11 +5702,14 @@ export class PGLiteEngine implements BrainEngine {
         -- be non-NULL while embedding is NULL) and embed_skip excluded, so the
         -- count can reach zero and the embed.stale remediation can converge.
         (SELECT count(*) FROM content_chunks cc
-           JOIN pages p ON p.id = cc.page_id
+           JOIN scoped_pages p ON p.id = cc.page_id
           WHERE cc.${colId} IS NULL
             AND NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip')
         ) as missing_embeddings,
-        (SELECT count(*) FROM links) as link_count,
+        (SELECT count(*) FROM links l
+          WHERE ($1::text[] IS NULL
+             OR (EXISTS (SELECT 1 FROM scoped_pages sp WHERE sp.id = l.from_page_id)
+                 AND EXISTS (SELECT 1 FROM scoped_pages sp WHERE sp.id = l.to_page_id)))) as link_count,
         (SELECT count(*) FROM entity_pages) as entity_page_count,
         -- gbrain#4153 consistency: an inbound link counts toward coverage
         -- only when its SOURCE page is live — the same endpoint-liveness rule
@@ -5656,23 +5718,33 @@ export class PGLiteEngine implements BrainEngine {
         -- AND islanded in one payload.
         (SELECT count(*) FROM entity_pages e
          WHERE EXISTS (SELECT 1 FROM links l
-                       JOIN pages src ON src.id = l.from_page_id
+                       JOIN scoped_pages src ON src.id = l.from_page_id
                        WHERE l.to_page_id = e.id AND src.deleted_at IS NULL))::float /
           GREATEST((SELECT count(*) FROM entity_pages), 1)::float as link_coverage,
         (SELECT count(*) FROM entity_pages e
          WHERE EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = e.id))::float /
           GREATEST((SELECT count(*) FROM entity_pages), 1)::float as timeline_coverage
-    `);
+    `, [scope]);
 
     // Top 5 most connected entities by total link count (in + out).
+    // X8 (#4592): a degree counts an edge only when its FAR endpoint is in
+    // scope too — parity with postgres-engine's rule and comment.
     const { rows: connected } = await this.db.query(`
       SELECT p.slug,
-             (SELECT count(*) FROM links l WHERE l.from_page_id = p.id OR l.to_page_id = p.id)::int as link_count
+             (SELECT count(*) FROM links l
+               WHERE (l.from_page_id = p.id
+                      AND ($1::text[] IS NULL
+                           OR EXISTS (SELECT 1 FROM pages fp WHERE fp.id = l.to_page_id AND fp.source_id = ANY($1))))
+                  OR (l.to_page_id = p.id
+                      AND ($1::text[] IS NULL
+                           OR EXISTS (SELECT 1 FROM pages fp WHERE fp.id = l.from_page_id AND fp.source_id = ANY($1))))
+             )::int as link_count
       FROM pages p
       WHERE p.type IN ('entity', 'person', 'company') AND p.deleted_at IS NULL
+        AND ($1::text[] IS NULL OR p.source_id = ANY($1))
       ORDER BY link_count DESC
       LIMIT 5
-    `);
+    `, [scope]);
 
     // Per-page flags for the linkable scope: orphan_pages and the
     // no-orphans / timeline-coverage DENOMINATORS are all computed over
@@ -5688,23 +5760,33 @@ export class PGLiteEngine implements BrainEngine {
     // TARGET is live. Without this, get_health's orphan_pages disagreed with
     // `gbrain orphans` whenever a soft-deleted page still linked to (or was
     // linked from) a live one.
+    // #4592: out-of-scope endpoints cannot rescue a page from orphan-hood.
     const { rows: pageScopeRows } = await this.db.query(`
       SELECT p.slug,
              (NOT EXISTS (SELECT 1 FROM links l
                           JOIN pages src ON src.id = l.from_page_id
-                          WHERE l.to_page_id = p.id AND src.deleted_at IS NULL)
+                          WHERE l.to_page_id = p.id AND src.deleted_at IS NULL
+                            AND ($1::text[] IS NULL OR src.source_id = ANY($1)))
               AND NOT EXISTS (SELECT 1 FROM links l
                           JOIN pages tgt ON tgt.id = l.to_page_id
-                          WHERE l.from_page_id = p.id AND tgt.deleted_at IS NULL)) as islanded,
+                          WHERE l.from_page_id = p.id AND tgt.deleted_at IS NULL
+                            AND ($1::text[] IS NULL OR tgt.source_id = ANY($1)))) as islanded,
              EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
       FROM pages p
       WHERE p.deleted_at IS NULL
-    `);
+        AND ($1::text[] IS NULL OR p.source_id = ANY($1))
+    `, [scope]);
 
     const r = h as Record<string, unknown>;
     const pageCount = Number(r.page_count);
     const embedCoverage = Number(r.embed_coverage);
-    const stalePages = await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS });
+    // Scoped: sum the scalar-sourceId counter per grant (parity with
+    // postgres-engine; the unmatchable __all__ scalar fail-closes to 0).
+    const stalePages = scope === null
+      ? await this.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })
+      : (await Promise.all(scope.map(sid =>
+          this.countStalePagesForExtraction({ sourceId: sid, versionTs: LINK_EXTRACTOR_VERSION_TS }),
+        ))).reduce((a, b) => a + b, 0);
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
     const linkablePages = (pageScopeRows as { slug: string; islanded: boolean; has_timeline: boolean }[])
       .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
