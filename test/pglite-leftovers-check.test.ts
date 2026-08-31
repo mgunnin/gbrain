@@ -6,6 +6,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { permsEnforced } from './helpers/fs-perms.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -165,24 +166,24 @@ describe('assessPgliteLeftovers', () => {
     expect(a.leftovers[0]?.approx_bytes).toBe(1024); // the symlink target's 8 KB is NOT counted
   });
 
-  test.skipIf(process.platform === 'win32' || (typeof process.geteuid === 'function' && process.geteuid() === 0))(
-    'an unreadable subdirectory marks the size incomplete, never exactly 0 B',
-    () => {
-      const home = makeHome('unreadable');
-      const dir = makeStore(home, 'brain.pglite', [1024]);
-      const locked = join(dir, 'locked');
-      mkdirSync(locked);
-      writeFileSync(join(locked, 'hidden'), Buffer.alloc(4096, 67));
-      chmodSync(locked, 0o000);
-      try {
-        const a = assessPgliteLeftovers('postgres', home);
-        expect(a.status).toBe('warn');
-        expect(a.leftovers[0]?.size_incomplete).toBe(true);
-        expect(a.message).toContain('>=');
-      } finally {
-        chmodSync(locked, 0o755); // so afterAll cleanup can delete it
-      }
-    });
+  // skipIf: needs a directory whose listing MUST fail (chmod 000) —
+  // unrunnable on hosts that don't enforce permission bits.
+  test.skipIf(!permsEnforced())('an unreadable subdirectory marks the size incomplete, never exactly 0 B', () => {
+    const home = makeHome('unreadable');
+    const dir = makeStore(home, 'brain.pglite', [1024]);
+    const locked = join(dir, 'locked');
+    mkdirSync(locked);
+    writeFileSync(join(locked, 'hidden'), Buffer.alloc(4096, 67));
+    chmodSync(locked, 0o000);
+    try {
+      const a = assessPgliteLeftovers('postgres', home);
+      expect(a.status).toBe('warn');
+      expect(a.leftovers[0]?.size_incomplete).toBe(true);
+      expect(a.message).toContain('>=');
+    } finally {
+      chmodSync(locked, 0o755); // so afterAll cleanup can delete it
+    }
+  });
 
   test('size walk is bounded by an injectable assessment-wide budget', () => {
     const home = makeHome('bounded');

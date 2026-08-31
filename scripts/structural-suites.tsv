@@ -124,10 +124,10 @@ test/e2e/openclaw-reference-compat.test.ts	OpenClaw reference workspace compat (
 test/e2e/skillpack-flow.test.ts	skillpack flow (E2E)	17	readFileSync
 test/e2e/workspace-generic-compat.test.ts	generic agent-workspace compat (INSTALL_FOR_AGENTS.md flow)	6	readFileSync
 test/embedding-dim-check-facts.test.ts	doctor checkFactsEmbeddingWidthConsistency wiring (T6)	4	doctor-source-helper
-test/eval-brainbench-e2e.test.ts	--llm availability gate	1	exec-scan
-test/eval-brainbench-e2e.test.ts	privacy guard violation branches (negative path)	1	exec-scan
-test/eval-brainbench-e2e.test.ts	render-brainbench-delta.ts (the CI step-summary block)	2	exec-scan
-test/eval-brainbench-e2e.test.ts	run-all once-per-sweep semantics (decision 16)	1	exec-scan
+test/eval-brainbench-e2e.slow.test.ts	--llm availability gate	1	exec-scan
+test/eval-brainbench-e2e.slow.test.ts	privacy guard violation branches (negative path)	1	exec-scan
+test/eval-brainbench-e2e.slow.test.ts	render-brainbench-delta.ts (the CI step-summary block)	2	exec-scan
+test/eval-brainbench-e2e.slow.test.ts	run-all once-per-sweep semantics (decision 16)	1	exec-scan
 test/eval-capture-db-plane.serial.test.ts	eval.capture set on the DB plane reaches the runtime gate (#1475)	9	bun-file
 test/eval-synthesize-concepts-routing.test.ts	dispatch-layer source pins (routing can’t regress silently)	2	readFileSync
 test/eval-synthesize-concepts-routing.test.ts	subprocess smoke — end-to-end routing	1	readFileSync

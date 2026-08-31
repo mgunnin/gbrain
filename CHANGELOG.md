@@ -2,6 +2,79 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.47.7.0] - 2026-08-30
+
+**The test-infra speed wave: the local suite runs up to 3× faster on
+memory-constrained machines and comes back green on machines it used to fail
+on, the CI matrix sheds its heaviest atom,
+and the e2e lane finally gets the schema-snapshot fast path every other lane
+already had.**
+
+### Fixed
+
+- **`bun run test` no longer collapses to a single shard on 16GB machines.**
+  The memory-adaptive runner shed shards before intra-shard width, but bun's
+  `--max-concurrency` only bounds `test.concurrent` tests (one file in the
+  corpus uses it) — so a common dev box ran the whole suite serially behind a
+  12000s watchdog, measured 3.25× slower than the same box at 4 shards. Width
+  sheds first now, and a new pinned test keeps it that way.
+- **Machines without coreutils `timeout` no longer hard-fail on watchdog
+  kills.** The fallback watchdog now drops a sentinel before TERMing a shard,
+  so the WEDGED/EXIT-HANG classifier is reachable there instead of a bare
+  rc=143 failure (regression-pinned).
+- **A long-registered shard flake is fixed at the root.** The extract-atoms
+  chunk-embed suite failed under shard parallelism because a neighbor's
+  provider key baked into the AI gateway's captured env snapshot survived the
+  neighbor's own cleanup; the suite now pins a keyless gateway and asserts its
+  own hermeticity. Two other registered flakes were verified already fixed and
+  their entries closed.
+- **Tests that assert "this must fail" now skip visibly on hosts that can't
+  make it fail.** Sandboxes with non-enforcing filesystems (permission bits
+  ignored), no crontab, or a git PATH shim that pollutes stderr previously
+  produced eight hard-red failures; environment probes turn those into
+  explicit skips while CI keeps full coverage.
+
+### Changed
+
+- **The unit suite's slowest files were rewritten into minimal forms with
+  assertion parity.** Thirteen files keep every test and every assertion while
+  running 1.2-8.6× faster (batched CLI spawns through a bounded pool, condition
+  polling instead of fixed sleeps, one engine + reset instead of per-test
+  boots, a build-once git fixture). Four attempted rewrites were reverted
+  with documented cause rather than shipped at risk.
+- **The BrainBench CLI e2e file moved to the slow tier with its own CI job.**
+  At 98s mined it was 10% of the whole matrix's weight and capped shard
+  scaling; post-rewrite it runs its independent CLI calls once through a
+  width-2 pool, and its in-process full-corpus duplicate of the CI brainbench
+  gate was removed.
+- **The serial lane dispatches heaviest-first.** A new advisory
+  `scripts/serial-weights.json` (mined from each run's banked durations)
+  drives LPT ordering; corrupt or missing weights fall back to discovery
+  order, never affecting correctness.
+- **`bun run test:e2e` activates the PGLite schema snapshot** like every other
+  runner (exported absolute so spawned CLI children find it), with explicit
+  per-file cold-path opt-outs for the suites that assert the path TO
+  post-init state. The e2e CI jobs restore the snapshot cache and activate it
+  too.
+- **`bun run verify` dropped its one genuinely duplicated check** (the
+  retrieval canary rides the unit matrix via its test file; the package
+  script remains for on-demand runs) and its worst timeout-flake exposure
+  with it.
+- **New shared test helpers** for contributors: `cli-spawn` (hermetic
+  async CLI spawns + bounded batching + memoized help calls), `wait-for`
+  (condition polling), `with-snapshot` (scoped cold-boot opt-out),
+  `resetPgliteStateNarrow` (explicit-table resets), `git-fixture`
+  (build-once repos), and environment probes (`fs-perms`,
+  `git-stderr-probe`). The speed helpers each ship with their own unit test
+  (the two environment probes are exercised through their consumer suites);
+  docs/TESTING.md carries the reach-for guide.
+
+To take advantage of v0.47.7.0: `gbrain upgrade`, then in the repo the fast
+loop is the same `bun run test` — just faster and honest about environment
+skips. Contributors writing tests: read the "Speed + environment helpers"
+section of docs/TESTING.md before hand-rolling spawn wrappers, sleeps, or
+permission-dependent assertions.
+
 ## [0.47.6.0] - 2026-08-29
 
 **The community fix wave: takes work on Postgres again, sync deletions get a

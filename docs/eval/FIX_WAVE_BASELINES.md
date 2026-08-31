@@ -101,7 +101,9 @@ recall@10=1.0000 first_relevant=1.0000 expected_top1=0.8333 vs floors
 ranking pipeline (keyword/title/alias arms + RRF against gold qrels) with
 synthetic basis vectors — no API keys, no production brain, so the live-serve
 lock is moot. Semantic-embedding regressions remain the keyed eval suites'
-job. Wired into `bun run verify` as check:eval-canary.
+job. Runs in CI via `test/eval-canary.test.ts` in the unit matrix;
+`check:eval-canary` remains as an on-demand package script (removed from the
+verify battery as pure double work).
 
 Verified-bug status at W0 ship: cycle-lock refresh + fencing (TODO-OPS-2
 closed), stall-death parent unblock, started_at ×4, modality carry, import
