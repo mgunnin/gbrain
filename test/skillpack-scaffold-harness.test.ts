@@ -357,7 +357,7 @@ describe('review-driven CLI hardening', () => {
     cleanups.push(dest);
     const env = { HOME: home, GBRAIN_HOME: gbrainHome };
     // Initialize a PGLite brain and set the gate on the DB plane only.
-    const init = spawnSync('bun', [CLI, 'init', '--pglite', '--non-interactive'], {
+    const init = spawnSync('bun', [CLI, 'init', '--pglite', '--no-embedding', '--non-interactive'], {
       encoding: 'utf8',
       cwd: REPO_ROOT,
       env: { ...process.env, ...env },

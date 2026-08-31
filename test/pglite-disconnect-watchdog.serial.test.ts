@@ -130,10 +130,12 @@ describe('pglite disconnect watchdog vs a wedged event loop (#4284, Bun-pinned)'
     expect(r.sinceArmedMs).toBeGreaterThanOrEqual(WATCHDOG_DEADLINE_MS - 500);
     expect(r.sinceArmedMs).toBeLessThan(11_000);
 
-    // Attribution: the worker's stderr lines carry the label and fire even
-    // while the main thread is starved (worker_threads = separate OS thread).
-    expect(r.stderr).toContain('pglite-disconnect-watchdog');
-    expect(r.stderr).toContain('grace expired');
+    // Attribution uses the synchronously emitted labeled arm breadcrumb plus
+    // the kernel-observed SIGKILL above. A delayed worker check may jump to the
+    // grace deadline, and final worker stderr can lose to SIGKILL on Bun/macOS,
+    // so configured signal names do not prove a mandatory escalation sequence.
+    expect(r.stderr).toContain('[pglite] disconnect watchdog armed:');
+    expect(r.stderr.split('disconnect watchdog armed').length - 1).toBe(1);
 
     // ADVISORY (not asserted — OV-4): under starvation the in-loop warn should
     // never appear; a future Bun that services timers under microtask pressure

@@ -35,12 +35,14 @@ import type { Page } from '../src/core/types.ts';
 let engine: BrainEngine;
 let dbDir: string;
 
+const PGLITE_COLD_INIT_TIMEOUT_MS = 180_000;
+
 beforeAll(async () => {
   dbDir = mkdtempSync(join(tmpdir(), 'enrichment-test-'));
   engine = new PGLiteEngine();
   await engine.connect({ engine: 'pglite', database_path: dbDir });
   await engine.initSchema();
-});
+}, PGLITE_COLD_INIT_TIMEOUT_MS);
 
 afterAll(async () => {
   await engine.disconnect();

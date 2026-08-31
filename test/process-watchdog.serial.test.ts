@@ -18,7 +18,7 @@ async function runHarness(
   deadlineMs: number,
   graceMs: number,
   hardCapMs: number,
-): Promise<{ exitCode: number | null; signalled: boolean; elapsedMs: number; stdout: string; stderr: string; killedByTest: boolean }> {
+): Promise<{ exitCode: number | null; signalCode: NodeJS.Signals | null; signalled: boolean; elapsedMs: number; stdout: string; stderr: string; killedByTest: boolean }> {
   const proc = Bun.spawn(['bun', HARNESS, mode, String(deadlineMs), String(graceMs)], {
     stdout: 'pipe',
     stderr: 'pipe',
@@ -34,7 +34,7 @@ async function runHarness(
   // Bun surfaces signal death via exitCode === null + signalCode, or a negative
   // exitCode on some platforms. Treat "not a clean 0" as signalled for our purpose.
   const signalled = proc.exitCode !== 0;
-  return { exitCode: proc.exitCode, signalled, elapsedMs, stdout, stderr, killedByTest };
+  return { exitCode: proc.exitCode, signalCode: proc.signalCode, signalled, elapsedMs, stdout, stderr, killedByTest };
 }
 
 describe('process-watchdog integration (Bun-pinned)', () => {
@@ -68,7 +68,7 @@ describe('process-watchdog integration (Bun-pinned)', () => {
 });
 
 describe('loop-stall watchdog integration (Bun-pinned, #4281)', () => {
-  test('starved loop with a SIGTERM listener is SIGTERMed then SIGKILLed around stall+grace', async () => {
+  test('starved loop with a SIGTERM listener is terminated by SIGKILL around stall+grace', async () => {
     // stall 300 + grace 250 = ~550ms expected death (plus worker boot). The
     // harness registers a SIGTERM listener, so only the SIGKILL escalation can
     // actually kill it — exactly the serve-http shape (process-cleanup's
@@ -78,9 +78,11 @@ describe('loop-stall watchdog integration (Bun-pinned, #4281)', () => {
     expect(r.killedByTest).toBe(false);          // watchdog, not the test, killed it
     expect(r.signalled).toBe(true);
     expect(r.elapsedMs).toBeLessThan(3500);
-    // The worker latched SIGTERM first, then escalated — both visible in its log.
-    expect(r.stderr).toContain('SIGTERM');
-    expect(r.stderr).toContain('SIGKILL');
+    // Kernel-observed SIGKILL is the race-free termination proof. A delayed
+    // worker check may jump straight to the grace deadline, and worker stderr
+    // can lose to the kill on Bun/macOS, so neither proves a mandatory TERM
+    // breadcrumb/sequence.
+    expect(r.signalCode).toBe('SIGKILL');
   }, 15000);
 
   test('healthy petting loop is NEVER killed across multiple stall windows', async () => {

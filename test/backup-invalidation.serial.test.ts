@@ -242,7 +242,10 @@ describe('workspace-push finish() choke point', () => {
 
   test('a clean lock-skip never touches the cache (skip returns before finish)', async () => {
     seedWarnCache();
-    const lock = acquirePushLock(work);
+    // Match workspacePush's exact git-reported root bytes on every platform
+    // (including Windows separator/casing behavior), rather than guessing at
+    // Git's canonicalization with Node realpath semantics.
+    const lock = acquirePushLock(git(work, 'rev-parse', '--show-toplevel'));
     expect(lock.acquired).toBe(true);
     try {
       writeFileSync(join(work, 'note.md'), 'racing\n');

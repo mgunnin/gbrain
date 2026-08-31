@@ -61,7 +61,7 @@ describe('agent register live-serve + duplicate-name refusals (real PGLite brain
     const env: Record<string, string | undefined> = { ...process.env, HOME: home, GBRAIN_HOME: home };
     delete env.GBRAIN_DATABASE_URL;
     delete env.DATABASE_URL;
-    const init = Bun.spawn(['bun', '--no-env-file', 'run', 'src/cli.ts', 'init', '--pglite'], {
+    const init = Bun.spawn(['bun', '--no-env-file', 'run', 'src/cli.ts', 'init', '--pglite', '--no-embedding'], {
       cwd: REPO, env, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
     });
     const initOut = await new Response(init.stdout).text();

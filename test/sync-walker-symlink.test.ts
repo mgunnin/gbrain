@@ -59,7 +59,10 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
       const files = collectSyncableFiles(tmp, { strategy: 'markdown' });
       const ms = Date.now() - t0;
 
-      expect(ms).toBeLessThan(1000); // would hang if walker followed the loop
+      // The contract is bounded termination, not sub-second wall time. Four
+      // concurrent filesystem/PGLite shards can push a correct lstat-only walk
+      // past 1s on macOS; an actual followed cycle never returns at all.
+      expect(ms).toBeLessThan(5000);
       expect(files).toContain(join(tmp, 'notes.md'));
       expect(files.every(f => !f.includes(`${sep}loop${sep}`))).toBe(true);
     });

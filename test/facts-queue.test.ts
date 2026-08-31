@@ -7,6 +7,7 @@
 
 import { describe, test, expect, beforeEach } from 'bun:test';
 import { FactsQueue, __resetFactsQueueForTests } from '../src/core/facts/queue.ts';
+import { waitFor } from './helpers/wait-for.ts';
 
 beforeEach(() => {
   __resetFactsQueueForTests();
@@ -21,7 +22,7 @@ describe('FactsQueue.enqueue', () => {
     for (let i = 0; i < 3; i++) {
       q.enqueue(async () => { seen.push(i); }, 'sess');
     }
-    await sleep(50);
+    await waitFor(() => q.getCounters().completed === 3, { label: 'three FIFO jobs complete' });
     expect(seen).toEqual([0, 1, 2]);
     expect(q.getCounters().completed).toBe(3);
   });
@@ -55,7 +56,7 @@ describe('FactsQueue.enqueue', () => {
       await sleep(20);
       log.push('b-end');
     }, 'sess');
-    await sleep(100);
+    await waitFor(() => log.length === 4, { label: 'both serialized jobs complete' });
     // a must finish before b starts within the same session.
     expect(log).toEqual(['a-start', 'a-end', 'b-start', 'b-end']);
   });
@@ -65,7 +66,7 @@ describe('FactsQueue.enqueue', () => {
     const log: string[] = [];
     q.enqueue(async () => { log.push('a-start'); await sleep(40); log.push('a-end'); }, 'sess-A');
     q.enqueue(async () => { log.push('b-start'); await sleep(40); log.push('b-end'); }, 'sess-B');
-    await sleep(80);
+    await waitFor(() => log.length === 4, { label: 'both parallel jobs complete' });
     // Both started before either ended.
     const aStart = log.indexOf('a-start');
     const bStart = log.indexOf('b-start');
@@ -77,7 +78,7 @@ describe('FactsQueue.enqueue', () => {
   test('failed jobs increment failed counter', async () => {
     const q = new FactsQueue({ cap: 10 });
     q.enqueue(async () => { throw new Error('boom'); }, 'sess');
-    await sleep(50);
+    await waitFor(() => q.getCounters().failed === 1, { label: 'failed job recorded' });
     expect(q.getCounters().failed).toBe(1);
     expect(q.getCounters().completed).toBe(0);
   });
