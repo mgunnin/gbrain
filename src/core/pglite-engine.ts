@@ -57,7 +57,7 @@ import { runMigrations } from './migrate.ts';
 import { hnswEfSearchFor, hnswIndexExpected, HNSW_EF_SEARCH_MAX } from './vector-index.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
-import { DELETE_BATCH_SIZE } from './engine-constants.ts';
+import { DELETE_BATCH_SIZE, TRAVERSE_PATH_ROW_CAP } from './engine-constants.ts';
 import { PageMissingError } from './engine-errors.ts';
 import { SOURCE_CONFIG_OBJECT_SQL } from './source-config-sql.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
@@ -99,7 +99,7 @@ import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
 import { EMBED_SKIP_FILTER_FRAGMENT } from './embed-skip.ts';
-import { QUARANTINE_FILTER_FRAGMENT } from './quarantine.ts';
+import { QUARANTINE_FILTER_FRAGMENT, quarantineFilterFragment } from './quarantine.ts';
 import {
   normalizeEngineColumn,
   buildVectorCastFragment,
@@ -240,8 +240,6 @@ export function tryLoadSnapshot(snapshotPath: string): Blob | null {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const fs = require('node:fs') as typeof import('node:fs'); // engine-dynamic-import-ok
       const crypto = require('node:crypto') as typeof import('node:crypto'); // engine-dynamic-import-ok
-      const { MIGRATIONS } = require('./migrate.ts') as typeof import('./migrate.ts'); // engine-dynamic-import-ok
-      const { PGLITE_SCHEMA_SQL } = require('./pglite-schema.ts') as typeof import('./pglite-schema.ts'); // engine-dynamic-import-ok
 
       if (!fs.existsSync(snapshotPath)) {
         if (!_snapshotWarnLogged) {
@@ -263,7 +261,10 @@ export function tryLoadSnapshot(snapshotPath: string): Blob | null {
         return null;
       }
       if (_snapshotSchemaHashMemo === null) {
-        _snapshotSchemaHashMemo = computeSnapshotSchemaHash(MIGRATIONS, PGLITE_SCHEMA_SQL, crypto);
+        // 'unavailable' (source files unreadable — compiled binary) never
+        // matches a hex hash below, so the snapshot is refused via the same
+        // stale path. Memoized either way: one file read per process.
+        _snapshotSchemaHashMemo = computeSnapshotSchemaHash(crypto, fs) ?? 'unavailable';
       }
       const versionLines = fs.readFileSync(versionPath, 'utf8').trim().split('\n');
       if (_snapshotSchemaHashMemo !== (versionLines[0] ?? '')) {
@@ -326,32 +327,36 @@ export function tryLoadSnapshot(snapshotPath: string): Blob | null {
 }
 
 export function computeSnapshotSchemaHash(
-  migrations: Array<{ version: number; name: string; sql?: string; sqlFor?: { pglite?: string }; handler?: unknown }>,
-  schemaSQL: string,
   crypto: typeof import('node:crypto'),
-): string {
-  const hash = crypto.createHash('sha256');
-  hash.update('schema:');
-  hash.update(schemaSQL);
-  hash.update('\nmigrations:\n');
-  for (const m of migrations) {
-    hash.update(String(m.version));
-    hash.update('\t');
-    hash.update(m.name);
-    hash.update('\t');
-    hash.update(m.sql ?? '');
-    hash.update('\t');
-    hash.update(m.sqlFor?.pglite ?? '');
-    hash.update('\t');
-    // W0 fix-wave (D5.13, Codex #4): 19+ migrations carry executable
-    // `handler` code with empty/absent sql — invisible to the sql-only hash,
-    // so editing a handler reused a stale snapshot. Function.prototype
-    // .toString folds the handler SOURCE into the hash (deterministic within
-    // a checkout; this is a dev/test fixture, not a shipped artifact).
-    hash.update(typeof m.handler === 'function' ? String(m.handler) : '');
-    hash.update('\n');
+  fs: typeof import('node:fs'),
+): string | null {
+  // Instrumentation-immune schema hash: the raw FILE BYTES of migrate.ts +
+  // pglite-schema.ts, resolved relative to this module.
+  //
+  // The previous form hashed the in-memory MIGRATIONS array, folding each
+  // migration handler's Function.prototype.toString (W0 D5.13 — editing a
+  // handler must stale the snapshot). But coverage instrumentation rewrites
+  // LOADED function bodies, so under `bun test --coverage` (every CI shard)
+  // the runtime hash never matched the plain-`bun run` builder's, and every
+  // CI engine silently cold-initted ("snapshot stale") — a permanent
+  // CI-vs-local timing divergence that amplified ordering flakes. File bytes
+  // keep the D5.13 property (a handler edit edits the file) and are identical
+  // under any loader, runtime, or instrumentation. They are also the same
+  // inputs CI's snapshot-cache key hashes, so builder, engine, and cache can
+  // no longer disagree in kind.
+  //
+  // Returns null when the source files are unreadable (compiled binary) —
+  // the snapshot is a dev/test fixture; no-snapshot is the safe answer there.
+  try {
+    const hash = crypto.createHash('sha256');
+    hash.update('files:v2\n');
+    hash.update(fs.readFileSync(new URL('./migrate.ts', import.meta.url)));
+    hash.update('\n--\n');
+    hash.update(fs.readFileSync(new URL('./pglite-schema.ts', import.meta.url)));
+    return hash.digest('hex');
+  } catch {
+    return null;
   }
-  return hash.digest('hex');
 }
 
 /**
@@ -2489,6 +2494,10 @@ export class PGLiteEngine implements BrainEngine {
         const fallbackParams = [...params];
         fallbackParams[0] = orQuery;
         ({ rows } = await this.db.query(keywordSql, fallbackParams));
+        // 2026-09 (#3617 follow-up): relaxed rows are TAGGED so hybrid's
+        // fusion can demote them — an OR-of-common-terms match must not
+        // outvote a healthy vector arm (SearchResult.keyword_relaxed doc).
+        return (rows as Record<string, unknown>[]).map((r) => ({ ...rowToSearchResult(r), keyword_relaxed: true as const }));
       }
     }
 
@@ -2567,7 +2576,8 @@ export class PGLiteEngine implements BrainEngine {
     // chunkless pages retrievable (the extreme D1 case: a title with no
     // body) with the alias-hop row shape (chunk_id 0, empty chunk_text).
     // Accepted limitations (Reviewer F5/F6): the synthetic chunkless row
-    // inherits the compiled-truth RRF boost and dedups on empty chunk_text;
+    // dedups on empty chunk_text (fusion's compiledTruthBoost skips it since
+    // #3695 — chunk_id 0 + empty chunk_text never gains chunk authority);
     // and detail='low' filters only the REPRESENTATIVE — pages without a
     // compiled_truth chunk still surface (unlike the keyword arm's filter).
     const titlesSql =
@@ -2605,6 +2615,9 @@ export class PGLiteEngine implements BrainEngine {
         const fallbackParams = [...params];
         fallbackParams[0] = boundWebsearchQuery(orQuery);
         ({ rows } = await this.db.query(titlesSql, fallbackParams));
+        // 2026-09 (#3617 follow-up): same relaxed-row tagging as the keyword
+        // arm — see SearchResult.keyword_relaxed.
+        return (rows as Record<string, unknown>[]).map((r) => ({ ...rowToSearchResult(r), keyword_relaxed: true as const }));
       }
     }
     return (rows as Record<string, unknown>[]).map(rowToSearchResult);
@@ -4173,6 +4186,13 @@ export class PGLiteEngine implements BrainEngine {
     slug: string,
     opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
   ): Promise<GraphPath[]> {
+    return (await this.traversePathsDetailed(slug, opts)).paths;
+  }
+
+  async traversePathsDetailed(
+    slug: string,
+    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
+  ): Promise<{ paths: GraphPath[]; truncated: boolean }> {
     const depth = opts?.depth ?? 5;
     const direction = opts?.direction ?? 'out';
     const linkType = opts?.linkType ?? null;
@@ -4234,6 +4254,7 @@ export class PGLiteEngine implements BrainEngine {
           ${linkTypeWhere}
           ${stepScope}
         ORDER BY depth, from_slug, to_slug
+        LIMIT ${TRAVERSE_PATH_ROW_CAP + 1}
       `;
     } else if (direction === 'in') {
       sql = `
@@ -4261,6 +4282,7 @@ export class PGLiteEngine implements BrainEngine {
           ${linkTypeWhere}
           ${stepScope}
         ORDER BY depth, from_slug, to_slug
+        LIMIT ${TRAVERSE_PATH_ROW_CAP + 1}
       `;
     } else {
       // both: walk in both directions, emit every traversed edge (preserving its
@@ -4293,14 +4315,19 @@ export class PGLiteEngine implements BrainEngine {
           ${pfScope}
           ${ptScope}
         ORDER BY depth, from_slug, to_slug
+        LIMIT ${TRAVERSE_PATH_ROW_CAP + 1}
       `;
     }
 
     const { rows } = await this.db.query(sql, params);
+    // Row cap: the LIMIT above fetched CAP + 1 rows; the probe row only tells
+    // us the walk overflowed and is dropped with everything past the cap.
+    const truncated = rows.length > TRAVERSE_PATH_ROW_CAP;
+    const bounded = (truncated ? rows.slice(0, TRAVERSE_PATH_ROW_CAP) : rows) as Record<string, unknown>[];
     // Dedup edges (same from/to/type/depth can appear via multiple visited paths).
     const seen = new Set<string>();
     const result: GraphPath[] = [];
-    for (const r of rows as Record<string, unknown>[]) {
+    for (const r of bounded) {
       const key = `${r.from_slug}|${r.to_slug}|${r.link_type}|${r.depth}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -4312,7 +4339,7 @@ export class PGLiteEngine implements BrainEngine {
         depth: r.depth as number,
       });
     }
-    return result;
+    return { paths: result, truncated };
   }
 
   async relationalFanout(
@@ -4579,7 +4606,7 @@ export class PGLiteEngine implements BrainEngine {
     sourceId?: string;
     sourceIds?: string[];
     mode?: 'inbound' | 'islanded';
-  }): Promise<Array<{ slug: string; title: string; domain: string | null }>> {
+  }): Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean }>> {
     // Soft-delete filter on BOTH sides:
     //   - candidate: p.deleted_at IS NULL — soft-deleted pages aren't orphan candidates
     //   - link source: src.deleted_at IS NULL — links FROM soft-deleted pages don't count as inbound
@@ -4618,7 +4645,9 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT
          p.slug,
          COALESCE(p.title, p.slug) AS title,
-         p.frontmatter->>'domain' AS domain
+         p.frontmatter->>'domain' AS domain,
+         p.type,
+         (NOT ${QUARANTINE_FILTER_FRAGMENT}) AS quarantined
        FROM pages p
        WHERE p.deleted_at IS NULL
          ${sourceFilter}
@@ -4633,7 +4662,7 @@ export class PGLiteEngine implements BrainEngine {
        ORDER BY p.slug`,
       params
     );
-    return rows as Array<{ slug: string; title: string; domain: string | null }>;
+    return rows as Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean }>;
   }
 
   // Tags
@@ -5669,8 +5698,12 @@ export class PGLiteEngine implements BrainEngine {
         WHERE ($1::text[] IS NULL OR p.source_id = ANY($1))
       ),
       entity_pages AS (
+        -- #4280: quarantined entity shells are not served memory — keep them
+        -- out of the link/timeline coverage denominators (parity with
+        -- onboard's VISIBLE_ENTITY_PREDICATE).
         SELECT id, slug FROM scoped_pages WHERE id IN (
           SELECT id FROM pages WHERE type IN ('entity', 'person', 'company') AND deleted_at IS NULL
+            AND ${quarantineFilterFragment('pages')}
         )
       )
       SELECT
@@ -5741,6 +5774,7 @@ export class PGLiteEngine implements BrainEngine {
              )::int as link_count
       FROM pages p
       WHERE p.type IN ('entity', 'person', 'company') AND p.deleted_at IS NULL
+        AND ${QUARANTINE_FILTER_FRAGMENT}
         AND ($1::text[] IS NULL OR p.source_id = ANY($1))
       ORDER BY link_count DESC
       LIMIT 5
@@ -5761,8 +5795,11 @@ export class PGLiteEngine implements BrainEngine {
     // `gbrain orphans` whenever a soft-deleted page still linked to (or was
     // linked from) a live one.
     // #4592: out-of-scope endpoints cannot rescue a page from orphan-hood.
+    // #4280: quarantined pages drop out of the linkable scope in SQL;
+    // machine leaf types (atom/conversation/source) drop out through the
+    // shared policy below via p.type.
     const { rows: pageScopeRows } = await this.db.query(`
-      SELECT p.id, p.slug,
+      SELECT p.id, p.slug, p.type,
              (NOT EXISTS (SELECT 1 FROM links l
                           JOIN pages src ON src.id = l.from_page_id
                           WHERE l.to_page_id = p.id AND src.deleted_at IS NULL
@@ -5774,6 +5811,7 @@ export class PGLiteEngine implements BrainEngine {
              EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id) as has_timeline
       FROM pages p
       WHERE p.deleted_at IS NULL
+        AND ${QUARANTINE_FILTER_FRAGMENT}
         AND ($1::text[] IS NULL OR p.source_id = ANY($1))
     `, [scope]);
     const { rows: liveLinkRows } = await this.db.query(`
@@ -5800,8 +5838,8 @@ export class PGLiteEngine implements BrainEngine {
           this.countStalePagesForExtraction({ sourceId: sid, versionTs: LINK_EXTRACTOR_VERSION_TS }),
         ))).reduce((a, b) => a + b, 0);
     const orphanOverrides = await loadOrphanPolicyOverrides(this);
-    const linkablePages = (pageScopeRows as { id: string; slug: string; islanded: boolean; has_timeline: boolean }[])
-      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides));
+    const linkablePages = (pageScopeRows as { id: string; slug: string; type: string; islanded: boolean; has_timeline: boolean }[])
+      .filter(row => !shouldExcludeFromOrphanReporting(row.slug, orphanOverrides, { type: row.type }));
     const linkablePageCount = linkablePages.length;
     const orphanPages = linkablePages.filter(row => row.islanded).length;
     const linkableTimelinePages = linkablePages.filter(row => row.has_timeline).length;
@@ -5919,10 +5957,17 @@ export class PGLiteEngine implements BrainEngine {
     slug: string,
     sourceOrSources: string | readonly string[],
   ): Promise<string> {
+    return (await this.resolveSlugWithAliasDetailed(slug, sourceOrSources))?.canonical_slug ?? slug;
+  }
+
+  async resolveSlugWithAliasDetailed(
+    slug: string,
+    sourceOrSources: string | readonly string[],
+  ): Promise<{ canonical_slug: string; source_id: string } | null> {
     const sources = Array.isArray(sourceOrSources)
       ? [...sourceOrSources]
       : [sourceOrSources as string];
-    if (sources.length === 0) return slug;
+    if (sources.length === 0) return null;
     try {
       // PGLite supports `= ANY($N::text[])` per pgvector / postgres semantics.
       // ORDER BY array_position pins the federated-read precedence so the
@@ -5936,7 +5981,7 @@ export class PGLiteEngine implements BrainEngine {
          ORDER BY id`,
         [slug, ...sources],
       );
-      if (rows.length === 0) return slug;
+      if (rows.length === 0) return null;
       if (rows.length > 1) {
         warnOncePerProcess(
           `resolveSlugWithAlias:multi_match:${slug}`,
@@ -5949,9 +5994,9 @@ export class PGLiteEngine implements BrainEngine {
         order: sources.indexOf((r as { source_id: string }).source_id),
       }));
       indexedRows.sort((a, b) => a.order - b.order);
-      return indexedRows[0].canonical_slug ?? slug;
+      return { canonical_slug: indexedRows[0].canonical_slug, source_id: indexedRows[0].source_id };
     } catch (e) {
-      if (isUndefinedTableError(e)) return slug;
+      if (isUndefinedTableError(e)) return null;
       throw e;
     }
   }

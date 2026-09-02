@@ -33,7 +33,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { WindowTurn } from './entity-salience.ts';
-import { toCorpusText } from '../transcripts/claude-code-jsonl.ts';
+import { toCorpusText, type ToolCallRecord } from '../transcripts/claude-code-jsonl.ts';
 import { mapOpenclawLine } from '../transcripts/openclaw.ts';
 
 /** Length of the hex content-hash slice in segment filenames. */
@@ -239,7 +239,7 @@ export async function coverageComplete(
 export function readOpenclawBoundaryTail(
   path: string,
   opts: { maxBytes?: number } = {},
-): { turns: WindowTurn[]; boundaryTurnIndexes: number[] } | null {
+): { turns: WindowTurn[]; boundaryTurnIndexes: number[]; toolCalls: ToolCallRecord[]; toolCallTurnIndexes: number[] } | null {
   const maxBytes = Math.max(1, Math.floor(opts.maxBytes ?? 2 * 1024 * 1024));
   let raw: string;
   try {
@@ -261,6 +261,13 @@ export function readOpenclawBoundaryTail(
   }
   const turns: WindowTurn[] = [];
   const boundaryTurnIndexes: number[] = [];
+  // Memorable integration: tool calls stamped with the turn slot they sit at
+  // (turns.length BEFORE the line's own turn is pushed — same semantics as the
+  // claude-code parser), so a caller writing only a window span can filter the
+  // calls to the same origin. A `skip` line can still carry calls (a
+  // placeholder-only message has no text but its calls are real work).
+  const toolCalls: ToolCallRecord[] = [];
+  const toolCallTurnIndexes: number[] = [];
   let mappedAnything = false;
   for (const line of raw.split('\n')) {
     const t = line.trim();
@@ -272,6 +279,12 @@ export function readOpenclawBoundaryTail(
       continue; // includes a tail read's partial first line
     }
     const mapped = mapOpenclawLine(entry);
+    if (mapped.kind === 'message' || mapped.kind === 'skip') {
+      for (const c of mapped.toolCalls ?? []) {
+        toolCalls.push(c);
+        toolCallTurnIndexes.push(turns.length);
+      }
+    }
     if (mapped.kind === 'session') {
       mappedAnything = true;
     } else if (mapped.kind === 'boundary') {
@@ -282,7 +295,78 @@ export function readOpenclawBoundaryTail(
       turns.push({ role: mapped.message.role, text: mapped.message.text });
     }
   }
-  return mappedAnything ? { turns, boundaryTurnIndexes } : null;
+  return mappedAnything ? { turns, boundaryTurnIndexes, toolCalls, toolCallTurnIndexes } : null;
+}
+
+/**
+ * Ambient-writeback turn files (WP4) — the Stop-hook backstop's siblings of
+ * checkpoint segments. `<sessionId>.wb-<hash24>[.src-<sourceId>].txt` where
+ * the hash is the GATE's normalized-turn hash (turn identity, computed in
+ * writeback-gate.ts) — a re-fired Stop hook for the same turn re-derives the
+ * same name and short-circuits (requirement 9's deterministic idempotency,
+ * embedding-free). The optional `.src-` segment banks the session's
+ * GBRAIN_SOURCE so the SWEEP fallback files the turn into the same source
+ * the prompt-time IPC lane would have (source-isolation invariant —
+ * adversarial review, this wave); omitted for the default source, keeping
+ * default-flow names byte-identical. They end `.txt` ON PURPOSE: the sweep's
+ * corpus pass is the free backstop when serve/IPC is down (the sweep applies
+ * the writeback gate before extracting them — OV2-11).
+ */
+export function wbFileName(sessionId: string, hash24: string, sourceId?: string | null): string {
+  const src = sourceId && sourceId !== 'default' ? `.src-${safeIdComponent(sourceId)}` : '';
+  return `${safeIdComponent(sessionId)}.wb-${hash24.replace(/[^0-9a-f]/g, '')}${src}.txt`;
+}
+
+/** `{sessionId, hash, sourceId?}` when `name` is a writeback turn file, else
+ * null. `sourceId` is the RAW banked segment — consumers validate it
+ * (isValidSourceId) before any DB use. */
+export function parseWbFileName(name: string): { sessionId: string; hash: string; sourceId?: string } | null {
+  const m = /^(.+)\.wb-([0-9a-f]{12,64})(?:\.src-([A-Za-z0-9._-]+))?\.txt$/.exec(name);
+  return m ? { sessionId: m[1], hash: m[2], ...(m[3] ? { sourceId: m[3] } : {}) } : null;
+}
+
+/** The TERMINAL writeback_off `.ingested` sidecar payload — the wb state
+ * machine's one terminal skip, written identically by the serve harvest and
+ * the sweep backstop (shape drift between the two writers would be invisible
+ * until a consumer disagrees). */
+export function writebackOffSidecarJson(): string {
+  return JSON.stringify({ ingested_at: new Date().toISOString(), skipped: 'writeback_off' }) + '\n';
+}
+
+/**
+ * Bank one gated user turn as a writeback corpus file: redacted render
+ * (NEVER written unscanned — scanner unavailable is a typed skip, matching
+ * the segment posture) → idempotent existence check (same turn or its
+ * `.ingested` sidecar ⇒ dup skip, zero LLM) → atomic write. Returns typed
+ * status codes for the heartbeat. Never throws.
+ */
+export async function bankWritebackTurn(
+  dir: string,
+  sessionId: string,
+  normalizedTurn: string,
+  hash24: string,
+  sourceId?: string | null,
+): Promise<{ status: 'wb_banked' | 'wb_dup' | 'wb_scan_unavailable' | 'wb_empty' | `wb_${string}`; flushCorpusFile?: string }> {
+  try {
+    const name = wbFileName(sessionId, hash24, sourceId);
+    const file = join(dir, name);
+    if (existsSync(file) || existsSync(file + '.ingested')) return { status: 'wb_dup', flushCorpusFile: name };
+    let redacted: string;
+    try {
+      const scan = await import('../secret-scan.ts');
+      redacted = scan.redactFindings(normalizedTurn).text;
+    } catch {
+      return { status: 'wb_scan_unavailable' };
+    }
+    if (!redacted.trim()) return { status: 'wb_empty' };
+    const tmp = `${file}.tmp-${process.pid}`;
+    writeFileSync(tmp, redacted + '\n', { mode: 0o600 });
+    renameSync(tmp, file);
+    return { status: 'wb_banked', flushCorpusFile: name };
+  } catch (e) {
+    const name = e instanceof Error ? e.name || 'Error' : 'Error';
+    return { status: `wb_${name.toLowerCase()}` };
+  }
 }
 
 /**
@@ -337,19 +421,24 @@ export async function decideCorpusMode(
   sessionId: string,
   turns: WindowTurn[],
   boundaryTurnIndexes: number[],
-): Promise<{ mode: 'full' | 'full_fallback' | 'remainder' | 'skip_covered'; turns: WindowTurn[] }> {
-  if (!boundaryTurnIndexes.length) return { mode: 'full', turns };
+): Promise<{ mode: 'full' | 'full_fallback' | 'remainder' | 'skip_covered'; turns: WindowTurn[]; startTurnIndex: number }> {
+  if (!boundaryTurnIndexes.length) return { mode: 'full', turns, startTurnIndex: 0 };
   try {
     if (await coverageComplete(dir, sessionId, turns, boundaryTurnIndexes)) {
       const remainder = splitByBoundaries(turns, boundaryTurnIndexes).remainder;
+      // splitByBoundaries takes the remainder from the LAST boundary, so that
+      // index is where the written span begins. Callers that derive anything
+      // else from the transcript (tool calls, hashes) must use the same
+      // origin, or their artifacts describe a different span than the corpus.
+      const startTurnIndex = boundaryTurnIndexes[boundaryTurnIndexes.length - 1] ?? 0;
       return remainder.length === 0
-        ? { mode: 'skip_covered', turns: remainder }
-        : { mode: 'remainder', turns: remainder };
+        ? { mode: 'skip_covered', turns: remainder, startTurnIndex }
+        : { mode: 'remainder', turns: remainder, startTurnIndex };
     }
   } catch {
     /* fall through to full_fallback */
   }
-  return { mode: 'full_fallback', turns };
+  return { mode: 'full_fallback', turns, startTurnIndex: 0 };
 }
 
 /**

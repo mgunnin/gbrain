@@ -29,6 +29,7 @@ const GHO = 'gho_' + 'B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9';
 const GH_PAT = 'github_pat_' + '11AAAAAAA0aaaaaaaaaaaa_bbbbbbbbbbbbbbbbbbbbbb';
 const SLACK = 'xoxb-' + '123456789012-abcdefABCDEF';
 const AWS = 'AKIA' + 'IOSFODNN7EXAMPLE';
+const GBRAIN_HEX = '0123456789abcdef'.repeat(4);
 const PEM = '-----BEGIN RSA PRIVATE KEY-----';
 
 let tmp: string | null = null;
@@ -76,6 +77,19 @@ describe('scanText — pattern classes', () => {
     }
   });
 
+  test("gbrain's own tokens (generateToken prefix family) fire as gbrain_token", () => {
+    // '' = legacy bearer (auth create / token-mint / serve-http); the rest are
+    // the OAuth forms from oauth-provider.ts, gbrain_at_ being the /mcp bearer.
+    for (const infix of ['', 'at_', 'rt_', 'cs_', 'code_']) {
+      const findings = scanText(`Authorization: Bearer gbrain_${infix}${GBRAIN_HEX}`);
+      expect(findings.map((f) => f.pattern)).toEqual(['gbrain_token']);
+    }
+  });
+
+  test('a gbrain_cl_ client id (public identifier) does not fire', () => {
+    expect(scanText(`client_id=gbrain_cl_${GBRAIN_HEX}`)).toEqual([]);
+  });
+
   test('a Voyage key (pa-…, PROVIDER_KEY_SHAPES shape) fires as voyage', () => {
     const findings = scanText(`voyage_api_key: ${VOYAGE}`);
     expect(findings.map((f) => f.pattern)).toEqual(['voyage']);
@@ -96,6 +110,8 @@ describe('scanText — pattern classes', () => {
       'task-management-systems-for-founders-and-agents',
       'xoxo love, the changelog',                            // not xox[baprs]-
       'AKIAXX',                                              // too short
+      `gbrain_${'ab'.repeat(16)} is a 32-hex config id`,     // token body is 64 hex
+      'the gbrain_token pattern name itself',                // identifier, no hex body
       '-----BEGIN CERTIFICATE-----',                         // not a private key
     ].join('\n');
     expect(scanText(text)).toEqual([]);
@@ -292,5 +308,59 @@ describe('glob dialect (shared with the push deny-list)', () => {
     expect(globToRegExp('a+b.md').test('a+b.md')).toBe(true);
     expect(globToRegExp('a+b.md').test('aab.md')).toBe(false);
     expect(pathAllowlisted('x (1).md', ['x (1).md'])).toBe(true);
+  });
+});
+
+describe('high-entropy assignment reaches compound credential keys', () => {
+  const HI = 'Ab3xK9mQ2pR7sT1vW4yZ8bC5dE6f';
+  // `\b`-style boundaries cannot match inside `api_access_token`, and a
+  // keyword-adjacent anchor cannot match `AWS_SECRET_ACCESS_KEY` at all —
+  // `SECRET` is not the segment touching the `=`. Both shapes leaked to an
+  // external API before this rule was widened AND enabled at the call site.
+  for (const [name, input] of [
+    ['underscore-separated keyword', `api_access_token: ${HI}`],
+    ['screaming snake case', `SMTP_PASSWORD=${HI}`],
+    ['keyword with trailing segments', `AWS_SECRET_ACCESS_KEY=${HI}`],
+  ] as const) {
+    test(name, () => {
+      expect(scanText(input, { highEntropy: true }).map((f) => f.pattern)).toEqual(['high_entropy_assignment']);
+    });
+  }
+
+  test('the value floor is exactly 12 — the 16-char-SMTP-password class that motivated it stays covered', () => {
+    // 12 distinct chars = log2(12) ≈ 3.585 bits/char, just over the 3.5 gate.
+    expect(scanText('password=aB3xK9mQ2pR7', { highEntropy: true }).map((f) => f.pattern)).toEqual(['high_entropy_assignment']);
+    // 11 chars can never reach 3.5 bits/char (log2(11) ≈ 3.46) — and the
+    // regex floor refuses it first. Pinned so a floor edit is a visible edit.
+    expect(scanText('password=aB3xK9mQ2pR', { highEntropy: true })).toEqual([]);
+  });
+
+  test('the widened keywords passphrase and credential fire', () => {
+    for (const k of ['passphrase', 'credential'] as const) {
+      expect(scanText(`${k}=${HI}`, { highEntropy: true }).map((f) => f.pattern)).toEqual(['high_entropy_assignment']);
+    }
+  });
+
+  /** Known limitation, asserted so it stays visible rather than being
+   * rediscovered. The left boundary requires the keyword to START at a
+   * non-alphanumeric, so a camelCase compound (`apiAccessToken`) is out of
+   * reach here. Dropping the boundary would let the keyword fire mid-word in
+   * ordinary prose, and this pattern is shared with gbrain's corpus scanning.
+   * The consumer's own scrub normalises separators and DOES cover this shape,
+   * and it is the last pass before anything leaves the machine. */
+  test('camelCase compounds are NOT covered by this rule', () => {
+    expect(scanText(`apiAccessToken=${HI}`, { highEntropy: true })).toEqual([]);
+  });
+
+  // The rule runs over tool-call arguments, which ARE the recall signal.
+  test('leaves paths, commands and hashes alone', () => {
+    for (const s of [
+      'src/core/context/hook-heartbeat.ts',
+      'cd ~/Documents/GitHub/memorable-gbrain && bun test',
+      'commit 3e365f5f1a2b4c8d9e0f1a2b3c4d5e6f70819293',
+      'export NODE_OPTIONS=--max-old-space-size=8192',
+    ]) {
+      expect(scanText(s, { highEntropy: true })).toEqual([]);
+    }
   });
 });

@@ -124,10 +124,29 @@ describe('doctor command', () => {
     expect(check.message).toContain('Subagent model resolves via models.subagent to "anthropic:claude-opus-4-7"');
   });
 
-  test('subagent_capability checks models.default before tier fallback', async () => {
+  test('subagent_capability checks models.tier.subagent before models.default (#4575)', async () => {
+    // The runtime hoisted models.tier.<tier> above models.default in #3873;
+    // the check must mirror that order. Pre-fix it read models.default first
+    // and reported an unclearable degraded:no_caching warn on any brain that
+    // set both keys — following the warning's own advice (set
+    // models.tier.subagent) could never retire it.
     const { checkSubagentCapability } = await import('../src/commands/doctor.ts');
     const config = new Map<string, string | null>([
       ['models.tier.subagent', 'anthropic:claude-sonnet-4-6'],
+      ['models.default', 'google:gemini-1.5-pro'],
+    ]);
+    const check = await checkSubagentCapability({
+      async getConfig(key: string): Promise<string | null> {
+        return config.get(key) ?? null;
+      },
+    } as any);
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('Subagent model resolves via models.tier.subagent to "anthropic:claude-sonnet-4-6"');
+  });
+
+  test('subagent_capability still explains models.default when it alone is set', async () => {
+    const { checkSubagentCapability } = await import('../src/commands/doctor.ts');
+    const config = new Map<string, string | null>([
       ['models.default', 'google:gemini-1.5-pro'],
     ]);
     const check = await checkSubagentCapability({
@@ -190,6 +209,63 @@ describe('doctor command', () => {
         expect(check.message).toContain('budget/pricing');
         expect(check.message).toContain('embedding-pricing.ts');
         expect(check.message).toContain('--max-cost');
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('#4648: reranker_health warns on >= 3 empty/malformed pass-throughs (named as pass-through)', async () => {
+    const { checkRerankerHealth } = await import('../src/commands/doctor.ts');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-passthrough-doctor-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        const reasons = ['empty_result_set', 'malformed_shape', 'empty_result_set'] as const;
+        reasons.forEach((reason, i) => {
+          logRerankFailure({
+            model: 'acmecorp:reranker-v1',
+            reason,
+            query_hash: `passthru${i}`,
+            doc_count: 12,
+            error_summary: 'provider answered successfully with an empty result set; results passed through unreranked',
+          });
+        });
+        const check = await checkRerankerHealth({
+          async getConfig(key: string): Promise<string | null> {
+            return key === 'search.reranker.enabled' ? 'true' : null;
+          },
+        } as any);
+        expect(check.status).toBe('warn');
+        expect(check.message).toContain('pass-through');
+        expect(check.message).toContain('3');
+      });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('#4648: two pass-throughs stay below the threshold — no pass-through warn', async () => {
+    const { checkRerankerHealth } = await import('../src/commands/doctor.ts');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-passthrough-doctor-2-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        for (const [i, reason] of (['empty_result_set', 'malformed_shape'] as const).entries()) {
+          logRerankFailure({
+            model: 'acmecorp:reranker-v1',
+            reason,
+            query_hash: `passthru-low${i}`,
+            doc_count: 12,
+            error_summary: 'provider answered successfully with a non-array result shape; results passed through unreranked',
+          });
+        }
+        const check = await checkRerankerHealth({
+          async getConfig(key: string): Promise<string | null> {
+            return key === 'search.reranker.enabled' ? 'true' : null;
+          },
+        } as any);
+        expect(check.status).toBe('ok');
+        expect(check.message).not.toContain('pass-through');
+        expect(check.message).toContain('below threshold');
       });
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });

@@ -14,6 +14,11 @@ The push channels share one zero-LLM core (`src/core/context/volunteer.ts`):
 | `watch` | `gbrain watch` | stream a transcript in, volunteered pages stream out |
 | `claude-code` / `codex` / `opencode` | `gbrain hook user-prompt` (registered by `gbrain bootstrap`) | per-prompt injection inside a harness; see "Harness hooks" below |
 
+Push context is READ-side. Its WRITE-side sibling — the opt-in ambient
+memory writeback channel (`gbrain hook stop` banking gated user turns for
+serve-side extraction, `memory.auto_writeback`) — is documented in
+[ambient-writeback.md](./ambient-writeback.md).
+
 ## How it decides
 
 1. **Extract** entities across the last N turns (capitalized runs, `@handles`),
@@ -96,12 +101,32 @@ those; extending the lane is a filed follow-up in TODOS.md).
 
 Kill switch: `GBRAIN_HOOKS=0`. Install/uninstall: `docs/guides/bootstrap.md`.
 
+## The OpenClaw reflex volunteer arm (2026-08 fix wave)
+
+The OpenClaw context-engine lane's ambient reflex now runs TWO arms per
+windowed turn: Arm 1 resolves entity pointers (the classic 3-pointer block),
+then Arm 2 runs the same `volunteerStage` gate the Claude Code turn-context
+lane ships — up to 3 additional confidence-gated pages (0.7 gate), deduped
+against the turn's pointers, rendered in the same wire idiom. Volunteer
+events from this lane log to `context_volunteer_events` under the `openclaw`
+channel (in-process only — the wire-claimable harness channel allowlist
+deliberately excludes it, so a hook client cannot spoof production
+attribution; on the PGLite/IPC rung these events are not yet logged, a
+disclosed gap with a filed fix).
+
+**Say to your agent:** *"Turn off the brain's volunteered context for now"* —
+your agent sets `retrieval_reflex_volunteer` to `false` (or exports
+`GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER=off` when config is unreachable — env wins
+over config as the incident lever). *"How often are volunteered pages actually
+used?"* — your agent runs `gbrain volunteer-context --stats`.
+
 ## Config
 
 | Key | Default | What it does |
 |---|---|---|
 | `retrieval_reflex_window_turns` | 4 | turns the ambient reflex extracts from; 1 = legacy current-turn-only (file/env plane: `GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS`) |
-| `retrieval_reflex` | true | the ambient channel's master switch |
+| `retrieval_reflex` | true | the ambient channel's master switch (env: `GBRAIN_RETRIEVAL_REFLEX`; negatives `false/0/off/no`, case-insensitive) |
+| `retrieval_reflex_volunteer` | true | the reflex volunteer arm (Arm 2) — the incident kill switch for volunteered pages on the OpenClaw lane (env: `GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER`, env above config) |
 | `retrieval_reflex_max_pointers` | 3 | pointer cap per turn |
 | `retrieval_reflex_lexical_arms` | true | the lowercase-alias + surname recall arms (env: `GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS`); off = pre-v0.46.15 arm set |
 

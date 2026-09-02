@@ -22,6 +22,7 @@ import { resolve } from 'node:path';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const SCRIPT = resolve(REPO_ROOT, 'scripts', 'check-wasm-embedded.sh');
+const PGLITE_SCRIPT = resolve(REPO_ROOT, 'scripts', 'check-pglite-embedded.sh');
 
 describe('check-wasm-embedded.sh (#3927)', () => {
   const source = readFileSync(SCRIPT, 'utf8');
@@ -40,4 +41,15 @@ describe('check-wasm-embedded.sh (#3927)', () => {
     expect(source).toContain(`if [[ "$OUTPUT" != *'"has_typescript_header": true'* ]]; then`);
     expect(source).toContain(`if [[ "$OUTPUT" != *'"calculateScore"'* ]]; then`);
   });
+});
+
+describe('compiled smoke tests on Darwin', () => {
+  for (const scriptPath of [SCRIPT, PGLITE_SCRIPT]) {
+    const source = readFileSync(scriptPath, 'utf8');
+
+    it(`${scriptPath.split('/').at(-1)} re-signs Bun's generated Mach-O before execution`, () => {
+      expect(source).toContain('if [[ "$(uname -s)" == "Darwin" ]]; then');
+      expect(source).toContain('codesign --force --sign - "$OUT_BIN"');
+    });
+  }
 });

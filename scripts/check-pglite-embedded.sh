@@ -55,6 +55,13 @@ if ! (cd "$BUILD_DIR" && bun build --compile --outfile "$OUT_BIN" scripts/pglite
   exit 1
 fi
 
+# Bun's linker-signed Mach-O can become invalid when embedded assets extend the
+# binary after the signature is written (observed on macOS 27). Re-sign the
+# temporary smoke-test binary before execution; Linux has no equivalent step.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  codesign --force --sign - "$OUT_BIN" >/dev/null
+fi
+
 # Run it against a temp GBRAIN_HOME. The smoketest boots a persistent PGLite
 # brain, upserts a page, and reads it back; it prints one JSON line and exits 0
 # only on a successful round-trip.

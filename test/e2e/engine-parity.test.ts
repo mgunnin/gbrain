@@ -19,7 +19,10 @@ import type { ChunkInput, SearchResult } from '../../src/core/types.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { getSessionContextState, upsertSessionContextState } from '../../src/core/context/session-state.ts';
 import { linkEntityIdentity, listEntityIdentities } from '../../src/core/entity-identity.ts';
+import { buildEntityCard } from '../../src/core/verbs/entity-card.ts';
 import { hasDatabase, setupDB, teardownDB, getEngine } from './helpers.ts';
+import { TRAVERSE_PATH_ROW_CAP } from '../../src/core/engine-constants.ts';
+import { DENSE_HUB_SLUG, DENSE_HUB_SPOKES, seedDenseHub } from '../helpers/dense-hub.ts';
 
 const SKIP_PG = !hasDatabase();
 const describeBoth = SKIP_PG ? describe.skip : describe;
@@ -143,12 +146,112 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     });
   }
 
+  test('searchKeyword orFallback: relaxed rows tagged keyword_relaxed on BOTH engines (2026-09 #3617 follow-up)', async () => {
+    // A query whose terms never co-occur in one chunk: zero strict recall,
+    // non-empty OR recall. Both engines must return the SAME tagged shape —
+    // hybrid's fusion demotion reads this flag, so a missing tag on one
+    // engine silently re-opens the relaxed-junk-outvotes-vector bug there.
+    // 'studies' lives only in the article page, 'distraction' only in the
+    // person page — no chunk carries both, so strict recall is zero while
+    // OR recall hits both pages.
+    const q = 'studies distraction';
+    const pgStrict = await pgEngine.searchKeyword(q, { limit: 5 });
+    const pgliteStrict = await pgliteEngine.searchKeyword(q, { limit: 5 });
+    expect(pgStrict).toHaveLength(0);
+    expect(pgliteStrict).toHaveLength(0);
+    const pgRelaxed = await pgEngine.searchKeyword(q, { limit: 5, orFallback: true });
+    const pgliteRelaxed = await pgliteEngine.searchKeyword(q, { limit: 5, orFallback: true });
+    // Non-empty FIRST (ship-review: without this, fixture-vocabulary drift
+    // makes every assertion below pass vacuously on empty arrays).
+    expect(pgRelaxed.length).toBeGreaterThan(0);
+    expect(pgliteRelaxed.length).toBeGreaterThan(0);
+    expect(pgRelaxed.map((r: SearchResult) => r.keyword_relaxed === true)).toEqual(
+      pgRelaxed.map(() => true),
+    );
+    expect(pgliteRelaxed.map((r: SearchResult) => r.keyword_relaxed === true)).toEqual(
+      pgliteRelaxed.map(() => true),
+    );
+    expect(new Set(pgRelaxed.map((r: SearchResult) => r.slug))).toEqual(
+      new Set(pgliteRelaxed.map((r: SearchResult) => r.slug)),
+    );
+  });
+
+  test('searchTitles orFallback: relaxed title rows tagged on BOTH engines (title-arm parity)', async () => {
+    // Title tokens that never co-occur in one title: strict title recall is
+    // zero, the title arm's always-on OR fallback fires, and BOTH engines
+    // must return the tagged shape — hybrid's titleFusionList reads the flag.
+    const q = 'outline founder';
+    const pgRelaxed = await pgEngine.searchTitles(q, { limit: 5 });
+    const pgliteRelaxed = await pgliteEngine.searchTitles(q, { limit: 5 });
+    expect(pgRelaxed.length).toBeGreaterThan(0);
+    expect(pgliteRelaxed.length).toBeGreaterThan(0);
+    for (const r of pgRelaxed as SearchResult[]) expect(r.keyword_relaxed).toBe(true);
+    for (const r of pgliteRelaxed as SearchResult[]) expect(r.keyword_relaxed).toBe(true);
+    expect(new Set(pgRelaxed.map((r: SearchResult) => r.slug))).toEqual(
+      new Set(pgliteRelaxed.map((r: SearchResult) => r.slug)),
+    );
+  });
+
   test('searchVector: top result matches between engines', async () => {
     const queryVec = basisEmbedding(7); // article direction
     const pgResults = await pgEngine.searchVector(queryVec, { limit: 5 });
     const pgliteResults = await pgliteEngine.searchVector(queryVec, { limit: 5 });
 
     expect(pgResults[0]?.slug).toBe(pgliteResults[0]?.slug);
+  });
+
+  test('entity card exact fact count + wire-date normalization match across engines', async () => {
+    // Pre-fix, active_fact_count was the length of a 100-row capped fetch
+    // (silently 100 for bigger entities) and PGLite leaked Date objects into
+    // the string|null timeline-date contract.
+    const slug = 'people/entity-card-parity';
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.putPage(slug, {
+        type: 'person',
+        title: 'Entity Card Parity Person',
+        compiled_truth: '# Entity Card Parity Person\n\nSynthetic parity fixture.',
+      }, { sourceId: 'default' });
+      await eng.executeRaw(
+        `INSERT INTO facts
+           (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence, created_at)
+         SELECT 'default', 'people/entity-card-parity', 'ordinary fact ' || gs::text,
+                'fact', 'world', 'medium', NOW(), 'parity-seed', 1.0, NOW()
+           FROM generate_series(1, 105) gs`,
+      );
+      await eng.insertFact(
+        {
+          fact: 'PRIVATE-PARITY-SENTINEL fact',
+          kind: 'fact',
+          entity_slug: slug,
+          visibility: 'private',
+          source: 'parity-seed',
+        },
+        { source_id: 'default' },
+      );
+      await eng.addTimelineEntry(
+        slug,
+        { date: new Date().toISOString().slice(0, 10), source: 'parity-seed', summary: 'Recent parity event' },
+        { sourceId: 'default' },
+      );
+    }
+
+    const pg = await buildEntityCard(pgEngine, 'default', slug, { remote: true });
+    const lite = await buildEntityCard(pgliteEngine, 'default', slug, { remote: true });
+    for (const result of [pg, lite]) {
+      expect(result.card?.active_fact_count).toBe(105); // exact, world-only for remote
+      expect(typeof result.card?.last_touched.last_timeline_date).toBe('string');
+      for (const thread of result.card?.open_threads ?? []) {
+        expect(thread.date === null || typeof thread.date === 'string').toBe(true);
+      }
+    }
+    expect(pg.card?.active_fact_count).toBe(lite.card?.active_fact_count);
+    expect(pg.card?.last_touched.last_timeline_date).toBe(lite.card?.last_touched.last_timeline_date!);
+
+    // Local callers see private rows in the count too — on both engines.
+    const pgLocal = await buildEntityCard(pgEngine, 'default', slug, { remote: false });
+    const liteLocal = await buildEntityCard(pgliteEngine, 'default', slug, { remote: false });
+    expect(pgLocal.card?.active_fact_count).toBe(106);
+    expect(liteLocal.card?.active_fact_count).toBe(106);
   });
 
   test('#4304 listAllPageRefs parity: updated_at is a real Date, same (source_id, slug) ordering', async () => {
@@ -1097,6 +1200,74 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     expect(slugs.indexOf('ep/ec-bob')).toBeLessThan(slugs.indexOf('companies/ec-widget'));
     expect(pg.find((r) => r.slug === 'ep/ec-alice')!.inbound_count).toBe(2);
   });
+
+  // #4280 — orphan / health denominators measured over SERVED memory.
+  // findOrphanPages carries {type, quarantined} so the shared policy can drop
+  // quarantined shells + machine leaf types; getHealth's entity denominator
+  // excludes quarantined entity shells in SQL. The Postgres half rides a
+  // `sql.unsafe(QUARANTINE_FILTER_FRAGMENT)` fragment that PGLite cannot
+  // exercise — pinned here against real Postgres. getStats stays RAW on both
+  // engines (pages_by_type counts the quarantined shell like any other page).
+  test('#4280 findOrphanPages {slug,type,quarantined} projection + getHealth/getStats entity denominators: Postgres ↔ PGLite parity', async () => {
+    const SRC = 'served-memory-parity';
+    const quarantine = { reason: 'junk_pattern', detail: 'parity fixture', assessed_at: new Date().toISOString() };
+    for (const eng of [pgEngine, pgliteEngine]) {
+      await eng.executeRaw(`INSERT INTO sources (id, name, config) VALUES ($1, 'Served Memory Parity', '{}'::jsonb) ON CONFLICT DO NOTHING`, [SRC]);
+      // Three live, islanded entity pages.
+      for (const n of ['a', 'b', 'c']) {
+        await eng.putPage(`people/sm-${n}`, { type: 'person', title: `SM ${n}`, compiled_truth: 'entity body' }, { sourceId: SRC });
+      }
+      // A quarantined entity shell — islanded, but NOT served memory.
+      await eng.putPage('people/sm-quarantined', {
+        type: 'person', title: 'SM quarantined', compiled_truth: 'junk',
+        frontmatter: { quarantine },
+      }, { sourceId: SRC });
+      // A machine leaf type — islanded by design.
+      await eng.putPage('people/sm-atom', { type: 'atom', title: 'SM atom', compiled_truth: 'atom body' }, { sourceId: SRC });
+    }
+
+    // Raw findOrphanPages rows (policy-free SQL): every islanded page is
+    // returned, with the metadata the policy needs to exclude two of them.
+    const project = async (eng: BrainEngine) =>
+      (await eng.findOrphanPages({ sourceId: SRC }))
+        .map(r => ({ slug: r.slug, type: r.type ?? null, quarantined: r.quarantined === true }))
+        .sort((x, y) => x.slug.localeCompare(y.slug));
+    const pgRows = await project(pgEngine);
+    const pgliteRows = await project(pgliteEngine);
+    expect(pgRows).toEqual([
+      { slug: 'people/sm-a', type: 'person', quarantined: false },
+      { slug: 'people/sm-atom', type: 'atom', quarantined: false },
+      { slug: 'people/sm-b', type: 'person', quarantined: false },
+      { slug: 'people/sm-c', type: 'person', quarantined: false },
+      { slug: 'people/sm-quarantined', type: 'person', quarantined: true },
+    ]);
+    expect(pgliteRows).toEqual(pgRows);
+
+    // getHealth: the entity denominator and the linkable scope both exclude
+    // the quarantined shell (SQL) and the atom (shared policy via p.type).
+    const health = async (eng: BrainEngine) => {
+      const h = await eng.getHealth({ sourceId: SRC });
+      return {
+        entity_page_count: h.entity_page_count,
+        linkable_page_count: h.linkable_page_count,
+        orphan_pages: h.orphan_pages,
+        page_count: h.page_count,
+      };
+    };
+    const pgHealth = await health(pgEngine);
+    const pgliteHealth = await health(pgliteEngine);
+    expect(pgHealth).toEqual({ entity_page_count: 3, linkable_page_count: 3, orphan_pages: 3, page_count: 5 });
+    expect(pgliteHealth).toEqual(pgHealth);
+
+    // getStats stays a RAW corpus count on both engines — the quarantined
+    // shell is still a `person` row here, and the atom is counted.
+    const pgStats = await pgEngine.getStats({ sourceId: SRC });
+    const pgliteStats = await pgliteEngine.getStats({ sourceId: SRC });
+    expect(pgStats.pages_by_type).toEqual({ person: 4, atom: 1 });
+    expect(pgliteStats.pages_by_type).toEqual(pgStats.pages_by_type);
+    expect(pgStats.page_count).toBe(5);
+    expect(pgliteStats.page_count).toBe(pgStats.page_count);
+  });
 });
 
 // ── relationalFanout parity (v0.43) ─────────────────────────────────────
@@ -1867,6 +2038,129 @@ describeBoth('Engine parity — traverseGraph / traversePaths (D7)', () => {
   });
 });
 
+// ── traversePaths row cap parity ─────────────────────────────────────────
+// Both engines bound the final SELECT at TRAVERSE_PATH_ROW_CAP (+1 probe
+// row) and report the overflow through traversePathsDetailed().truncated.
+// The LIMIT sits under the shared ORDER BY depth, from_slug, to_slug, so on
+// an identical corpus the two engines must keep the SAME shallow edge set —
+// a drift in the cap placement (postgres.js sql`` vs positional $N) or in
+// the probe-row arithmetic would only show against real Postgres.
+describeBoth('Engine parity — traversePaths row cap', () => {
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    await seedDenseHub(pgEngine);
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+    await seedDenseHub(pgliteEngine);
+  }, 180_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  const edgeShape = (paths: Awaited<ReturnType<BrainEngine['traversePaths']>>) =>
+    paths.map(p => `${p.from_slug}>${p.to_slug}:${p.link_type}@${p.depth}`);
+
+  test('depth-3 both-direction walk from the hub: truncated on both, identical bounded edge set', async () => {
+    const pg = await pgEngine.traversePathsDetailed(DENSE_HUB_SLUG, { depth: 3, direction: 'both' });
+    const pglite = await pgliteEngine.traversePathsDetailed(DENSE_HUB_SLUG, { depth: 3, direction: 'both' });
+    expect(pg.truncated).toBe(true);
+    expect(pglite.truncated).toBe(true);
+    expect(pg.paths.length).toBeLessThanOrEqual(TRAVERSE_PATH_ROW_CAP);
+    expect(pglite.paths.length).toBeLessThanOrEqual(TRAVERSE_PATH_ROW_CAP);
+    // Shallowest-first survives the cut identically: every hub edge at depth 1.
+    expect(pg.paths.filter(p => p.depth === 1).length).toBe(DENSE_HUB_SPOKES);
+    expect(edgeShape(pg.paths)).toEqual(edgeShape(pglite.paths));
+    // The GraphPath[] projection is the same bounded list on both engines.
+    expect(edgeShape(await pgEngine.traversePaths(DENSE_HUB_SLUG, { depth: 3, direction: 'both' }))).toEqual(edgeShape(pg.paths));
+    expect(edgeShape(await pgliteEngine.traversePaths(DENSE_HUB_SLUG, { depth: 3, direction: 'both' }))).toEqual(edgeShape(pglite.paths));
+  }, 120_000);
+
+  test('under the cap: truncated=false on both, full edge set identical', async () => {
+    const pg = await pgEngine.traversePathsDetailed(DENSE_HUB_SLUG, { depth: 1, direction: 'both' });
+    const pglite = await pgliteEngine.traversePathsDetailed(DENSE_HUB_SLUG, { depth: 1, direction: 'both' });
+    expect(pg.truncated).toBe(false);
+    expect(pglite.truncated).toBe(false);
+    expect(pg.paths.length).toBe(DENSE_HUB_SPOKES);
+    expect(edgeShape(pg.paths)).toEqual(edgeShape(pglite.paths));
+  });
+});
+
+// ── resolveSlugWithAliasDetailed parity ─────────────────────────────────
+// Postgres orders by array_position() in SQL; PGLite re-sorts in JS. The
+// owning source_id is what get_page now pins its canonical read to, so both
+// engines must agree on WHICH alias row wins under a federated scope, not
+// just on the canonical slug string.
+async function seedAliasOwners(eng: BrainEngine) {
+  for (const id of ['par-a', 'par-b']) {
+    await eng.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+      [id],
+    );
+  }
+  // slug_aliases is not in the e2e TRUNCATE list — clear this fixture's rows.
+  await eng.executeRaw(`DELETE FROM slug_aliases WHERE alias_slug LIKE 'par/%'`);
+  await eng.executeRaw(
+    `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug, notes)
+     VALUES ('par-b', 'par/old-b', 'par/canonical-b', 'owned by b'),
+            ('par-a', 'par/shared', 'par/canonical-a', 'shared a'),
+            ('par-b', 'par/shared', 'par/canonical-b', 'shared b')`,
+  );
+}
+
+describeBoth('Engine parity — resolveSlugWithAliasDetailed', () => {
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    await seedAliasOwners(pgEngine);
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+    await seedAliasOwners(pgliteEngine);
+  }, 90_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  test('owning source_id + canonical agree on both engines (scalar, federated, out-of-scope, no match)', async () => {
+    for (const scope of ['par-b', ['par-a', 'par-b'], ['par-a'], ['default']] as const) {
+      const pg = await pgEngine.resolveSlugWithAliasDetailed('par/old-b', scope);
+      const pglite = await pgliteEngine.resolveSlugWithAliasDetailed('par/old-b', scope);
+      expect(pg).toEqual(pglite);
+    }
+    expect(await pgEngine.resolveSlugWithAliasDetailed('par/old-b', ['par-a', 'par-b']))
+      .toEqual({ canonical_slug: 'par/canonical-b', source_id: 'par-b' });
+    expect(await pgEngine.resolveSlugWithAliasDetailed('par/old-b', ['par-a'])).toBeNull();
+    expect(await pgEngine.resolveSlugWithAliasDetailed('par/none', ['par-a', 'par-b'])).toBeNull();
+  });
+
+  test('multi-source winner follows the scope order identically; the wrapper is the canonical projection', async () => {
+    const origWarn = console.warn;
+    console.warn = () => {};
+    try {
+      for (const scope of [['par-a', 'par-b'], ['par-b', 'par-a']]) {
+        const pg = await pgEngine.resolveSlugWithAliasDetailed('par/shared', scope);
+        const pglite = await pgliteEngine.resolveSlugWithAliasDetailed('par/shared', scope);
+        expect(pg).toEqual(pglite);
+        expect(pg!.source_id).toBe(scope[0]);
+        expect(await pgEngine.resolveSlugWithAlias('par/shared', scope)).toBe(pg!.canonical_slug);
+        expect(await pgliteEngine.resolveSlugWithAlias('par/shared', scope)).toBe(pglite!.canonical_slug);
+      }
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+});
+
 // ── D7: restorePage arc parity ───────────────────────────────────────────
 // softDelete → hidden → includeDeleted peek → restore → visible → second
 // restore false. Both engines gate restore on `deleted_at IS NOT NULL` and
@@ -2038,5 +2332,124 @@ describeBoth('Engine parity — open_loops loops-store round-trip', () => {
     expect(pg.closedBy).toBe('parity-test');
     expect(pg.openAfterCount).toBe(0);
     expect(pg.doneAfterCount).toBe(1);
+  });
+});
+
+describeBoth('Engine parity — facts TTL read-time validity (WP5)', () => {
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+  }, 90_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  const HOUR = 60 * 60 * 1000;
+  const SRC = 'ttlparity';
+  const ENTITY = 'people/ttl-parity-example';
+  const EMB_ENTITY = 'people/ttl-parity-embed';
+  const SESSION = 'ttl-parity-session';
+
+  const texts = (rows: Array<{ fact: string }>) => rows.map(r => r.fact).sort();
+
+  // Runs the WP5 scenario on one engine and returns a normalized summary —
+  // the parity assert compares the two summaries wholesale, then pins
+  // absolute expectations so both engines can't be identically wrong.
+  async function roundTrip(eng: BrainEngine) {
+    const past = new Date(Date.now() - HOUR);
+    const future = new Date(Date.now() + 24 * HOUR);
+    await eng.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+      [SRC],
+    );
+    await eng.insertFact(
+      { fact: 'ttl lapsed fact', kind: 'fact', entity_slug: ENTITY, source: 'test', source_session: SESSION, valid_until: past },
+      { source_id: SRC },
+    );
+    await eng.insertFact(
+      { fact: 'ttl future fact', kind: 'fact', entity_slug: ENTITY, source: 'test', source_session: SESSION, valid_until: future },
+      { source_id: SRC },
+    );
+    await eng.insertFact(
+      { fact: 'ttl durable fact', kind: 'fact', entity_slug: ENTITY, source: 'test', source_session: SESSION },
+      { source_id: SRC },
+    );
+    // Embedding-branch pair (separate entity keeps the recency-branch counts clean).
+    const emb = basisEmbedding(101);
+    await eng.insertFact(
+      { fact: 'ttl embed lapsed', kind: 'fact', entity_slug: EMB_ENTITY, source: 'test', valid_until: past, embedding: emb },
+      { source_id: SRC },
+    );
+    await eng.insertFact(
+      { fact: 'ttl embed live', kind: 'fact', entity_slug: EMB_ENTITY, source: 'test', embedding: emb },
+      { source_id: SRC },
+    );
+    // Ontology-writer-style supersession: valid_until close + superseded_by,
+    // expired_at stays NULL (--asof time-travel intact).
+    const oldRow = await eng.insertFact(
+      { fact: 'ttl superseded old', kind: 'fact', entity_slug: ENTITY, source: 'test' },
+      { source_id: SRC },
+    );
+    const newRow = await eng.insertFact(
+      { fact: 'ttl superseded new', kind: 'fact', entity_slug: ENTITY, source: 'test' },
+      { source_id: SRC },
+    );
+    await eng.executeRaw(
+      `UPDATE facts SET valid_until = now() - interval '1 hour', superseded_by = $1 WHERE id = $2`,
+      [newRow.id, oldRow.id],
+    );
+
+    const since = new Date(Date.now() - 24 * HOUR);
+    const health = await eng.getFactsHealth(SRC);
+    return {
+      byEntity: texts(await eng.listFactsByEntity(SRC, ENTITY)),
+      bySince: texts(await eng.listFactsSince(SRC, since, { entitySlug: ENTITY })),
+      bySession: texts(await eng.listFactsBySession(SRC, SESSION)),
+      dupRecency: texts(await eng.findCandidateDuplicates(SRC, ENTITY, 'ttl lapsed fact')),
+      dupEmbedding: texts(await eng.findCandidateDuplicates(SRC, EMB_ENTITY, 'ttl embed lapsed', { embedding: emb })),
+      history: texts(await eng.listFactsByEntity(SRC, ENTITY, { activeOnly: false })),
+      supersessions: texts(await eng.listSupersessions(SRC)),
+      health: {
+        total_active: health.total_active,
+        total_expired: health.total_expired,
+        top: health.top_entities.map(t => `${t.entity_slug}:${t.count}`).sort(),
+      },
+      backlog: await eng.countUnconsolidatedFacts(SRC),
+    };
+  }
+
+  test('active reads filter lapsed valid_until identically; history + health agree', async () => {
+    const pg = await roundTrip(pgEngine);
+    const pglite = await roundTrip(pgliteEngine);
+    expect(pg).toEqual(pglite);
+
+    // Absolute expectations (not just cross-engine equality):
+    const activeEntity = ['ttl durable fact', 'ttl future fact', 'ttl superseded new'];
+    expect(pg.byEntity).toEqual(activeEntity);
+    expect(pg.bySince).toEqual(activeEntity);
+    expect(pg.bySession).toEqual(['ttl durable fact', 'ttl future fact']);
+    expect(pg.dupRecency).toEqual(activeEntity);
+    // Lapsed row is not a dedup candidate → a re-stated fact re-inserts fresh.
+    expect(pg.dupEmbedding).toEqual(['ttl embed live']);
+    // History (activeOnly:false) still shows every row.
+    expect(pg.history).toEqual([
+      'ttl durable fact', 'ttl future fact', 'ttl lapsed fact',
+      'ttl superseded new', 'ttl superseded old',
+    ]);
+    // The valid_until-closed superseded row stays visible to listSupersessions.
+    expect(pg.supersessions).toContain('ttl superseded old');
+    // Health: 4 validity-live actives; lapsed + closed rows count expired-style.
+    expect(pg.health.total_active).toBe(4);
+    expect(pg.health.total_expired).toBe(3);
+    expect(pg.health.top).toEqual([`${ENTITY}:3`, `${EMB_ENTITY}:1`].sort());
+    // Backlog counter matches what the consolidator's active read can see.
+    expect(pg.backlog).toBe(4);
   });
 });

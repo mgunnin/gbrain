@@ -57,7 +57,7 @@ export const FACTS_FENCE_END   = '<!--- gbrain:facts:end -->';
 // the fence parser has zero engine dependencies — it must run in pure-
 // markdown contexts (the chunker strip, the CI invariant check) where
 // importing engine.ts pulls a large DB-shaped transitive graph.
-export type FactKind = 'event' | 'preference' | 'commitment' | 'belief' | 'fact';
+export type FactKind = 'event' | 'preference' | 'commitment' | 'belief' | 'fact' | 'idea';
 
 // Mirror src/core/engine.ts FactVisibility ('private' | 'world'). Binary
 // gate per the existing takes D21 contract — drives the chunker strip
@@ -67,7 +67,7 @@ export type FactVisibility = 'private' | 'world';
 export type FactNotability = 'high' | 'medium' | 'low';
 
 const KIND_VALUES: ReadonlySet<string> = new Set([
-  'event', 'preference', 'commitment', 'belief', 'fact',
+  'event', 'preference', 'commitment', 'belief', 'fact', 'idea',
 ]);
 const VISIBILITY_VALUES: ReadonlySet<string> = new Set(['private', 'world']);
 const NOTABILITY_VALUES: ReadonlySet<string> = new Set(['high', 'medium', 'low']);
@@ -244,7 +244,7 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
 
     const kind = kindRaw.trim().toLowerCase();
     if (!KIND_VALUES.has(kind)) {
-      warnings.push(`FACTS_TABLE_MALFORMED: unknown kind "${kindRaw}" (expected event|preference|commitment|belief|fact)`);
+      warnings.push(`FACTS_TABLE_MALFORMED: unknown kind "${kindRaw}" (expected event|preference|commitment|belief|fact|idea)`);
       continue;
     }
 
@@ -340,7 +340,12 @@ export function renderFactsTable(facts: ParsedFact[]): string {
     const valueCell = f.claimValue === undefined ? '' : String(f.claimValue);
     return `${base} ${escapeFenceCell(f.claimMetric ?? '')} | ${escapeFenceCell(valueCell)} | ${escapeFenceCell(f.claimUnit ?? '')} | ${escapeFenceCell(f.claimPeriod ?? '')} |`;
   });
-  const inner = ['', header, separator, ...rows, ''].join('\n');
+  // #4615: the leading double-'' emits a BLANK LINE between the begin marker
+  // and the header. The marker is an HTML block; with only one newline after
+  // it, GFM parsers (Obsidian 1.3.2+, GitHub, VS Code) treat the pipe rows as
+  // a paragraph continuation and show raw pipes instead of a table. The
+  // parser skips blank lines, so this is round-trip safe.
+  const inner = ['', '', header, separator, ...rows, ''].join('\n');
   return `${FACTS_FENCE_BEGIN}${inner}${FACTS_FENCE_END}`;
 }
 
@@ -508,10 +513,52 @@ export function upsertFactRow(
   if (beginIdx !== -1 && endIdx !== -1) {
     out = body.slice(0, beginIdx) + newFence + body.slice(endIdx + FACTS_FENCE_END.length);
   } else {
-    const sep = body.endsWith('\n') ? '\n' : '\n\n';
-    out = `${body}${sep}## Facts\n\n${newFence}\n`;
+    // #4756: the FIRST fence must land in compiled_truth — ABOVE the timeline
+    // sentinel. splitBody() files everything below the sentinel into
+    // page.timeline, where extract_facts refuses to reconcile it
+    // (FACTS_FENCE_BELOW_SENTINEL) — a blind EOF append on any page that
+    // already had a timeline froze the fence permanently.
+    const section = `## Facts\n\n${newFence}\n`;
+    const sentinelAt = timelineSentinelOffset(body);
+    if (sentinelAt !== -1) {
+      const head = body.slice(0, sentinelAt);
+      const sep = head === '' ? '' : head.endsWith('\n\n') ? '' : head.endsWith('\n') ? '\n' : '\n\n';
+      out = `${head}${sep}${section}\n${body.slice(sentinelAt)}`;
+    } else {
+      const sep = body.endsWith('\n') ? '\n' : '\n\n';
+      out = `${body}${sep}${section}`;
+    }
   }
   return { body: out, rowNum: nextRowNum };
+}
+
+/**
+ * Char offset of the line start of the first timeline sentinel in `body`,
+ * or -1 when none is present. Mirrors the UNAMBIGUOUS sentinel forms of
+ * `markdown.ts:findTimelineSplitIndex` (`<!-- timeline -->` /
+ * `<!--timeline-->` — what serializeMarkdown emits — plus the decorated
+ * `--- timeline ---`). The legacy bare `---` + `## Timeline` fallback is
+ * deliberately NOT matched: upsertFactRow receives raw on-disk text that may
+ * still carry YAML frontmatter, whose `---` delimiters would false-positive
+ * that rule (findTimelineSplitIndex documents the same caveat — it expects
+ * body lines). Local rather than imported because this module must stay free
+ * of markdown.ts's transitive dependency graph (see the FactKind comment at
+ * the top of the file).
+ */
+function timelineSentinelOffset(body: string): number {
+  let offset = 0;
+  for (const line of body.split('\n')) {
+    const trimmed = line.trim();
+    if (
+      trimmed === '<!-- timeline -->' ||
+      trimmed === '<!--timeline-->' ||
+      /^---\s+timeline\s+---$/i.test(trimmed)
+    ) {
+      return offset;
+    }
+    offset += line.length + 1;
+  }
+  return -1;
 }
 
 export interface StripFactsFenceOpts {

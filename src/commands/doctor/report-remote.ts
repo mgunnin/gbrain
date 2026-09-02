@@ -50,6 +50,8 @@ import {
   checkLinkResolutionOpportunity,
   checkFederationHealth,
   checkSelfUpgradeHealth,
+  multiSourceDriftGitRootSkipNote,
+  computeExtractAtomsBacklogCheck,
 } from '../doctor.ts';
 import {
   checkSchemaPackActive,
@@ -288,19 +290,35 @@ export async function doctorReportRemote(
         });
       } else if (result.count > 0) {
         const sampleStr = result.sample.map(s => `${s.slug} (intended=${s.intended_source})`).join(', ');
+        const skipNote = result.git_root_skipped.length > 0
+          ? multiSourceDriftGitRootSkipNote(result.git_root_skipped)
+          : '';
         checks.push({
           name: 'multi_source_drift',
           status: 'warn',
           message:
             `${result.count} page slug(s) appear at 'default' but NOT at the intended source ` +
             `(e.g., ${sampleStr}). Likely pre-v0.30.3 misroutes OR an incomplete initial sync. ` +
-            `Verify on the brain host: \`gbrain sources status\` then \`gbrain sync --source <id> --full\`.`,
+            `Verify on the brain host: \`gbrain sources status\` then \`gbrain sync --source <id> --full\`.` +
+            skipNote,
         });
       } else {
+        // #4712: see the local doctor's twin check — 'ok' would misreport
+        // "verified clean" if every candidate source was skipped and no
+        // walk actually ran.
+        const allSkipped =
+          result.git_root_skipped.length > 0 &&
+          result.git_root_skipped.length >= nonDefaultWithPath.length;
         checks.push({
           name: 'multi_source_drift',
-          status: 'ok',
-          message: 'No cross-source slug drift detected.',
+          status: allSkipped ? 'warn' : 'ok',
+          message: allSkipped
+            ? `Multi-source drift check performed no verification` +
+              multiSourceDriftGitRootSkipNote(result.git_root_skipped)
+            : result.git_root_skipped.length > 0
+              ? `No cross-source slug drift detected among checked sources.` +
+                multiSourceDriftGitRootSkipNote(result.git_root_skipped)
+              : 'No cross-source slug drift detected.',
         });
       }
     }
@@ -365,6 +383,12 @@ export async function doctorReportRemote(
   // Postgres brains are exactly who can't otherwise see the extraction backlog.
   // Brain-wide here (remote --source scoping is a separate TODO, like orphan_ratio).
   checks.push(await checkLinksExtractionLag(engine));
+
+  // #4576 (related gap): extract_atoms_backlog was absent from the
+  // thin-client surface, so an MCP-only caller couldn't see the backlog at
+  // all. SQL counts + pack/config reads on the server side — the env that
+  // actually runs (or fails to run) the cycle.
+  checks.push(await computeExtractAtomsBacklogCheck(engine));
 
   // v0.39 T7 + T9 — schema-pack health checks (3 checks per v0.38 plan):
   //   schema_pack_active        — active pack resolves cleanly

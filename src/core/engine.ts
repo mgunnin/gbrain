@@ -487,11 +487,11 @@ export interface DreamVerdictInput {
 // v0.31 Hot Memory: facts table + recall surface
 // ============================================================
 
-/** Allowed `facts.kind` values. Different decay halflives apply per kind. */
-export type FactKind = 'event' | 'preference' | 'commitment' | 'belief' | 'fact';
+/** Allowed `facts.kind` values (per-kind decay halflives). 'idea' is extractor/DB-only — absent from the frozen MEMORY_VERBS enum in verbs.ts. */
+export type FactKind = 'event' | 'preference' | 'commitment' | 'belief' | 'fact' | 'idea';
 
 export const ALL_FACT_KINDS: readonly FactKind[] = [
-  'event', 'preference', 'commitment', 'belief', 'fact',
+  'event', 'preference', 'commitment', 'belief', 'fact', 'idea',
 ] as const;
 
 /** Visibility tier on a fact row. Mirrors takes' world-default ACL contract (D21). */
@@ -631,10 +631,10 @@ export interface FactListOpts {
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */
 export interface FactsHealth {
   source_id: string;
-  total_active: number;          // facts where expired_at IS NULL
+  total_active: number;          // expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())
   total_today: number;           // created in last 24h
   total_week: number;            // created in last 7d
-  total_expired: number;         // expired_at IS NOT NULL
+  total_expired: number;         // expired_at IS NOT NULL OR valid_until <= now() (the complement of active)
   total_consolidated: number;    // consolidated_at IS NOT NULL
   top_entities: Array<{ entity_slug: string; count: number }>;
   /** Optional counters fed by the queue / classifier — populated when those modules report. */
@@ -1500,6 +1500,20 @@ export interface BrainEngine {
     opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
   ): Promise<GraphPath[]>;
   /**
+   * `traversePaths` plus its truncation signal. The final SELECT is bounded
+   * by `TRAVERSE_PATH_ROW_CAP` (engine-constants.ts) on both engines, and
+   * `truncated` is true when the walk hit it — rows past the cap (the
+   * DEEPEST edges under the ORDER BY depth contract) were dropped. The cap
+   * counts raw rows before the in-memory edge dedup, so `paths.length`
+   * alone cannot reveal truncation. `traversePaths` is the `.paths`
+   * projection; the op layer surfaces `truncated` as a stderr note so the
+   * GraphPath[] wire shape stays unchanged.
+   */
+  traversePathsDetailed(
+    slug: string,
+    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
+  ): Promise<{ paths: GraphPath[]; truncated: boolean }>;
+  /**
    * Typed-edge relational fan-out for the relational recall arm (v0.43).
    *
    * Generalizes traversePaths to a SEED ARRAY and aggregates to ranked NODES
@@ -1633,11 +1647,23 @@ export interface BrainEngine {
    * no-inbound-only view (a page that links out but is never linked TO still
    * counts as an orphan there).
    */
+  /**
+   * #4280: rows carry `type` + `quarantined` so the shared orphan-reporting
+   * policy can exclude machine leaf types and quarantined shells that slug
+   * conventions cannot infer. The SQL stays raw (no filtering here) — policy
+   * lives in ONE place (`shouldExcludeFromOrphanReporting`).
+   */
   findOrphanPages(opts?: {
     sourceId?: string;
     sourceIds?: string[];
     mode?: 'inbound' | 'islanded';
-  }): Promise<Array<{ slug: string; title: string; domain: string | null }>>;
+  }): Promise<Array<{
+    slug: string;
+    title: string;
+    domain: string | null;
+    type?: string | null;
+    quarantined?: boolean;
+  }>>;
 
   // Tags
   /**
@@ -2153,7 +2179,9 @@ export interface BrainEngine {
   /**
    * v0.32: count facts that haven't been promoted to takes by the consolidate
    * phase yet (active + unconsolidated). Drives `gbrain recall --pending`.
-   * Single SQL: COUNT(*) WHERE consolidated_at IS NULL AND expired_at IS NULL.
+   * Single SQL: COUNT(*) WHERE consolidated_at IS NULL AND expired_at IS NULL
+   * AND (valid_until IS NULL OR valid_until > now()) — read-time TTL validity
+   * keeps this backlog in lockstep with what the consolidator can read.
    */
   countUnconsolidatedFacts(source_id: string): Promise<number>;
 
@@ -2185,9 +2213,12 @@ export interface BrainEngine {
    * - Visibility-filtered: when `opts.remote=true`, only `visibility='world'`
    *   facts are returned. Trusted local callers see both private + world.
    * - Optional metric filter restricts to a single normalized metric label.
-   * - Active-only by default (expired_at IS NULL); soft-deleted entities
-   *   on the pages side are NOT filtered here — trajectory is a facts-table
-   *   query and doesn't JOIN pages.
+   * - Active-only by default (expired_at IS NULL). DELIBERATELY no
+   *   valid_until clause: trajectory is a HISTORY view, and the consolidator
+   *   stamps valid_until on every non-newest point in a cluster — filtering
+   *   would collapse each trajectory to its final point. Soft-deleted
+   *   entities on the pages side are NOT filtered here — trajectory is a
+   *   facts-table query and doesn't JOIN pages.
    */
   findTrajectory(opts: TrajectoryOpts): Promise<TrajectoryPoint[]>;
 
@@ -2274,6 +2305,18 @@ export interface BrainEngine {
     slug: string,
     sourceOrSources: string | readonly string[],
   ): Promise<string>;
+  /**
+   * `resolveSlugWithAlias` plus the OWNING source of the winning alias row
+   * (same scope + precedence rules), or null when no alias matches (or the
+   * table predates v104). A consumer that goes on to READ the canonical page
+   * must scope that read to `source_id`: a federated getPage prefers the
+   * anchor source, so an unrelated live page at the canonical slug in another
+   * granted source would otherwise shadow the alias owner's page.
+   */
+  resolveSlugWithAliasDetailed(
+    slug: string,
+    sourceOrSources: string | readonly string[],
+  ): Promise<{ canonical_slug: string; source_id: string } | null>;
 
   /**
    * T3 retrieval-cathedral — free-text alias resolution for SEARCH.

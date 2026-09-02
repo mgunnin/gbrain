@@ -14,7 +14,8 @@ import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
 import { gcSessionContextState } from '../core/context/session-state.ts';
 import { bindResolveIpcForServe } from './resolve-ipc-binding.ts';
-import { GBRAIN_MCP_INSTRUCTIONS } from './instructions.ts';
+import { resolveMcpInstructions } from './instructions.ts';
+import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { isEngineDegraded, onEngineRecovered } from '../core/degraded-marker.ts';
 
 export async function resolveMcpStdioSourceScope(
@@ -64,6 +65,48 @@ export async function resolveMcpStdioSourceScope(
       ? { sourceId: env, tier: 'env' }
       : { sourceId: 'default', tier: 'seed_default' };
   }
+}
+
+/**
+ * #4583 rework + review fixes: once-per-process unscoped-default-write
+ * advisory for the stdio lane. The latch arms on the first SUCCESSFUL
+ * assessment whatever its verdict (warned, or no-guard) — pre-fix it armed
+ * only when a warning printed, so on a no-guard brain the assessment's
+ * unindexed full-`pages` aggregate ran on EVERY mutating stdio call. The
+ * inputs are process-stable (env escape hatch, the brain's page
+ * distribution), so one assessment decides for the process. A FAILED
+ * assessment does NOT latch: the write proceeds (fail-open) but the next
+ * mutating seed_default call retries, so a transient DB error cannot disable
+ * the advisory for the life of the serve process. Concurrent calls share one
+ * in-flight assessment. Cheap early-returns (non-mutating call, non-seed
+ * tier) do NOT latch either — a later mutating seed_default call still gets
+ * its assessment. Exported for tests; `write` is injectable (production
+ * writes stderr).
+ */
+export function createDefaultWriteAdvisory(
+  engine: BrainEngine,
+  opts: { enabled: boolean; write?: (line: string) => void },
+): (tier: import('../core/source-resolver.ts').SourceTier, mutating: boolean) => Promise<void> {
+  let latched = false;
+  let inflight: Promise<void> | null = null;
+  const write = opts.write ?? ((line: string) => process.stderr.write(line + '\n'));
+  return async (tier, mutating) => {
+    if (latched || !opts.enabled) return;
+    if (!mutating || tier !== 'seed_default') return;
+    inflight ??= (async () => {
+      try {
+        const { assessUnscopedDefaultWrite } = await import('../core/source-resolver.ts');
+        const { warning, assessed } = await assessUnscopedDefaultWrite(engine, tier, mutating);
+        // Latch before writing so a throwing stderr writer still counts as
+        // assessed; never latch on a failed (fail-open) assessment.
+        if (assessed) latched = true;
+        if (warning) write(warning);
+      } catch { /* advisory; never block a write */ } finally {
+        inflight = null;
+      }
+    })();
+    await inflight;
+  };
 }
 
 /**
@@ -129,18 +172,7 @@ export async function trackStdioRpc<T>(work: () => Promise<T>): Promise<T> {
 }
 
 export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface; sourceGuard?: boolean } = {}) {
-  const server = new Server(
-    { name: 'gbrain', version: VERSION },
-    // listChanged: a client that handshakes during DEGRADED mode receives the
-    // gate-hidden catalog (stdioVisibleTools fail-closes every publishGateKey
-    // op on engine failure) and caches it — recovery sends the notification
-    // so the full catalog comes back without a harness restart.
-    {
-      capabilities: { tools: { listChanged: true } },
-      instructions: GBRAIN_MCP_INSTRUCTIONS,
-    },
-  );
-
+  const config = loadConfig();
   // MEMORY_VERBS v1 surface mode: 'full' (default — every op, byte-identical
   // to pre-surface behavior), 'starter' (WP4 daily-driver set), or 'verbs'
   // (exactly the 7 protocol verbs). Enforced BOTH on the advertised list and
@@ -150,15 +182,46 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // the transport-LOCALITY axis). Publish gates are the separate owner-
   // CONSENT axis keyed on ctx.remote === false only, and stdio dispatches
   // remote:true — so gate-off ops are subtracted per tools/list below.
+  // (Resolved before Server construction: the initialize instructions need
+  // the allowed-op set to decide whether extract_facts may be advertised.)
   const surface: McpSurface = clampSurface(opts.surface ?? 'full');
   const surfacedOps = filterOpsForSurface(operations, surface);
   const allowedOps = surface === 'full' ? undefined : allowedOpNames(operations, surface);
+
+  // Ambient writeback (opt-in, default off): resolved ONCE at boot — a
+  // config flip needs a serve restart on this lane, the same posture as
+  // `mcp.strict_params` below. Uses the fail-closed dual-plane resolver
+  // rather than a file-only read (deliberate deviation from the file-plane
+  // boot rule): the visibility POSTURE lives in the DB plane, and a partial
+  // file-only resolve could embed a `world` posture against an explicitly
+  // private brain. Read failure here yields the OFF bundle — no section,
+  // never a wrong posture — and the engine is already connected by the time
+  // serve reaches this call.
+  const writeback = await resolveWritebackConfig(engine, config);
+  const server = new Server(
+    { name: 'gbrain', version: VERSION },
+    // listChanged: a client that handshakes during DEGRADED mode receives the
+    // gate-hidden catalog (stdioVisibleTools fail-closes every publishGateKey
+    // op on engine failure) and caches it — recovery sends the notification
+    // so the full catalog comes back without a harness restart.
+    {
+      capabilities: { tools: { listChanged: true } },
+      // #4748: canonical contract (+ opt-in ambient-writeback section) plus the
+      // optional operator-set deployment identity, appended last.
+      instructions: resolveMcpInstructions(config, process.env, {
+        writeback: ambientOptsFrom(writeback, {
+          remember: allowedOps ? allowedOps.has('remember') : true,
+          extractFacts: allowedOps ? allowedOps.has('extract_facts') : true,
+        }),
+      }),
+    },
+  );
 
   // WP3: strict-params schema emission, resolved ONCE at startup from the
   // FILE config plane only — stdio has no per-request list cycle, so a
   // `mcp.strict_params` flip needs a serve restart here (deliberate; the
   // OAuth HTTP path re-reads dual-plane per request).
-  const strictParams = parseStrictParamsMode(loadConfig()?.mcp?.strict_params) === 'reject';
+  const strictParams = parseStrictParamsMode(config?.mcp?.strict_params) === 'reject';
 
   // Generate tool definitions from operations. Extracted to buildToolDefs so
   // the subagent tool registry (v0.15+) can call the same mapper against a
@@ -169,6 +232,12 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   server.setRequestHandler(ListToolsRequestSchema, async () => trackStdioRpc(async () => ({
     tools: buildToolDefs(await stdioVisibleTools(engine, surfacedOps), { strictParams }),
   })));
+
+  // #4583 (fixes #4564's misrouted-write symptom): once-per-process advisory
+  // for unscoped default writes on a multi-source brain; latch semantics live
+  // in createDefaultWriteAdvisory above. Skipped under --source-guard (the
+  // opt-in fail-closed guard owns that lane).
+  const defaultWriteAdvisory = createDefaultWriteAdvisory(engine, { enabled: !opts.sourceGuard });
 
   // Dispatch tool calls via shared dispatch.ts (parity with HTTP transport).
   // MCP stdio callers are remote/untrusted; dispatch defaults remote=true.
@@ -195,6 +264,16 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     const sessionId = typeof rawMetaSession === 'string' && rawMetaSession.length > 0
       ? rawMetaSession
       : undefined;
+    // #4583 rework: warn (once per process) when a MUTATING call's RESOLVED
+    // source scope actually lands in 'default' (tier seed_default) on a
+    // bulk-non-default brain. Keyed on the already-computed resolution tier —
+    // NOT on raw GBRAIN_SOURCE presence — so dotfile / local_path /
+    // brain_default pins never false-positive. No `--source` flag exists on
+    // this transport, so warn instead of refusing the agent's write.
+    await defaultWriteAdvisory(
+      sourceScope.tier,
+      operations.find(o => o.name === name)?.mutating === true,
+    );
     return dispatchToolCall(engine, name, params, {
       remote: true,
       // #1061: mark the transport so whoami can report {transport: 'stdio'}

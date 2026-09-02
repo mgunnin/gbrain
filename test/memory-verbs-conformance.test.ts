@@ -187,6 +187,32 @@ describe('recall — G1B superset + budget packing', () => {
 });
 
 describe('remember — contract behavior', () => {
+  it("kind enum is frozen at the 5 protocol kinds — 'idea' is extractor/DB-only", () => {
+    // docs/protocol/MEMORY_VERBS_v1.md:39-41 — the remember verb's kind enum
+    // is a frozen protocol surface. The extractor/DB taxonomy gained 'idea'
+    // (engine.ts FactKind, migration v145); the protocol enum MUST NOT.
+    const kindEnum = operationsByName['remember'].params?.kind?.enum ?? [];
+    expect(kindEnum).toEqual(['event', 'preference', 'commitment', 'belief', 'fact']);
+    expect(kindEnum).not.toContain('idea');
+  });
+
+  it("recall's RESPONSE kind enum admits 'idea' — the reader must not be told a lie", () => {
+    // The INPUT freeze above is the protocol contract (a caller cannot WRITE
+    // an idea through the verb). The response side describes what the system
+    // actually RETURNS: the extractor and the facts table carry 'idea', so a
+    // stored idea fact flows back through recall. A response schema omitting
+    // it would declare a contract the system itself violates. Widening a
+    // response enum is strictly permissive for consumers.
+    const { RESPONSE_SCHEMAS } = require('../src/core/verbs.ts') as {
+      RESPONSE_SCHEMAS: Record<string, Record<string, unknown>>;
+    };
+    const facts = ((RESPONSE_SCHEMAS.recall as Record<string, Record<string, Record<string, unknown>>>)
+      .properties?.facts) as Record<string, Record<string, Record<string, Record<string, unknown>>>>;
+    const kindEnum = facts?.items?.properties?.kind?.enum as string[] | undefined;
+    expect(kindEnum).toEqual(['event', 'preference', 'commitment', 'belief', 'fact', 'idea']);
+    // ...while the remember INPUT enum stays frozen at five (asserted above).
+  });
+
   it('rejects empty provenance with provenance_required + a populated suggestion', async () => {
     const { isError, body } = await callRemote('remember', { fact: 'x', provenance: '   ' });
     expect(isError).toBe(true);
@@ -203,6 +229,17 @@ describe('remember — contract behavior', () => {
     expect(isError).toBe(true);
     expect(body.error).toBe('invalid_params');
     expect(body.suggestion).toContain('30d');
+  });
+
+  it('treats a null-like entity STRING ("null") as absent — never entity_slug=\'null\' (#4755)', async () => {
+    // LLM callers emit the literal token "null" for subjectless statements;
+    // it means what omitting the param means.
+    const { isError, body } = await callRemote('remember', {
+      fact: 'a gap statement with no subject', provenance: 'test', entity: 'null',
+    });
+    expect(isError).toBe(false);
+    expect(body.status).toBe('inserted');
+    expect(body.entity_slug).toBe(null);
   });
 
   it('accepts duration ttl and returns a future ISO valid_until; echoes null entity_slug', async () => {
@@ -378,6 +415,84 @@ describe('entity — card, arms, zero LLM', () => {
     const { body } = await callRemote('entity', { name: 'people/fence-test' });
     expect(body.found).toBe(true);
     expect(JSON.stringify(body.card.open_threads)).not.toContain('PRIVATE-SENTINEL');
+  });
+
+  it('active_fact_count is exact beyond the fetch cap, source-scoped, and visibility-scoped', async () => {
+    // Pre-fix, active_fact_count was facts.length under a 100-row fetch cap,
+    // so entities with more facts silently reported 100.
+    await seedEntityPage('people/count-truth-test', 'Count Truth Test Person');
+    await engine.executeRaw(
+      `INSERT INTO facts
+         (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence, created_at)
+       SELECT 'default', 'people/count-truth-test', 'world fact ' || gs::text,
+              'fact', 'world', 'medium', NOW(), 'conformance-seed', 1.0, NOW()
+         FROM generate_series(1, 125) gs`,
+      [],
+    );
+    await engine.insertFact(
+      {
+        fact: 'PRIVATE-COUNT-SENTINEL fact',
+        kind: 'fact',
+        entity_slug: 'people/count-truth-test',
+        visibility: 'private',
+        source: 'conformance-seed',
+      },
+      { source_id: 'default' },
+    );
+    // A same-slug fact in a foreign source must never inflate the count.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('other', 'other-tenant', '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [],
+    );
+    await engine.insertFact(
+      {
+        fact: 'FOREIGN-SOURCE-SENTINEL fact',
+        kind: 'fact',
+        entity_slug: 'people/count-truth-test',
+        visibility: 'world',
+        source: 'conformance-seed',
+      },
+      { source_id: 'other' },
+    );
+
+    // Remote: world-only — the 125 seeded world facts, exactly.
+    const remote = await callRemote('entity', { name: 'people/count-truth-test' });
+    expect(remote.body.card.active_fact_count).toBe(125);
+
+    // Local: private rows count too (126); foreign source never does.
+    const local = await operationsByName.entity.handler(localCtx(), { name: 'people/count-truth-test' });
+    expect((local as { card: { active_fact_count: number } }).card.active_fact_count).toBe(126);
+  });
+
+  it('timeline dates honor the string|null card contract in-process (PGLite returns Date objects)', async () => {
+    // The frozen RESPONSE_SCHEMAS type last_timeline_date and thread dates as
+    // string|null, but PGLite returns a Date object for the DATE column. The
+    // JSON wire hides this (Date.toJSON), so pin the IN-PROCESS card that
+    // local consumers (loops, CLI rendering) read directly.
+    await seedEntityPage('people/date-contract-test', 'Date Contract Test Person');
+    await engine.addTimelineEntry(
+      'people/date-contract-test',
+      {
+        date: new Date().toISOString().slice(0, 10),
+        source: 'conformance-seed',
+        summary: 'Recent event inside the open-thread window',
+      },
+      { sourceId: 'default' },
+    );
+
+    const res = await operationsByName.entity.handler(localCtx(), { name: 'people/date-contract-test' }) as {
+      card: {
+        last_touched: { last_timeline_date: unknown };
+        open_threads: Array<{ kind: string; date: unknown }>;
+      };
+    };
+    expect(typeof res.card.last_touched.last_timeline_date).toBe('string');
+    const recent = res.card.open_threads.find(t => t.kind === 'recent_event');
+    expect(recent).toBeDefined();
+    for (const t of res.card.open_threads) {
+      expect(t.date === null || typeof t.date === 'string').toBe(true);
+    }
   });
 });
 

@@ -39,6 +39,13 @@ if ! (cd "$BUILD_DIR" && bun build --compile --outfile "$OUT_BIN" scripts/chunke
   exit 1
 fi
 
+# Bun's linker-signed Mach-O can become invalid when embedded assets extend the
+# binary after the signature is written (observed on macOS 27). Re-sign the
+# temporary smoke-test binary before execution; Linux has no equivalent step.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  codesign --force --sign - "$OUT_BIN" >/dev/null
+fi
+
 # Run it and capture JSON output.
 OUTPUT="$("$OUT_BIN" 2>&1)"
 

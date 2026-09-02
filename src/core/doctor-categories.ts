@@ -56,6 +56,7 @@ export type CheckCategory = 'brain' | 'skill' | 'ops' | 'meta';
  */
 export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'abandoned_threads',
+  'atom_provenance_drift',
   'brain_score',
   'calibration_freshness',
   'child_table_orphans',
@@ -88,6 +89,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'facts_health',
   'frontmatter_integrity',
   'malformed_path_pages',
+  'memory_writeback',
   'grade_confidence_drift',
   'graph_coverage',
   'entity_link_coverage',
@@ -162,6 +164,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'bootstrap_harness_health',
   'bootstrap_hooks_heartbeat',
   'bootstrap_last_verify',
+  'memorable_relay_health',
   'backup_coverage',
   'bootstrap_push_health',
   'bootstrap_durability_job',
@@ -218,6 +221,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
  */
 export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   'cycle_phase_scope',
+  'default_source_local_path',
   'eval_capture',
   'minions_migration',
   'multi_source_drift',

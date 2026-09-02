@@ -344,7 +344,7 @@ i=0
 for f in "${ordered_files[@]}"; do
   [ -f "$LOG_DIR/$i.dur" ] && echo "$(cat "$LOG_DIR/$i.dur") $f"
   i=$((i + 1))
-done | sort -rn | head -10 | sed 's/^/  /'
+done | sort -rn | awk 'NR<=10' | sed 's/^/  /'
 
 # Bank the FULL per-file duration table before the tmpdir EXIT trap destroys
 # it — the mining input for scripts/serial-weights.json (workspace-local,

@@ -32,7 +32,7 @@ import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
 import { VERSION } from '../version.ts';
-import { loadConfig, loadConfigFileOnly, toEngineConfig } from '../core/config.ts';
+import { loadConfig, loadConfigFileOnly, saveConfig, toEngineConfig, type GBrainConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import { resolveGbrainHome } from '../core/gbrain-home.ts';
 import { detectExecutionEnvironment } from '../core/execution-env.ts';
@@ -61,6 +61,7 @@ import {
   writeCommittedClaudeHooks,
   removeClaudeHooks,
 } from '../core/bootstrap/hooks.ts';
+import { removeCodexHooks, writeCodexHooks } from '../core/bootstrap/codex-hooks.ts';
 import {
   guardReceiptOverwrite,
   readHarnessReceiptState,
@@ -574,6 +575,33 @@ function consentAnswer(ws: string, key: string): string | undefined {
   return bank.questions[key]?.default;
 }
 
+/**
+ * WP8: map the interview's SURFACE_MULTIUSER consent answer onto the
+ * machine-local `brain.audience` declaration (file mirror — engine-free by
+ * bootstrap's contract; the audience classifier reads it as a declaration
+ * fallback and the harness advisory gates on it). 'shared' → declare
+ * shared; the 'single-principal' default declares nothing (personal is the
+ * classifier's own default posture, and staying silent keeps a later
+ * explicit `gbrain config set brain.audience` the stronger signal).
+ * SET-IF-UNSET only; never throws (bootstrap must not die on a config
+ * write). Exported for tests.
+ */
+export function applyDeclaredAudienceFromInterview(ws: string): void {
+  try {
+    const answer = (consentAnswer(ws, 'SURFACE_MULTIUSER') ?? '').trim().toLowerCase();
+    if (answer !== 'shared') return;
+    const cfg = (loadConfigFileOnly() ?? { engine: 'pglite' }) as GBrainConfig;
+    if (cfg.brain?.audience) return; // explicit declaration wins — never overwrite
+    cfg.brain = { ...(cfg.brain ?? {}), audience: 'shared' };
+    saveConfig(cfg);
+    console.log(
+      'brain.audience=shared declared (from the interview) — ambient-writeback consent nudges will not fire on this brain.',
+    );
+  } catch {
+    /* declaration is advisory — never blocks the wire phase */
+  }
+}
+
 /** Post-render machine receipt [CX2-1/CX2-12]; preserves an existing same-
  * workspace receipt's ownership fields (mirrors attach.ts). */
 function writeRenderReceipt(home: string, ws: string): void {
@@ -761,6 +789,14 @@ async function runInterview(ws: string, rest: string[]): Promise<number> {
     }
     if (r.invalidatedConfirmation) warnInvalidatedConfirmation();
     console.log(`${key} recorded.`);
+    // Apply the audience declaration the moment the answer lands (red-team
+    // review, this wave): the agent runs `gbrain init` (the engine phase)
+    // BETWEEN interview and wire, and init's writeback consent nudge
+    // classifies the fresh brain — a shared declaration applied only at
+    // runHooks time would arrive too late, so a team-brain bootstrap would
+    // get the personal-brain ask and burn the fire-once sentinel. The
+    // runHooks call stays as the idempotent backstop.
+    if (key === 'SURFACE_MULTIUSER') applyDeclaredAudienceFromInterview(ws);
     return 0;
   }
   const skipIdx = rest.indexOf('--skip');
@@ -1041,6 +1077,13 @@ async function runHooks(
     return 1;
   }
   const sourceId = state.manifest.source_id;
+
+  // WP8: the interview's declared audience becomes the machine-local
+  // brain.audience declaration (file mirror; the classifier and the harness
+  // advisory both honor it, and a later `gbrain config set brain.audience`
+  // dual-writes the DB row too). Set-if-unset only — an operator's explicit
+  // declaration is never overwritten by a re-run.
+  applyDeclaredAudienceFromInterview(ws);
 
   const gbrainBin = flagValue(rest, '--gbrain-bin') ?? resolveGbrainBin();
   if (!gbrainBin) {
@@ -1520,7 +1563,35 @@ async function runHooks(
         );
       }
     } else if (harness === 'codex') {
-      console.log('gbrain does not wire Codex hooks yet — per-turn context is the AGENTS.md pull protocol (stated plainly; the codex hook lane is a filed follow-up).');
+      if (hooksConsent) {
+        // Codex hooks are user-global (one hooks.json per CODEX_HOME) and
+        // TRUST-GATED: the writer lands both the hooks.json entry and its
+        // config.toml trusted_hash, or codex silently never runs it. The
+        // command carries NO GBRAIN_SOURCE — hooks.json is machine-global, a
+        // baked source would stamp every codex session on this machine with
+        // this repo's source; session-end resolves from the payload instead.
+        const r = writeCodexHooks({ gbrainBin });
+        if (r.ok) {
+          hooksWritten = true;
+          console.log(
+            `codex SessionEnd hook installed in ${r.hooksPath} (+ trust entry in ${r.configPath}) — session capture is live for the WHOLE machine's codex sessions. Turn off any time with GBRAIN_HOOKS=0, or remove with \`gbrain bootstrap uninstall\`.`,
+          );
+          console.log('note: per-turn context on codex stays the AGENTS.md pull protocol — this hook is session-END capture only (v1).');
+          for (const note of r.notes) console.error(note);
+        } else {
+          for (const note of r.notes) console.error(note);
+          if (!mcpSkipped) {
+            appendReceiptRegistration(home, ws, { host: harness, scope: 'user', detail: 'mcp' });
+          }
+          return 1;
+        }
+      } else {
+        console.log(
+          noHooks
+            ? 'codex hooks skipped (--no-hooks) — per-turn context is the AGENTS.md pull protocol; re-enable with `gbrain bootstrap hooks --harness codex`.'
+            : 'codex hooks declined (HOOKS_CONSENT set to no) — per-turn context is the AGENTS.md pull protocol; re-enable with `gbrain bootstrap hooks --harness codex`.',
+        );
+      }
     } else {
       console.log(
         'gbrain does not wire opencode\'s plugin/event system yet — per-turn context is the AGENTS.md ' +
@@ -1775,6 +1846,9 @@ async function runUninstall(ws: string, rest: string[], home: string, runner: Ex
           break;
         }
         case 'codex': {
+          const rh = removeCodexHooks();
+          if (rh.removed) console.log(`removed gbrain's codex SessionEnd hook (${rh.hooksPath}) + its trust entry (${rh.configPath})`);
+          for (const note of rh.notes) console.error(note);
           if (pluginOwned) {
             console.log('MCP server was provided by the gbrain plugin (not registered by bootstrap) — leaving it; `codex plugin remove gbrain@gbrain` removes the plugin.');
             break;

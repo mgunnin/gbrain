@@ -67,10 +67,16 @@ import {
 } from '../core/transcripts/claude-code-jsonl.ts';
 import {
   bankCompactSegment,
+  bankWritebackTurn,
   decideCorpusMode,
   gcCorpusArtifacts,
   HARVEST_RECEIPT_SUFFIX,
+  segmentHash,
 } from '../core/context/corpus-segments.ts';
+import { gateWritebackTurn, WRITEBACK_SKIP_REASONS } from '../core/facts/writeback-gate.ts';
+import { resolveWritebackConfigFromFile } from '../core/facts/writeback-config.ts';
+import { memorableGateAllowed, recordAndRelayReceipt, redactedToolCallsJson } from '../core/context/hook-heartbeat.ts';
+import { captureSpecFor } from '../core/transcripts/capture-spec.ts';
 import {
   heartbeatPath,
   hookStatusPath,
@@ -112,6 +118,12 @@ export const DIGEST_MEMORY_CAP_BYTES = 3072;
 export const DIGEST_SECTIONS = ['standing rules', 'open commitments', 'active context'];
 /** Stop-buffer retention [G15]. */
 export const STOP_BUFFER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/** Ambient-writeback Stop step's own deadline (WP4): well inside Stop's 10s
+ * harness cap, alongside (not inside) the push step's 3s. Fail-open always. */
+export const WRITEBACK_STOP_DEADLINE_MS = 2000;
+/** Newest-tail read for locating the last user turn — one turn never needs
+ * the 2MB user-prompt window, and this lane pays the parse EVERY Stop. */
+export const WRITEBACK_TRANSCRIPT_TAIL_BYTES = 128 * 1024;
 /** Default corpus retention when `dream.synthesize.corpus_retention_days` is unset [G15]. */
 export const CORPUS_RETENTION_DAYS_DEFAULT = 30;
 /**
@@ -411,7 +423,11 @@ function ensureDir0700(dir: string): string {
 }
 
 function sanitizeSessionId(id: unknown): string {
-  const s = typeof id === 'string' ? id.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 120) : '';
+  // Leading dashes are stripped so the id can never be parsed as a FLAG by a
+  // downstream argv consumer (the detached memorable spawn passes it as a
+  // positional value) — hook stdin is untrusted input.
+  const s =
+    typeof id === 'string' ? id.replace(/[^A-Za-z0-9._-]/g, '-').replace(/^-+/, '').slice(0, 120) : '';
   return s && !/^\.+$/.test(s) ? s : 'unknown';
 }
 
@@ -1431,6 +1447,122 @@ async function hookStop(io: HookIo): Promise<number> {
     outcome = 'error';
     reason = errorCode(e);
   }
+  // Ambient-writeback backstop (WP4) — its own try/deadline, fail-open, and
+  // FILE-plane gated (this child never opens the engine; the serve-side
+  // harvest re-checks the AUTHORITATIVE DB-plane gate before extracting).
+  // Every outcome is a typed heartbeat reason on its own `writeback-bank`
+  // event; IPC down = degraded (the sweep's corpus pass extracts the banked
+  // file later). Zero LLM here — the gate is deterministic and "Thanks"
+  // never even produces a file.
+  let wbReason: string | undefined;
+  const wbT0 = Date.now();
+  try {
+    const wbWork = (async (): Promise<string> => {
+      // ONE uncached loadConfig for the whole step (it re-reads disk every
+      // call) — gate, corpus dir, and IPC discovery all share it.
+      const cfg = loadConfig();
+      const wb = resolveWritebackConfigFromFile(cfg);
+      if (!wb.enabled) return 'wb_off';
+      const sid = sanitizeSessionId(j?.session_id);
+      if (sid === 'unknown') return 'no_session';
+      const tp = j?.transcript_path;
+      if (tp === undefined || tp === null) return 'no_transcript';
+      const conf = confineTranscriptPath(tp as string, {
+        ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
+      });
+      if (!conf.ok) return `transcript_${conf.reason}`;
+      const findLastUser = (ts: WindowTurn[]): WindowTurn | undefined => {
+        for (let i = ts.length - 1; i >= 0; i--) {
+          if (ts[i].role === 'user' && ts[i].text) return ts[i];
+        }
+        return undefined;
+      };
+      let lastUser: WindowTurn | undefined;
+      try {
+        // Cheap-first tail sizing: a 128KB newest-tail finds the most-recent
+        // user turn in the common case, BUT the turn's OFFSET from EOF is the
+        // whole assistant response including tool_result JSONL — a single big
+        // file-read result can push it out of the window (red-team review,
+        // this wave: turn SIZE ≠ turn OFFSET). Missing ⇒ ONE retry at the
+        // 2MB user-prompt cap; only then is the turn genuinely absent. The
+        // wide parse only ever runs when the cheap one failed, so the common
+        // path keeps the 128KB cost inside this lane's 2s budget.
+        lastUser = findLastUser(
+          parseTranscript(conf.path, { maxBytes: WRITEBACK_TRANSCRIPT_TAIL_BYTES }).turns,
+        );
+        if (!lastUser) {
+          lastUser = findLastUser(
+            parseTranscript(conf.path, { maxBytes: USER_PROMPT_TRANSCRIPT_MAX_BYTES }).turns,
+          );
+        }
+      } catch {
+        return 'parse_failed';
+      }
+      if (!lastUser || !lastUser.text) return 'no_user_turn';
+      const gated = gateWritebackTurn(lastUser.text);
+      if (!gated.ok) return gated.reason;
+      const banked = await bankWritebackTurn(
+        await corpusDir(cfg), sid, gated.normalized, gated.hash24,
+        // Bank the session's source IN THE NAME so the sweep fallback files
+        // the turn into the same source the IPC lane below would have.
+        process.env.GBRAIN_SOURCE ?? null,
+      );
+      if (banked.status !== 'wb_banked' && banked.status !== 'wb_dup') return banked.status;
+      if (banked.status === 'wb_dup') return 'wb_dup';
+      // Prompt-harvest ask over the compact-bank IPC lane — sourceId rides
+      // exactly like the compact call (OV2-9/OV-A6); every failure below is
+      // degraded-not-blocking: the banked file is the durable artifact and
+      // the sweep extracts it when serve is away.
+      const socket = resolveSocketPathForConfig(cfg);
+      if (!socket) return 'no_pglite_path';
+      const secret = readIpcSecretForConfig(cfg);
+      if (!secret) return 'no_serve';
+      const res = await requestContextPack(socket, {
+        secret,
+        sessionId: sid,
+        bankOnly: true,
+        trigger: 'writeback-bank',
+        ...(banked.flushCorpusFile ? { flushCorpusFile: banked.flushCorpusFile } : {}),
+        ...(process.env.GBRAIN_SOURCE ? { sourceId: process.env.GBRAIN_SOURCE } : {}),
+      });
+      if (res === IPC_UNAVAILABLE) return 'ipc_unavailable';
+      if ('degraded' in res && res.degraded === 'stale_serve') return 'stale_serve';
+      const resp = res as ContextPackResponse;
+      if (!resp.ok) return 'flush_failed';
+      const cf = (resp.block as { checkpointFlush?: { status?: string; reason?: string } } | null | undefined)?.checkpointFlush;
+      if (cf?.status === 'scheduled') return 'wb_scheduled';
+      return cf ? `flush_skip_${cf.reason ?? 'unknown'}` : 'wb_banked';
+    })();
+    const raced = await withDeadline(WRITEBACK_STOP_DEADLINE_MS, wbWork);
+    wbReason = raced === DEADLINE ? 'wb_deadline' : raced;
+  } catch (e) {
+    wbReason = `wb_${errorCode(e)}`;
+  }
+  if (wbReason && wbReason !== 'wb_off') {
+    // Outcome classes (adversarial review, this wave): 'ok' covers BOTH the
+    // banked/scheduled successes AND every BY-DESIGN skip — the deterministic
+    // gate filters ("Thanks" → ack_or_greeting), a turn genuinely absent from
+    // the transcript, and the flush_skip_* family (the turn IS banked; the
+    // enqueue was declined by a designed cap/queue policy and the sweep
+    // extracts it later). 'degraded' is reserved for infrastructure faults
+    // (IPC down, stale serve, parse/scan failures, deadline) so doctor's
+    // skipped-vs-failed counters and any alerting stay honest.
+    const wbByDesign =
+      wbReason === 'wb_scheduled' || wbReason === 'wb_banked' || wbReason === 'wb_dup' ||
+      wbReason === 'no_user_turn' || wbReason.startsWith('flush_skip_') ||
+      (WRITEBACK_SKIP_REASONS as readonly string[]).includes(wbReason);
+    await writeHeartbeat(io, {
+      ts: new Date().toISOString(),
+      event: 'writeback-bank',
+      outcome: wbByDesign ? 'ok' : 'degraded',
+      reason: wbReason,
+      // Step-local clock: this event's duration must reflect the 2s-budgeted
+      // step, not hookStop's whole run (a wb_deadline reason with a
+      // duration exceeding the deadline would mislead triage).
+      duration_ms: Date.now() - wbT0,
+    });
+  }
+
   // Per-turn durability push [D3/D17/D20] — its own try/deadline so the
   // buffer append above and the heartbeat below are never at risk.
   let pushReason: string | undefined;
@@ -1512,19 +1644,56 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
   let sessionId = 'unknown';
   let ws: string | undefined;
   let segmentMode: string | undefined;
+  // Apply-LAST reasons: entries here describe something other than THIS
+  // session's own capture health — prior-run relay failures (memorable_relay_*)
+  // and a discovery-fallback note — so under first-degrade-wins they must not
+  // mask a current-session reason (e.g. push_unavailable, scan_unavailable).
+  // Held here and applied just before the heartbeat write.
+  const deferredReasons: string[] = [];
   try {
     const j = await readStdinJson(io, 500);
     sessionId = sanitizeSessionId(j?.session_id);
     ws = io.cwd ?? (typeof j?.cwd === 'string' ? (j.cwd as string) : process.cwd());
     const cfg = loadConfig();
+    // ONE gate for the whole Memorable integration (memorableGateAllowed —
+    // shared with the openclaw lane and doctor). Answered BEFORE the parse so
+    // the default gate-off population never pays tool-call collection.
+    const memorableAllowed = (await memorableGateAllowed(cfg)).allowed;
 
-    const conf = confineTranscriptPath(j?.transcript_path, {
-      ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
-    });
+    // Per-harness capture seam: claude-code and codex each pin their OWN
+    // confinement root + parser; unknown harnesses resolve to the claude spec
+    // (today's behavior, pinned by the capture-spec golden test).
+    const spec = captureSpecFor(io.harness);
+    const rootOpt = io.transcriptRoot ? { root: io.transcriptRoot } : {};
+    let conf = spec.confine(j?.transcript_path, { ...rootOpt });
+    // A newest-mtime discovery with NO session-id match is a guess: on a
+    // machine with concurrent sessions it can be a different, still-RUNNING
+    // rollout. Fine for the local corpus (overwritten on the real session
+    // end), never for the relay — a receipt would describe a session that
+    // has not ended, and its partial hash would double-pay extraction later.
+    let discoveryWasGuess = false;
+    if (!conf.ok && conf.reason === 'missing_path' && spec.discover) {
+      // A codex SessionEnd payload can carry transcript_path:null (no local
+      // rollout); the bounded newest-first discovery keeps the lane useful —
+      // LOUDLY (typed deferred reason, never a silent guess).
+      const found = spec.discover(sessionId === 'unknown' ? null : sessionId, { ...rootOpt });
+      if (found) {
+        deferredReasons.push(found.degrade);
+        discoveryWasGuess = found.degrade === 'transcript_discovered_newest';
+        conf = spec.confine(found.path, { ...rootOpt });
+      }
+    }
     if (!conf.ok) {
       degrade(`transcript_${conf.reason}`);
     } else {
-      const parsed = parseTranscript(conf.path);
+      const parsed = spec.parse(conf.path, { collectToolCalls: memorableAllowed });
+      if (sessionId === 'unknown') {
+        // Stdin payload carried no session_id (observed on codex): adopt the
+        // transcript's own id so successive such sessions don't collapse onto
+        // one shared unknown.txt corpus (overwriting each other's dedup key).
+        const inline = (parsed as { sessionId?: string | null }).sessionId;
+        if (typeof inline === 'string' && inline) sessionId = sanitizeSessionId(inline);
+      }
       turnsN = parsed.turns.length;
       bytesN = parsed.bytesRead;
       if (bytesN > 0 && turnsN === 0) {
@@ -1558,12 +1727,22 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           // [S3#2] Secret-scan AT WRITE TIME. Scanner absent → still write
           // (the corpus is 0700-local), but say so in the heartbeat.
           let text = toCorpusText(corpusTurns);
+          let toolCallsJson = '[]';
           try {
             const scan = await import('../core/secret-scan.ts');
-            const redacted = scan.redactFindings(text);
+            // The relay child derives its egress task line from this corpus, so
+            // the moment the integration is on, the corpus scan runs with the
+            // same highEntropy posture as the tool-calls JSON below — the
+            // local-only default keeps the cheaper vendor-prefix-only scan.
+            const redacted = scan.redactFindings(text, memorableAllowed ? { highEntropy: true } : {});
             text = redacted.text;
             // COUNT only — the findings themselves never land in telemetry [S3#7].
             redactionsN = redacted.redactions.length;
+            if (memorableAllowed) {
+              // Same span as the corpus, highEntropy always on — see the
+              // shared helper's doc for why.
+              toolCallsJson = await redactedToolCallsJson(parsed.toolCalls, parsed.toolCallTurnIndexes, decided.startTurnIndex);
+            }
           } catch {
             degrade('scan_unavailable');
           }
@@ -1578,6 +1757,37 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
           const tmpCorpus = `${corpusFile}.tmp-${process.pid}`;
           writeFileSync(tmpCorpus, text, { mode: 0o600 });
           renameSync(tmpCorpus, corpusFile);
+          // Additive signal for a local third-party consumer (never gbrain
+          // itself): the corpus file above is done, hashed post-redaction so
+          // the hash can never fingerprint pre-scrub content. Receipt + relay
+          // live in hook-heartbeat.ts's recordAndRelayReceipt (shared with the
+          // openclaw context-engine lane): dedup by content hash, prior-run
+          // outcome surfacing, detached fire-and-forget spawn.
+          if (memorableAllowed && discoveryWasGuess) {
+            deferredReasons.push('memorable_relay_skipped_newest_guess');
+          } else if (memorableAllowed && redactionsN === undefined) {
+            // Scanner unavailable → the corpus above is UNREDACTED. The local
+            // 0600 write is fine, but nothing unscanned may reach the relay
+            // child (its egress task line derives from this corpus). Fail
+            // CLOSED — same posture as the openclaw context-engine lane —
+            // instead of delegating the refusal to the closed-source child.
+            deferredReasons.push('memorable_relay_skipped_unscanned');
+          } else if (memorableAllowed) {
+            const relay = await recordAndRelayReceipt({
+              session_id: sessionId,
+              harness: io.harness ?? 'claude-code',
+              corpus_path: corpusFile,
+              content_hash: segmentHash(text),
+              turn_count: turnsN,
+              workspace_root: ws ?? process.cwd(),
+              tool_calls_json: toolCallsJson,
+              secret_scan_ok: true, // scanner ran — the unscanned case took the branch above
+            }, { trimRelayFile: true }); // both capture lanes trim memorable-relay.jsonl (converging newest-keeping trims)
+            for (const r of relay.degradeReasons) {
+              if (r.startsWith('memorable_relay_')) deferredReasons.push(r);
+              else degrade(r);
+            }
+          }
           try {
             rmSync(corpusFile + CORPUS_INGESTED_SUFFIX, { force: true });
           } catch {
@@ -1651,6 +1861,10 @@ async function hookSessionEnd(io: HookIo): Promise<number> {
   } catch {
     /* best effort */
   }
+
+  // Deferred reasons apply LAST — visible when nothing about THIS session
+  // degraded, never masking a current-session reason.
+  for (const r of deferredReasons) degrade(r);
 
   await writeHeartbeat(io, {
     ts: new Date().toISOString(),

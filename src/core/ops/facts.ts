@@ -14,7 +14,7 @@
 
 import type { Operation } from './contract.ts';
 import { OperationError, verbError } from './contract.ts';
-import { sourceScopeOpts, stampEvidenceSafe } from './context.ts';
+import { federatedSearchScope, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { hybridSearchCached, stampContentFlags } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
@@ -24,6 +24,7 @@ import { isAvailable } from '../ai/gateway.ts';
 // #4209: the named entity-hints cap — surfaced in the extract_facts param
 // description and the entity_hints_used/_dropped response fields.
 import { ENTITY_HINTS_CAP } from '../facts/extract.ts';
+import { parseTtlShorthand } from '../facts/ttl-parse.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
 import type { SearchResult } from '../types.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
@@ -35,7 +36,7 @@ import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 const extract_facts: Operation = {
   name: 'extract_facts',
   description:
-    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
+    'v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls the configured extraction model (key-aware: any servable provider — OpenAI or Anthropic key both work), runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. With NO servable chat model, returns skipped: extraction_unavailable + an agent_action telling YOU to extract and write via `remember` (visibility: "private"). Skips extraction when the turn is dream-generated content (anti-loop). For agent memory writes of a SINGLE already-formed fact, prefer the `remember` verb (zero LLM, mandatory provenance).',
   params: {
     turn_text: { type: 'string', required: true, description: 'The user message or page body to extract facts from. Sanitized via INJECTION_PATTERNS before the LLM call.' },
     session_id: { type: 'string', description: 'Opaque session id (e.g. topic-id from MCP _meta.session_id, or CLI --session). Stored on each fact for the recall --session filter. Not an auth surface. NOTE (#4206): the session survives on the DB row at insert time, but the `## Facts` fence has no session column — a fence rebuild/reconcile re-derives rows session-less. Treat fence-backed facts as session-less across rebuilds.' },
@@ -369,7 +370,12 @@ const recall: Operation = {
     let searchResults: SearchResult[] = [];
     let searchDegraded: string | undefined;
     if (queryText) {
-      const searchScope = sourceScopeOpts(ctx);
+      // #3242 parity (#4707): the page-search arm widens an unqualified
+      // no-grant caller across the transport-computed federated set, exactly
+      // like search/query/get_page/list_pages/resolve_slugs. sourceScopeOpts
+      // alone pinned this arm to the scalar source, so a `federated: true`
+      // source was invisible to recall while visible to every sibling read op.
+      const searchScope = federatedSearchScope(ctx);
       // #4352 — recall's page-search arm enforces `visibility: private` for
       // untrusted callers (matches the facts arms' world-only filter above).
       const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
@@ -858,46 +864,31 @@ function parseSinceParam(raw: unknown): Date | null {
  * Throws verbError('invalid_params') on anything unparseable.
  */
 export function parseTtlParam(raw: unknown): Date | null {
-  if (raw == null) return null;
-  if (typeof raw !== 'string') {
+  // Grammar lives in the dependency-free leaf (core/facts/ttl-parse.ts — E1,
+  // ambient-writeback wave) so the engine-free hook lane shares it without
+  // importing this module's gateway-reaching graph. This wrapper owns the
+  // wire contract: the verbError copy below is byte-identical to the
+  // pre-extraction messages.
+  const parsed = parseTtlShorthand(raw);
+  if (parsed.ok) return parsed.validUntil;
+  if (parsed.code === 'not_string') {
     throw verbError(
       'invalid_params',
       `ttl must be a string, got ${typeof raw}.`,
       'Pass a duration like "30d" or "12h", or an absolute ISO 8601 timestamp like "2026-07-12T00:00:00Z".',
     );
   }
-  const s = raw.trim();
-  if (!s) return null;
-
-  // ISO-8601 DURATION syntax is a documented trap — reject with the fix.
-  if (/^P(T|\d)/i.test(s) && /^P(?:\d+[YMWD])*(?:T(?:\d+[HMS])+)?$/i.test(s)) {
+  if (parsed.code === 'iso_duration') {
+    const s = parsed.input;
     throw verbError(
       'invalid_params',
       `ttl "${s}" looks like an ISO-8601 duration, which is not accepted.`,
       `Use the shorthand form instead (e.g. "${s.replace(/^PT?/i, '').toLowerCase()}" style: "30d", "12h"), or an absolute ISO 8601 expiry timestamp.`,
     );
   }
-
-  // Relative duration shorthand → now + duration.
-  const dur = s.match(/^(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hr|hours?|d|days?)$/i);
-  if (dur) {
-    const n = parseInt(dur[1], 10);
-    const unit = dur[2].toLowerCase();
-    const ms =
-      unit.startsWith('s') ? n * 1000 :
-      unit.startsWith('m') ? n * 60 * 1000 :
-      unit.startsWith('h') ? n * 60 * 60 * 1000 :
-      n * 24 * 60 * 60 * 1000;
-    return new Date(Date.now() + ms);
-  }
-
-  // Absolute ISO 8601 date or datetime.
-  const iso = Date.parse(s);
-  if (Number.isFinite(iso)) return new Date(iso);
-
   throw verbError(
     'invalid_params',
-    `Cannot parse ttl "${s}".`,
+    `Cannot parse ttl "${parsed.input}".`,
     'Pass a duration like "30d" or "12h", or an absolute ISO 8601 timestamp like "2026-07-12T00:00:00Z". Omit ttl for a fact that never expires.',
   );
 }

@@ -35,7 +35,23 @@ export const MEMORY_VERBS_VERSION = 1;
 export const VERB_NAMES = ['recall', 'remember', 'entity', 'synthesize', 'forget', 'context_pack', 'delta'] as const;
 export type VerbName = (typeof VERB_NAMES)[number];
 
+/**
+ * The `remember` INPUT enum — FROZEN at five by the v1 protocol contract
+ * (docs/protocol/MEMORY_VERBS_v1.md: "the values and their meanings stay
+ * fixed"). Widening the extractor/DB taxonomy does NOT widen this; a caller
+ * cannot write an `idea` through the verb surface.
+ */
 const FACT_KINDS = ['event', 'preference', 'commitment', 'belief', 'fact'] as const;
+
+/**
+ * What a reader may RECEIVE. The extractor and the facts table carry `idea`
+ * (migration v145), so a stored idea fact flows back through `recall` — a
+ * response schema that omitted it would declare a contract the system itself
+ * violates. This is a widening for response consumers (strictly more values
+ * accepted), and it is deliberately a SEPARATE constant so the input freeze
+ * above can never drift into it.
+ */
+const FACT_KINDS_RESPONSE = [...FACT_KINDS, 'idea'] as const;
 const PROVENANCE_MAX = 500;
 
 // ─── remember ────────────────────────────────────────────────────────────────
@@ -136,12 +152,17 @@ const remember: Operation = {
       };
     }
 
-    const { writeSingleFact } = await import('./facts/write-single.ts');
+    const { writeSingleFact, isNullLikeEntity } = await import('./facts/write-single.ts');
+    // #4755: a null-like entity token ("null", "None", "N/A", …) means the
+    // same thing as omitting the param — LLM callers emit these for
+    // subjectless statements, and resolving them would file the fact under
+    // a non-existent entity_slug no lookup can reach.
+    const entityParam = typeof p.entity === 'string' ? p.entity.trim() : null;
     const result = await writeSingleFact(ctx.engine, ctx.sourceId ?? 'default', {
       fact,
       provenance,
       kind: kind as (typeof FACT_KINDS)[number],
-      entity: typeof p.entity === 'string' && p.entity.trim() ? p.entity.trim() : null,
+      entity: entityParam && !isNullLikeEntity(entityParam) ? entityParam : null,
       visibility,
       validUntil,
     });
@@ -253,6 +274,7 @@ const synthesize: Operation = {
     }
     const scope = sourceScopeOpts(ctx);
     const { runThink } = await import('./think/index.ts');
+    const { embedQuery } = await import('./embedding.ts');
     // Remote-safe delegation: save/take are NEVER offered through this verb,
     // for any caller — the verb is a pure read.
     const result = await runThink(ctx.engine, {
@@ -264,6 +286,8 @@ const synthesize: Operation = {
       ...(scope.sourceIds !== undefined ? { allowedSources: scope.sourceIds } : {}),
       // Fail-closed: only a context that explicitly says local gets local.
       remote: ctx.remote !== false,
+      // #3734: activate takes' vector retrieval arm for the synthesize verb.
+      embedQuestion: (q) => embedQuery(q),
     });
 
     // [c10] runThink degrades gracefully to a no-LLM stub RESULT; the protocol
@@ -452,7 +476,7 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
             id: { type: 'integer', description: 'LEGACY numeric id (pre-v1 consumers). Use fact_id.' },
             fact_id: { type: 'string', description: 'Opaque protocol id — the value forget accepts.' },
             fact: { type: 'string' },
-            kind: { type: 'string', enum: FACT_KINDS as unknown as string[] },
+            kind: { type: 'string', enum: FACT_KINDS_RESPONSE as unknown as string[] },
             entity_slug: { type: ['string', 'null'] },
             provenance: { type: 'string' },
             valid_until: { type: ['string', 'null'] },
