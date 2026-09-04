@@ -1807,6 +1807,10 @@ export interface EvalCaptureFailure {
  *                        it was the primary recall arm (vector unavailable)
  *   cache_prestamp     — served from a cache row written before the
  *                        degradation stamp existed; cleanliness unprovable
+ *   reranker_skipped   — the mode enables the reranker but it did not run:
+ *                        reason `no_key` (provider key absent) or
+ *                        `sunset_short_circuit` (provider dead past its
+ *                        announced date); results are in RRF order
  *   rerank_passthrough — the reranker was enabled and the provider answered
  *                        SUCCESSFULLY but with an empty/malformed result set,
  *                        so results passed through in raw RRF order with no
@@ -1832,6 +1836,7 @@ export const DEGRADED_STAGES = [
   'budget_truncated',
   'keyword_zero',
   'cache_prestamp',
+  'reranker_skipped',
   'rerank_passthrough',
   'keyword_relaxed_carried',
 ] as const;
@@ -1850,6 +1855,8 @@ export const DEGRADED_REASONS = [
   'variant_embed_failed',
   'original_embed_failed',
   'first_result_truncated',
+  'no_key',
+  'sunset_short_circuit',
   // #4648 — rerank_passthrough reasons (mirror RerankPassThroughReason).
   'empty_result_set',
   'malformed_shape',
@@ -1859,6 +1866,29 @@ export type DegradedReason = (typeof DEGRADED_REASONS)[number];
 export interface DegradedStageEntry {
   stage: DegradedStage;
   reason?: DegradedReason;
+}
+
+/**
+ * Stages that change RANKING but never RECALL: the result set is complete,
+ * only its order is not what the mode promised. Consumers that reason about
+ * "was recall impaired?" (empty-result copy, the short degraded cache TTL)
+ * skip these; consumers that report "what did not run" keep them.
+ *
+ * Membership is a deliberate list, not "anything reranker-shaped":
+ *   - `reranker_skipped` IS ranking-only: it is a CONFIG state (no key / dead
+ *     provider) that a short TTL cannot fix, so the cache keeps the full TTL.
+ *   - `rerank_passthrough` (#4648) is NOT listed on purpose: the provider
+ *     answered 200 with an empty/malformed set — a TRANSIENT fault where the
+ *     short degraded TTL lets the next query recover a reranked result set
+ *     (master's v0.48.1.0 behavior, kept at the merge). It never reaches the
+ *     empty-result copy because a pass-through implies a non-empty batch.
+ *   - `keyword_relaxed_carried` is recall-shaped by definition (see above).
+ * Pinned by test/degraded-stages-recall.test.ts; a new fail-open stage must be
+ * classified here in the same commit that adds it.
+ */
+export const RANKING_ONLY_DEGRADED_STAGES: ReadonlySet<DegradedStage> = new Set<DegradedStage>(['reranker_skipped']);
+export function affectsRecall(d: { stage?: string; reason?: string } | undefined | null): boolean {
+  return !!d?.stage && !RANKING_ONLY_DEGRADED_STAGES.has(d.stage as DegradedStage);
 }
 
 /**

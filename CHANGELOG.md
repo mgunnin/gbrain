@@ -2,6 +2,230 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.48.2.0] - 2026-09-02
+
+**Your search reranker now runs on Voyage, and every surface tells you whether it is actually running.**
+
+The cross-encoder reranker that `balanced` and `tokenmax` search modes run
+after fusion used to default to a ZeroEntropy model whose hosted API shuts
+down on 2026-09-04. This release moves the default to Voyage `rerank-2.5`
+ahead of that date. It rides the same `VOYAGE_API_KEY` as the embedding
+default, so a brain that already embeds with Voyage reranks with no extra
+setup. A brain without the key keeps working: search falls through in fusion
+order, quietly, and `gbrain search modes`, `gbrain search --explain` and
+`gbrain doctor` all say so instead of leaving you to guess why results look
+unranked.
+
+**Say to your agent:** *"check whether my brain's reranker is actually
+running"* — *"turn reranking off for now"* — your agent runs
+`gbrain search modes` / `gbrain doctor`, then either exports `VOYAGE_API_KEY`
+or runs `gbrain config set search.reranker.enabled false`.
+
+### How to use it
+
+```bash
+gbrain search modes          # Reranker: voyage:rerank-2.5 (enabled) — VOYAGE_API_KEY present
+gbrain doctor                # reranker_health names the fix when the key is missing
+gbrain search "acme-example series A" --explain   # shows `degraded: reranker_skipped (no_key)` if it was skipped
+```
+
+No Voyage key and no wish to rerank: `gbrain config set search.reranker.enabled false`.
+
+### Things to watch
+
+- Every cached search result set is re-keyed once by this flip (the reranker
+  model is part of the cache key in all three modes). One cold pass, then the
+  cache refills within `cache.ttl_seconds` (default 3600).
+- A brain that explicitly configured a ZeroEntropy `zerank-*` reranker keeps
+  it until 2026-09-04; from that date the dead hosted call is skipped before
+  any HTTP, with one audit row per process and a single stderr line naming
+  the switch command.
+- The LongMemEval reranker on-vs-off rows landed in this release (Measured,
+  below; the reranker-off row is a reproduction of v0.48.0.0, not a new
+  result). The rest of the paired rerank A/B (the autocut floor, and
+  NamedThingBench, cat13b and world-v1) is pre-registered in the ranker wave
+  that follows this release and publishes there, wins and losses.
+- If you run `tokenmax`, expect worse small-k recall than `balanced` for now.
+  `tokenmax` turns on LLM multi-query expansion, and on LongMemEval at k=5
+  expansion drops strict `recall_all@5` from 93.19% to 54.89% (258/470,
+  2026-09-02, v0.48.2.0; paired +3 / -183 against plain hybrid). The
+  mechanism is equal-weight variant vector lists in RRF, and the fix is
+  tracked in the TODOS.md entry on master, "multi-query expansion dilutes
+  small-k retrieval now that fusion is clean" (weight variant lists below the
+  original, cap their contribution, or expand only when the original query's
+  evidence is weak). Until it lands, `gbrain config set search.mode balanced`
+  keeps the reranker and drops expansion.
+
+### Measured
+
+Five retrieval arms on the public LongMemEval benchmark, run at this release
+so the reranker flip is judged against a reranker-off baseline from the same
+day. Metric: LongMemEval's official session-level `recall_all@5` (every gold
+session inside the top-5 distinct retrieved sessions; retrieval only, no
+reader model). Dataset: `longmemeval_s`, cleaned September 2025 revision,
+500 questions, 30 abstention questions excluded, 470 scored. Run on
+2026-09-02 at gbrain v0.48.2.0 (commit 172df271, PR #4792), search mode
+`balanced` pinned, autocut OFF, reranker OFF except the two rerank arms
+(which run `voyage:rerank-2.5`, this release's default), embedder
+`openai:text-embedding-3-large` at 1536 dims, k=5, single run, 0 errors in
+every arm. "Paired" is per-question against the hybrid row: questions this
+arm gets right that hybrid missed / questions it loses that hybrid had.
+
+| Arm | recall_all@5 | recall_any@5 | Paired vs hybrid | Notes |
+|---|---|---|---|---|
+| hybrid (reranker off; the like-for-like row) | **93.19%** (438/470) | 98.72% | +0 / -0 | nDCG_any@5 93.32%; distinct sessions in the top 5: 5 on 422 questions, 4 on 47, 3 on 1 (mean 4.90); p50 3.7 s / p99 6.3 s per question |
+| hybrid + LLM multi-query expansion | **54.89%** (258/470) | 86.60% | +3 / -183 | nDCG_any@5 71.68%; mean 5.00 distinct sessions; p50 5.1 s / p99 8.0 s; the v0.48.0.0 receipt had 49.6%, same verdict: harmful at small k |
+| hybrid, session-diverse (3x over-fetch, top-5 distinct sessions) | **93.40%** (439/470) | 98.72% | +1 / -0 | nDCG_any@5 93.38%; mean 5.00 distinct sessions; p50 3.7 s / p99 6.4 s |
+| hybrid + rerank (`voyage:rerank-2.5`, this release's default; the release default path) | **95.32%** (448/470) | 99.79% | +18 / -8 | nDCG_any@5 95.77%; mean 4.89 distinct sessions; p50 3.8 s / p99 6.3 s |
+| hybrid, session-diverse + rerank | **95.53%** (449/470) | 99.79% | +19 / -8 | nDCG_any@5 95.82%; mean 5.00 distinct sessions; p50 3.8 s / p99 6.3 s |
+
+By question type (`recall_all@5`, hybrid reranker off, then hybrid + rerank):
+knowledge-update 98.6% (71/72), then 100% (72/72); multi-session 92.6%
+(112/121), unchanged at 92.6% (112/121); single-session-assistant 100%
+(56/56), unchanged; single-session-preference 96.7% (29/30), then 100%
+(30/30); single-session-user 98.4% (63/64), then 100% (64/64);
+temporal-reasoning 84.3% (107/127), then 89.8% (114/127). The expansion arm
+loses in every type (multi-session 34.7%, temporal-reasoning 40.2%,
+knowledge-update 62.5%, single-session-user 78.1%, single-session-preference
+80.0%, single-session-assistant 82.1%). The full per-type table is in
+`docs/eval-bench.md`.
+
+- **Identical to v0.48.0.0.** 438/470 matches the v0.48.0.0 receipt (PR
+  #4787) exactly, per type as well as in total: the reranker succession does
+  not change reranker-off retrieval.
+- **The reranker earns +2.13 points on the release default path.** With
+  `voyage:rerank-2.5` on, hybrid moves from 93.19% to 95.32% (+18 / -8
+  paired); every gain outside multi-session, where the reranker changes
+  nothing (112/121 both ways), and the largest in temporal-reasoning (107 to
+  114 of 127). Any-hit rises to 99.79%: the reranker is promoting sessions
+  that were already in the candidate pool, not finding new ones.
+- **Expansion is harmful at k=5, plainly.** `tokenmax`'s LLM multi-query
+  expansion drops strict recall from 93.19% to 54.89% (+3 / -183 paired) and
+  any-hit from 98.72% to 86.60%, on the same 470 questions, with zero
+  expansion errors. Equal-weight variant vector lists push correct sessions
+  out of the top 5. Nobody should read the reranker-on numbers as a
+  `tokenmax` result; `tokenmax` was not measured with the reranker here.
+- **Slot starvation is not the miss class.** Session-diverse over-fetch (3x,
+  keep the top-5 distinct sessions) fills every top-5 to 5.00 distinct
+  sessions (hybrid alone returned fewer than 5 on 48 of 470) and gains
+  exactly one question (93.19% to 93.40%, +1 / -0; 95.32% to 95.53% with the
+  reranker). The 22 questions the reranker still misses are ranking misses,
+  not duplicate sessions eating slots.
+- **The bracket below the fix, disclosed.** Between v0.28.8 (83.40%
+  `recall_all@5`, May 2026; the 97.66% any-hit figure that led the May report
+  is a diagnostic only) and v0.48.0.0, an unpublished keyword-fallback fusion
+  regression dropped hybrid to 51.3%. Re-measured on 2026-09-02 at the
+  v0.47.8.0 evals pin (2a56b512), same 470 questions: 51.39% `recall_all@5`.
+  v0.48.0.0 fixed it (93.19%). The ceiling at k=5 is 99.4%, because 3
+  questions carry 6 gold sessions; pure vector on the same corpus scored
+  93.8% (v0.48.0.0 receipt), so hybrid is roughly neutral on this benchmark.
+- **Strict vs loose, in one line.** `recall_all@5` counts a question only when
+  every gold session is in the top 5; `recall_any@5` counts it when any one is.
+  The 98.72% any-hit number is the loose diagnostic and is the one that sits
+  beside most published "LongMemEval retrieval" scores; the 93.19% strict
+  number says nothing about answer accuracy (gbrain has published no
+  LLM-judged answer-accuracy run).
+
+Receipts, per-question rows (`rerun-2026-09-02-v0.48.2.0-*.ndjson`, one per
+arm, plus `rerun-2026-09-02-v0.48.2.0-all-arms.json` and the two SVG charts),
+and the arm table:
+[gbrain-evals `docs/benchmarks/2026-05-07-longmemeval-s.md`](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-07-longmemeval-s.md).
+
+**Say to your agent:** *"Run the public LongMemEval benchmark against my
+brain"* — your agent runs
+`gbrain eval longmemeval <path-to-longmemeval_s_cleaned.json> --retrieval-only --top-k 5 --by-type --no-trajectory`
+(the CLI's `--by-type` summary is any-hit recall, and it runs the release
+default, reranker on when `VOYAGE_API_KEY` is set; the strict `recall_all@5`
+receipt comes from the gbrain-evals runner, which pins reranker and autocut
+off: `bash eval/runner/longmemeval-batch.sh --adapters hybrid --embedding-model openai:text-embedding-3-large --embedding-dims 1536`).
+
+### To take advantage of v0.48.2.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about the reranker:
+
+1. **Check what is running:** `gbrain search modes`
+2. **Either add the key or turn reranking off:**
+   ```bash
+   export VOYAGE_API_KEY=...          # or: gbrain config set voyage_api_key ...
+   gbrain config set search.reranker.enabled false   # if you do not want reranking
+   ```
+3. **Verify:** `gbrain doctor` shows `reranker_health: ok`.
+4. **If any step fails,** file an issue at https://github.com/garrytan/gbrain/issues
+   with the output of `gbrain doctor`.
+
+### Itemized changes
+
+#### Changed
+- **Reranker default → `voyage:rerank-2.5` in all three mode bundles.**
+  `DEFAULT_RERANKER_MODEL` in `src/core/ai/defaults.ts` is the one code home;
+  `src/core/search/mode.ts` and `src/core/ai/gateway.ts` import it. The
+  retired ZeroEntropy value stays a named constant (`LEGACY_DEFAULT_RERANKER_MODEL`)
+  for the sunset row, so an explicit `zeroentropyai:*` config still
+  short-circuits past the date instead of hanging five seconds per query.
+- **Keyless brains fail open quietly.** `gateway.rerank()` skips a reranker
+  whose provider key is absent before any HTTP call (`RerankError('no_key')`):
+  one audit row per process per model, no stderr. `applyReranker` passes the
+  results through and reports the skip, and `hybridSearch` stamps
+  `{stage: 'reranker_skipped', reason: 'no_key' | 'sunset_short_circuit'}`
+  on `HybridSearchMeta.degraded`; `--explain` renders it via
+  `formatDegradedSummary`. The stamp does NOT shorten the query-cache TTL
+  (it is a configuration state, not a transient provider limp; the cached
+  rows carry the stamp so a hit stays honest). `auth` now means "key present
+  but rejected" (HTTP 401/403).
+- **Init writes less.** `writeNewInstallRerankerDefault` writes no
+  `search.reranker.model` row when the default is ready (the bundle already
+  resolves to it); keyed installs WITHOUT a Voyage key still get
+  `search.reranker.enabled false`; keyless installs still get nothing.
+- **`gbrain doctor` `reranker_health`** resolves enablement and model through
+  `resolveSearchMode(loadSearchModeConfig)` and checks readiness before
+  reading the audit (through the same DB-merged config plane the CLI hands
+  the gateway, so DB-plane keys and self-hosted base-URL overrides count):
+  enabled-but-not-running warns with the paste-ready fix; `no_key` /
+  `sunset_short_circuit` skip rows are reported as information once the
+  reranker is ready; the auth, payload, budget, transient and unknown
+  ladders are unchanged.
+- **Budget scopes:** the rerank budget reservation is now taken only when an
+  HTTP call will actually be made (and before the abort timer is armed), so
+  skipped rerankers under a cost cap no longer accumulate unsettled
+  projections; the estimate honors the provider's tokenizer density (Voyage
+  counts roughly one token per character on dense text), so a cap cannot be
+  under-reserved by dense CJK or JSON documents.
+- **Doctor `search_mode`:** an explicit `search.reranker.model` row that equals
+  the mode bundle's own default (every Voyage install since v0.46.3 has one) is
+  called redundant with a precise `gbrain config unset search.reranker.model`
+  instead of a `--reset` that would also wipe your other tuned search knobs.
+- **Doctor never blames a missing reranker key on a brain that has no embedding
+  provider** (search runs keyword-only there and the reranker never fires), and
+  audit rows for a retired model no longer make the live default warn.
+- **Empty-result copy:** a skipped reranker is a ranking-only state, so the MCP
+  empty-result block and the CLI `No results.` line keep saying "clean miss"
+  instead of reporting a retrieval degradation.
+- **Remote MCP callers** (`search_modes`) get the reranker verdict without the
+  host's provider-key inventory or self-host topology; the local CLI dashboard
+  keeps the full readiness line.
+- **Init:** a ZeroEntropy embedding pick is treated like any other keyed
+  non-Voyage install (`search.reranker.enabled false` without a Voyage key), and
+  a `--force` re-init sees a Voyage key that lives only in the brain's config
+  table.
+- **ZeroEntropy detection everywhere** (`rerankerSunset`, the upgrade banner,
+  the doctor checks, init) matches the provider id case-insensitively and in the
+  `provider/model` form, the same way the gateway resolves it.
+
+#### Added
+- `src/core/ai/reranker-readiness.ts` — `rerankerReadiness(model, env, now?)`
+  + `describeRerankerFix(r)`, the one readiness predicate behind
+  `gbrain search modes`, doctor and init; pinned to agree with
+  `isAvailable('reranker', m)` on an env × model matrix.
+- **`gbrain search modes`** attributes the five `reranker_*` knobs like every
+  other knob, prints a per-bundle `reranker=… topNIn=… autocut=…` line and a
+  runtime `Reranker:` readiness line; `--json` carries `reranker_readiness`.
+- Tests: `test/ai/reranker-readiness.test.ts`,
+  `test/rerank-no-key.serial.test.ts`, `test/hybrid-reranker-skipped.serial.test.ts`,
+  `test/doctor-reranker-health.test.ts`, `test/modes-report-reranker.test.ts`,
+  `test/init-reranker-default.test.ts`; the sunset short-circuit suite now
+  pins the explicit-ZE scenario plus the live-default-after-the-date case.
+
 ## [0.48.1.0] - 2026-09-02
 
 **The community fix wave: 55 contributor pull requests adopted or reworked

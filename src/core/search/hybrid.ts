@@ -19,6 +19,7 @@ import type {
   DegradedStageEntry,
   DegradedReason,
 } from '../types.ts';
+import { affectsRecall } from '../types.ts';
 import { embed, embedQuery } from '../embedding.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
 import { isDbAccessFailure } from '../pg-access-classify.ts';
@@ -38,7 +39,7 @@ import {
 } from './relational-recall.ts';
 import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
-import { applyReranker, type RerankPassThroughReason } from './rerank.ts';
+import { applyReranker, type RerankPassThroughReason, type RerankSkipReason } from './rerank.ts';
 import {
   classifyQuery,
   classifyQueryWithBrainPatterns,
@@ -2156,13 +2157,16 @@ export async function hybridSearch(
     model: resolvedMode.reranker_model,
     timeoutMs: resolvedMode.reranker_timeout_ms,
   };
-  // #4648: a success-shaped pass-through (provider answered 200 with an
-  // empty/malformed result set) stamps the degraded[] channel so callers can
-  // tell "reranker off for this call" from "reranker died silently" —
-  // results come back in raw RRF order with no rerank_score either way.
+  // v0.48.2: a SKIPPED reranker (no provider key / provider past its sunset)
+  // is stamped `reranker_skipped` (ranking-only — never shortens the cache TTL
+  // or turns an empty result into a degraded miss), and a success-shaped
+  // pass-through (#4648: provider answered 200 with an empty/malformed result
+  // set) is stamped `rerank_passthrough`, so --explain, telemetry and eval rows
+  // can tell "reranked" from "fell through in RRF order" — never stderr.
   const reranked = rerankerOpts.enabled
     ? await applyReranker(query, deduped, {
         ...(rerankerOpts as any),
+        onSkip: (reason: RerankSkipReason) => pushDegraded(degraded, 'reranker_skipped', reason),
         onPassThrough: (reason: RerankPassThroughReason) => {
           pushDegraded(degraded, 'rerank_passthrough', reason);
           // Chain a per-call callback if the caller supplied one.
@@ -2798,7 +2802,13 @@ export async function hybridSearchCached(
     results.length > 0 &&
     (innerMeta?.vector_enabled ?? false)
   ) {
-    const isDegraded = (finalMeta.degraded?.length ?? 0) > 0;
+    // v0.48.2: `reranker_skipped` is a CONFIG state (no provider key / dead
+    // provider), not a transient provider limp — the result set is complete,
+    // just unreranked, and will stay that way until the operator acts. It
+    // keeps the full TTL (a keyless balanced brain must not churn its cache
+    // every 60s); the stamp still rides the stored meta so a hit is honest.
+    // Stale unreranked rows after a key appears expire within one TTL.
+    const isDegraded = (finalMeta.degraded ?? []).some(affectsRecall);
     trackCacheWrite(
       cache
         .store(query, queryEmbedding, results, finalMeta, {

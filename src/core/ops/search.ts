@@ -747,16 +747,21 @@ const search_modes: Operation = {
   name: 'search_modes',
   description:
     'Read-only search-mode dashboard: active mode, EVERY mode-bundle knob resolved with ' +
-    'attribution (mode default vs config override), and the three frozen bundles. Brain-level ' +
-    'planes only — per-call SearchOpts overrides on individual searches are not shown ' +
-    '(per_call_note in the payload spells this out). Never mutates; to change modes, tell ' +
-    'the user to set the search.mode config key on the brain host.',
+    'attribution (mode default vs config override), the three frozen bundles, and a ' +
+    'reranker_readiness verdict (whether the resolved reranker will actually run; remote ' +
+    'callers get the verdict without the host key inventory). Brain-level planes only — ' +
+    'per-call SearchOpts overrides on individual searches are not shown (per_call_note in ' +
+    'the payload spells this out). Never mutates; to change modes, tell the user to set the ' +
+    'search.mode config key on the brain host.',
   params: {},
   scope: 'read',
   area: 'search',
   handler: async (ctx) => {
-    const { buildModesReport } = await import('../search/modes-report.ts');
-    return buildModesReport(ctx.engine);
+    const { buildModesReport, redactReadinessForRemote } = await import('../search/modes-report.ts');
+    // Untrusted (remote) callers get the readiness verdict without the host's
+    // provider-key inventory (env var names + presence + paste-ready fix).
+    const modesReport = await buildModesReport(ctx.engine);
+    return ctx.remote === false ? modesReport : redactReadinessForRemote(modesReport);
   },
 };
 
